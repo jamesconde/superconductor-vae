@@ -78,7 +78,3 @@ If you use this code, please cite:
   author = {James Conde}
 }
 ```
-
-## License
-
-MIT License
