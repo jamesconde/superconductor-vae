@@ -113,8 +113,12 @@ class CompositionEncoder:
         formula = re.sub(r'\s+', '', formula)
 
         # Handle doping notation (δ, x, y, z at end)
+        # e.g., "YBa2Cu3O7-x" -> "YBa2Cu3O7"
         formula = re.sub(r'[-+]?[δxyzn]$', '', formula, flags=re.IGNORECASE)
-        formula = re.sub(r'[-+]?\d*\.\d+$', '', formula)  # Remove trailing decimals
+
+        # NOTE: Previously had regex to remove trailing decimals, but this incorrectly
+        # stripped valid stoichiometry like "0.998" from "Ag0.002Al0.998".
+        # Doping deltas like "-0.1" are rare and can be handled case-by-case.
 
         return self._parse_formula_recursive(formula)
 
