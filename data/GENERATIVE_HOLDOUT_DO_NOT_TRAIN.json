@@ -1,0 +1,324 @@
+{
+  "description": "These superconductors must NEVER be seen during training. They are reserved for testing if the generative model can produce known superconductors it has never seen.",
+  "created": "2025-12-16",
+  "split_seed": 42,
+  "selection_criteria": "Top 5 by Tc from each family (including Other) in test set",
+  "total_holdout": 45,
+  "holdout_samples": [
+    {
+      "formula": "Tl2Ba2Ca(19/20)Y(1/20)Cu2O8",
+      "Tc": 106.5,
+      "family": "YBCO",
+      "original_index": 13718,
+      "purpose": "NEVER_TRAIN - generative evaluation holdout"
+    },
+    {
+      "formula": "Y3Ba5Cu8O18",
+      "Tc": 100.1,
+      "family": "YBCO",
+      "original_index": 16230,
+      "purpose": "NEVER_TRAIN - generative evaluation holdout"
+    },
+    {
+      "formula": "Y1Ba(39/20)La(1/20)Cu3O(69/10)",
+      "Tc": 99.0,
+      "family": "YBCO",
+      "original_index": 15087,
+      "purpose": "NEVER_TRAIN - generative evaluation holdout"
+    },
+    {
+      "formula": "Y(4/5)Ba2Cu3O(161/25)",
+      "Tc": 96.0,
+      "family": "YBCO",
+      "original_index": 14555,
+      "purpose": "NEVER_TRAIN - generative evaluation holdout"
+    },
+    {
+      "formula": "Y(1/5)Eu(4/5)Ba2Cu3O7",
+      "Tc": 93.8,
+      "family": "YBCO",
+      "original_index": 14178,
+      "purpose": "NEVER_TRAIN - generative evaluation holdout"
+    },
+    {
+      "formula": "Hg(3/10)La(7/10)Ba2Ca3Cu(18/5)Ag(2/5)O10",
+      "Tc": 121.6,
+      "family": "LSCO",
+      "original_index": 5475,
+      "purpose": "NEVER_TRAIN - generative evaluation holdout"
+    },
+    {
+      "formula": "La1Ba2Cu3O(137/20)",
+      "Tc": 93.0,
+      "family": "LSCO",
+      "original_index": 7805,
+      "purpose": "NEVER_TRAIN - generative evaluation holdout"
+    },
+    {
+      "formula": "La(1/2)Gd(1/2)Ba2Cu3O",
+      "Tc": 88.0,
+      "family": "LSCO",
+      "original_index": 6645,
+      "purpose": "NEVER_TRAIN - generative evaluation holdout"
+    },
+    {
+      "formula": "Bi2Sr(19/10)La(1/10)Ca1Cu2OY",
+      "Tc": 85.04,
+      "family": "LSCO",
+      "original_index": 2125,
+      "purpose": "NEVER_TRAIN - generative evaluation holdout"
+    },
+    {
+      "formula": "Hg1Sr2La(3/10)Ca(1/2)Ce(1/5)Cu2O6",
+      "Tc": 81.0,
+      "family": "LSCO",
+      "original_index": 5959,
+      "purpose": "NEVER_TRAIN - generative evaluation holdout"
+    },
+    {
+      "formula": "Hg(33/50)Pb(17/50)Ba2Ca(99/50)Cu(29/10)O(42/5)",
+      "Tc": 143.0,
+      "family": "Hg-cuprate",
+      "original_index": 5530,
+      "purpose": "NEVER_TRAIN - generative evaluation holdout"
+    },
+    {
+      "formula": "Hg(9/10)Au(1/10)Ba2Ca2Cu3O",
+      "Tc": 133.0,
+      "family": "Hg-cuprate",
+      "original_index": 5726,
+      "purpose": "NEVER_TRAIN - generative evaluation holdout"
+    },
+    {
+      "formula": "Hg1Ba2Ca(173/100)Pb(17/100)Cu(143/50)O8",
+      "Tc": 132.25,
+      "family": "Hg-cuprate",
+      "original_index": 5797,
+      "purpose": "NEVER_TRAIN - generative evaluation holdout"
+    },
+    {
+      "formula": "Hg(17/20)Re(3/20)Ba(83/50)Sr(17/50)Ca2Cu3O8",
+      "Tc": 131.3,
+      "family": "Hg-cuprate",
+      "original_index": 5645,
+      "purpose": "NEVER_TRAIN - generative evaluation holdout"
+    },
+    {
+      "formula": "Hg(17/20)Re(3/20)Ba(36/25)Sr(14/25)Ca2Cu3O8",
+      "Tc": 128.7,
+      "family": "Hg-cuprate",
+      "original_index": 5644,
+      "purpose": "NEVER_TRAIN - generative evaluation holdout"
+    },
+    {
+      "formula": "Tl2Ba2Ca2Cd(1/10)Cu3O",
+      "Tc": 123.5,
+      "family": "Tl-cuprate",
+      "original_index": 13746,
+      "purpose": "NEVER_TRAIN - generative evaluation holdout"
+    },
+    {
+      "formula": "Tl(1/2)Pb(1/2)Sr(8/5)Ba(2/5)Ca2Cu3F(11/5)O",
+      "Tc": 121.0,
+      "family": "Tl-cuprate",
+      "original_index": 13367,
+      "purpose": "NEVER_TRAIN - generative evaluation holdout"
+    },
+    {
+      "formula": "Tl(1/2)Pb(1/2)Sr2Ca2Cu3Li(1/5)O",
+      "Tc": 117.0,
+      "family": "Tl-cuprate",
+      "original_index": 13389,
+      "purpose": "NEVER_TRAIN - generative evaluation holdout"
+    },
+    {
+      "formula": "Tl(1/2)Pb(1/2)Sr(4/5)Ba(1/5)Ca2Cu3U(1/25)O",
+      "Tc": 114.0,
+      "family": "Tl-cuprate",
+      "original_index": 13364,
+      "purpose": "NEVER_TRAIN - generative evaluation holdout"
+    },
+    {
+      "formula": "Tl(3/5)V(1/2)Sr2Ca2Cu3O",
+      "Tc": 110.0,
+      "family": "Tl-cuprate",
+      "original_index": 13417,
+      "purpose": "NEVER_TRAIN - generative evaluation holdout"
+    },
+    {
+      "formula": "Bi(9/5)Pb(1/5)Sb(1/10)Sr2Ca2Cu2O",
+      "Tc": 136.0,
+      "family": "Bi-cuprate",
+      "original_index": 1646,
+      "purpose": "NEVER_TRAIN - generative evaluation holdout"
+    },
+    {
+      "formula": "Bi(8/5)Pb(2/5)Sb(1/10)Sr2Ca2Cu2O",
+      "Tc": 134.125,
+      "family": "Bi-cuprate",
+      "original_index": 1460,
+      "purpose": "NEVER_TRAIN - generative evaluation holdout"
+    },
+    {
+      "formula": "Bi(9/10)Nd(1/20)Tb(1/20)Pb1Sr2Ca2Cu3O10",
+      "Tc": 111.0,
+      "family": "Bi-cuprate",
+      "original_index": 1353,
+      "purpose": "NEVER_TRAIN - generative evaluation holdout"
+    },
+    {
+      "formula": "Bi(17/10)Pb(3/10)Sr2Ca2Cu3O",
+      "Tc": 110.18333333333334,
+      "family": "Bi-cuprate",
+      "original_index": 1625,
+      "purpose": "NEVER_TRAIN - generative evaluation holdout"
+    },
+    {
+      "formula": "Bi(8/5)Pb(2/5)Sr2Ca3Cu(97/25)Si(3/25)O12",
+      "Tc": 110.0,
+      "family": "Bi-cuprate",
+      "original_index": 1531,
+      "purpose": "NEVER_TRAIN - generative evaluation holdout"
+    },
+    {
+      "formula": "Sm(13/20)Th(7/20)Fe1As1O1",
+      "Tc": 53.0,
+      "family": "Iron-based",
+      "original_index": 12154,
+      "purpose": "NEVER_TRAIN - generative evaluation holdout"
+    },
+    {
+      "formula": "Nd1Fe1As1O(17/20)",
+      "Tc": 51.45,
+      "family": "Iron-based",
+      "original_index": 10627,
+      "purpose": "NEVER_TRAIN - generative evaluation holdout"
+    },
+    {
+      "formula": "Dy1Fe1As1O(17/20)",
+      "Tc": 51.0,
+      "family": "Iron-based",
+      "original_index": 4171,
+      "purpose": "NEVER_TRAIN - generative evaluation holdout"
+    },
+    {
+      "formula": "Sm(9/10)U(1/10)Fe1As1O1",
+      "Tc": 47.0,
+      "family": "Iron-based",
+      "original_index": 12185,
+      "purpose": "NEVER_TRAIN - generative evaluation holdout"
+    },
+    {
+      "formula": "Sm1Fe1As(19/20)P(1/20)F(3/25)O(22/25)",
+      "Tc": 46.8,
+      "family": "Iron-based",
+      "original_index": 12338,
+      "purpose": "NEVER_TRAIN - generative evaluation holdout"
+    },
+    {
+      "formula": "Mg(97/100)Na(3/100)B2",
+      "Tc": 38.0,
+      "family": "MgB2",
+      "original_index": 8808,
+      "purpose": "NEVER_TRAIN - generative evaluation holdout"
+    },
+    {
+      "formula": "Mg(17/20)Na(3/20)B2",
+      "Tc": 38.0,
+      "family": "MgB2",
+      "original_index": 8755,
+      "purpose": "NEVER_TRAIN - generative evaluation holdout"
+    },
+    {
+      "formula": "Mg(9/10)Li(1/10)B2",
+      "Tc": 36.91666666666666,
+      "family": "MgB2",
+      "original_index": 8838,
+      "purpose": "NEVER_TRAIN - generative evaluation holdout"
+    },
+    {
+      "formula": "Mg(17/20)Li(3/20)B2",
+      "Tc": 36.6,
+      "family": "MgB2",
+      "original_index": 8754,
+      "purpose": "NEVER_TRAIN - generative evaluation holdout"
+    },
+    {
+      "formula": "Mg(49/50)Cr(1/50)B2",
+      "Tc": 35.3,
+      "family": "MgB2",
+      "original_index": 8815,
+      "purpose": "NEVER_TRAIN - generative evaluation holdout"
+    },
+    {
+      "formula": "Gd1Pb1Sr2Ca3Cu4O",
+      "Tc": 42.0,
+      "family": "Conventional",
+      "original_index": 5256,
+      "purpose": "NEVER_TRAIN - generative evaluation holdout"
+    },
+    {
+      "formula": "Nb(79/100)Al(41/250)Ga(57/1000)",
+      "Tc": 20.7,
+      "family": "Conventional",
+      "original_index": 9637,
+      "purpose": "NEVER_TRAIN - generative evaluation holdout"
+    },
+    {
+      "formula": "Nb3Al(71/100)Ge(29/100)",
+      "Tc": 20.7,
+      "family": "Conventional",
+      "original_index": 9945,
+      "purpose": "NEVER_TRAIN - generative evaluation holdout"
+    },
+    {
+      "formula": "Nd1Pr(1/2)Ce(1/2)Sr2Cu2Nb1O10",
+      "Tc": 20.5,
+      "family": "Conventional",
+      "original_index": 10636,
+      "purpose": "NEVER_TRAIN - generative evaluation holdout"
+    },
+    {
+      "formula": "Nb3Al(19/25)Ge(6/25)",
+      "Tc": 20.4,
+      "family": "Conventional",
+      "original_index": 9949,
+      "purpose": "NEVER_TRAIN - generative evaluation holdout"
+    },
+    {
+      "formula": "Cu1Cr1O2",
+      "Tc": 132.0,
+      "family": "Other",
+      "original_index": 4018,
+      "purpose": "NEVER_TRAIN - generative evaluation holdout"
+    },
+    {
+      "formula": "Ba2Ca5Cu7O14",
+      "Tc": 120.0,
+      "family": "Other",
+      "original_index": 1120,
+      "purpose": "NEVER_TRAIN - generative evaluation holdout"
+    },
+    {
+      "formula": "B(3/5)C(2/5)Sr(1/2)Ba(3/2)Ca2Cu3O9",
+      "Tc": 119.0,
+      "family": "Other",
+      "original_index": 419,
+      "purpose": "NEVER_TRAIN - generative evaluation holdout"
+    },
+    {
+      "formula": "C(1/2)Ba2Ca3Cu(9/2)O11",
+      "Tc": 117.0,
+      "family": "Other",
+      "original_index": 2681,
+      "purpose": "NEVER_TRAIN - generative evaluation holdout"
+    },
+    {
+      "formula": "Pb(1/2)Sr2Ca1Cu(5/2)O(34/5)",
+      "Tc": 115.0,
+      "family": "Other",
+      "original_index": 10901,
+      "purpose": "NEVER_TRAIN - generative evaluation holdout"
+    }
+  ]
+}
