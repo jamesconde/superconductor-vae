@@ -43,6 +43,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint as grad_checkpoint  # V12.8: Gradient checkpointing
 from typing import List, Tuple, Optional, Dict
 import re
 
@@ -1325,6 +1326,8 @@ class EnhancedTransformerDecoder(nn.Module):
         use_stoich_conditioning: bool = True,
         max_elements: int = 12,  # Maximum elements per formula
         n_stoich_tokens: int = 4,  # Number of stoichiometry memory tokens
+        # V12.8: Gradient checkpointing for memory optimization
+        use_gradient_checkpointing: bool = False,
     ):
         super().__init__()
 
@@ -1338,6 +1341,7 @@ class EnhancedTransformerDecoder(nn.Module):
         self.use_skip_connection = use_skip_connection
         self.use_stoich_conditioning = use_stoich_conditioning
         self.max_elements = max_elements
+        self.use_gradient_checkpointing = use_gradient_checkpointing
 
         # Token embedding
         self.token_embedding = nn.Embedding(
@@ -1465,6 +1469,30 @@ class EnhancedTransformerDecoder(nn.Module):
 
         return memory
 
+    def precompute_memory(
+        self,
+        z: torch.Tensor,
+        encoder_skip: Optional[torch.Tensor] = None,
+        stoich_pred: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        V12.8: Pre-compute memory projections for reuse across multiple operations.
+
+        This is useful when the same z/encoder_skip/stoich_pred will be used multiple times:
+        - REINFORCE training (forward + sample on same z)
+        - Speculative decoding (draft and target share memory)
+        - Multiple generation attempts from same latent
+
+        Args:
+            z: Latent vectors (batch, latent_dim)
+            encoder_skip: Skip connection from encoder (batch, encoder_skip_dim)
+            stoich_pred: Stoichiometry conditioning [batch, max_elements + 1]
+
+        Returns:
+            memory: Pre-computed memory tensor (batch, n_memory_tokens + extras, d_model)
+        """
+        return self._create_memory(z, encoder_skip, stoich_pred)
+
     def forward(
         self,
         z: torch.Tensor,
@@ -1472,6 +1500,7 @@ class EnhancedTransformerDecoder(nn.Module):
         encoder_skip: Optional[torch.Tensor] = None,
         teacher_forcing_ratio: float = 1.0,
         stoich_pred: Optional[torch.Tensor] = None,  # V12.4: [batch, max_elements + 1]
+        cached_memory: Optional[torch.Tensor] = None,  # V12.8: Pre-computed memory
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Forward pass with scheduled sampling (teacher forcing).
@@ -1489,6 +1518,8 @@ class EnhancedTransformerDecoder(nn.Module):
                                    0.5 = 50% chance of using model prediction at each step
             stoich_pred: V12.4 stoichiometry conditioning [batch, max_elements + 1]
                         Contains predicted element fractions + element count
+            cached_memory: V12.8 Pre-computed memory from precompute_memory().
+                          If provided, skips memory creation (saves computation).
 
         Returns:
             logits: Token logits (batch, seq_len-1, vocab_size)
@@ -1498,8 +1529,12 @@ class EnhancedTransformerDecoder(nn.Module):
         device = z.device
         seq_len = target_tokens.size(1) - 1  # -1 because we predict next token
 
-        # Create combined memory (V12.4: includes stoichiometry tokens)
-        memory = self._create_memory(z, encoder_skip, stoich_pred)
+        # V12.8: Use cached memory if provided, otherwise create it
+        if cached_memory is not None:
+            memory = cached_memory
+        else:
+            # Create combined memory (V12.4: includes stoichiometry tokens)
+            memory = self._create_memory(z, encoder_skip, stoich_pred)
 
         # Fast path: Full teacher forcing (TF = 1.0) - parallel forward
         if teacher_forcing_ratio >= 1.0:
@@ -1510,6 +1545,63 @@ class EnhancedTransformerDecoder(nn.Module):
             causal_mask = self._generate_causal_mask(seq_len, device)
             tgt_key_padding_mask = (input_tokens == PAD_IDX)
 
+            # V12.8: Use gradient checkpointing to save memory during training
+            if self.use_gradient_checkpointing and self.training:
+                # Checkpoint requires function format - wrap decoder call
+                def run_decoder(tgt, mem, mask, padding_mask):
+                    return self.transformer_decoder(
+                        tgt=tgt, memory=mem, tgt_mask=mask,
+                        tgt_key_padding_mask=padding_mask
+                    )
+                output = grad_checkpoint(
+                    run_decoder, embedded, memory, causal_mask, tgt_key_padding_mask,
+                    use_reentrant=False
+                )
+            else:
+                output = self.transformer_decoder(
+                    tgt=embedded,
+                    memory=memory,
+                    tgt_mask=causal_mask,
+                    tgt_key_padding_mask=tgt_key_padding_mask
+                )
+
+            logits = self.output_proj(output)
+            generated = logits.argmax(dim=-1)
+            return logits, generated
+
+        # OPTIMIZED path: Scheduled sampling (TF < 1.0) - 2 passes instead of 60
+        # V12.6: This is 30x faster than the original sequential approach
+        #
+        # Strategy:
+        # 1. First pass: Get logits using ground truth inputs (parallel, like TF=1.0)
+        # 2. Sample tokens from logits and mix with ground truth per TF ratio
+        # 3. Second pass: Forward with mixed inputs to get final logits
+        #
+        # This gives the model training signal on handling its own predictions
+        # while keeping computational cost at 2x instead of 60x.
+
+        # ==== First pass: get predicted tokens using parallel forward ====
+        input_tokens = target_tokens[:, :-1]  # All but last
+        embedded = self.token_embedding(input_tokens)
+        embedded = self.pos_encoding(embedded)
+
+        causal_mask = self._generate_causal_mask(seq_len, device)
+        tgt_key_padding_mask = (input_tokens == PAD_IDX)
+
+        # V12.8: Helper function for checkpointing
+        def run_decoder(tgt, mem, mask, padding_mask):
+            return self.transformer_decoder(
+                tgt=tgt, memory=mem, tgt_mask=mask,
+                tgt_key_padding_mask=padding_mask
+            )
+
+        # V12.8: Use gradient checkpointing for first pass
+        if self.use_gradient_checkpointing and self.training:
+            output = grad_checkpoint(
+                run_decoder, embedded, memory, causal_mask, tgt_key_padding_mask,
+                use_reentrant=False
+            )
+        else:
             output = self.transformer_decoder(
                 tgt=embedded,
                 memory=memory,
@@ -1517,57 +1609,48 @@ class EnhancedTransformerDecoder(nn.Module):
                 tgt_key_padding_mask=tgt_key_padding_mask
             )
 
-            logits = self.output_proj(output)
-            generated = logits.argmax(dim=-1)
-            return logits, generated
+        # Get logits and predictions from first pass
+        first_logits = self.output_proj(output)  # [batch, seq_len, vocab]
+        predicted_tokens = first_logits.argmax(dim=-1)  # [batch, seq_len]
 
-        # Slow path: Scheduled sampling (TF < 1.0) - sequential autoregressive
-        # This is necessary to train the model to handle its own predictions
-        # NOTE: Matches generate() method structure to avoid CUDA/autocast issues
-        all_logits = []
-        all_generated = []
+        # ==== Mix predicted tokens with ground truth ====
+        # For each position, use ground truth with probability TF, prediction with (1-TF)
+        use_gt_mask = (torch.rand(batch_size, seq_len, device=device) < teacher_forcing_ratio)
 
-        # Start with START token
-        current_tokens = target_tokens[:, :1]  # [batch, 1] = START token
+        # Target for position t is at target_tokens[:, t+1] (shifted by 1)
+        gt_next_tokens = target_tokens[:, 1:]  # Ground truth targets
 
-        for t in range(seq_len):
-            # Embed current sequence
-            embedded = self.token_embedding(current_tokens)
-            embedded = self.pos_encoding(embedded)
+        # Mix: use GT where mask is True, prediction where False
+        mixed_tokens = torch.where(use_gt_mask, gt_next_tokens, predicted_tokens)
 
-            # Create causal mask for current length
-            curr_len = current_tokens.size(1)
-            causal_mask = self._generate_causal_mask(curr_len, device)
+        # Create new input sequence: START + mixed tokens (excluding last position)
+        # The input at position t should be the token chosen for position t-1
+        start_tokens = target_tokens[:, :1]  # START token
+        mixed_inputs = torch.cat([start_tokens, mixed_tokens[:, :-1]], dim=1)  # [batch, seq_len]
 
-            # Transformer forward (no tgt_key_padding_mask - matches generate())
+        # ==== Second pass: forward with mixed inputs ====
+        embedded = self.token_embedding(mixed_inputs)
+        embedded = self.pos_encoding(embedded)
+
+        # Padding mask based on mixed inputs
+        tgt_key_padding_mask = (mixed_inputs == PAD_IDX)
+
+        # V12.8: Use gradient checkpointing for second pass
+        if self.use_gradient_checkpointing and self.training:
+            output = grad_checkpoint(
+                run_decoder, embedded, memory, causal_mask, tgt_key_padding_mask,
+                use_reentrant=False
+            )
+        else:
             output = self.transformer_decoder(
                 tgt=embedded,
                 memory=memory,
-                tgt_mask=causal_mask
+                tgt_mask=causal_mask,
+                tgt_key_padding_mask=tgt_key_padding_mask
             )
 
-            # Get logits for last position only
-            last_logits = self.output_proj(output[:, -1:, :])  # [batch, 1, vocab]
-            all_logits.append(last_logits)
-
-            # Sample next token
-            pred_token = last_logits.argmax(dim=-1)  # [batch, 1]
-            all_generated.append(pred_token)
-
-            # Scheduled sampling: decide whether to use ground truth or prediction
-            if t < seq_len - 1:  # Don't need next token for last position
-                gt_token = target_tokens[:, t + 1:t + 2]  # [batch, 1] ground truth
-
-                # Per-sample random choice: use GT with probability teacher_forcing_ratio
-                use_gt = (torch.rand(batch_size, 1, device=device) < teacher_forcing_ratio).long()
-                next_token = use_gt * gt_token + (1 - use_gt) * pred_token
-
-                # Append to sequence
-                current_tokens = torch.cat([current_tokens, next_token], dim=1)
-
-        # Concatenate all timesteps
-        logits = torch.cat(all_logits, dim=1)  # [batch, seq_len, vocab]
-        generated = torch.cat(all_generated, dim=1)  # [batch, seq_len]
+        logits = self.output_proj(output)  # [batch, seq_len, vocab]
+        generated = logits.argmax(dim=-1)  # [batch, seq_len]
 
         return logits, generated
 
@@ -1578,7 +1661,7 @@ class EnhancedTransformerDecoder(nn.Module):
         temperature: float = 1.0,
         max_len: Optional[int] = None
     ) -> List[str]:
-        """Generate formulas autoregressively."""
+        """Generate formulas autoregressively (legacy, no KV cache)."""
         self.eval()
         batch_size = z.size(0)
         device = z.device
@@ -1626,5 +1709,397 @@ class EnhancedTransformerDecoder(nn.Module):
             for i in range(batch_size):
                 formula = indices_to_formula(generated_tokens[i, 1:])
                 formulas.append(formula)
+
+        return formulas
+
+    # =========================================================================
+    # V12.7: KV CACHING FOR FAST AUTOREGRESSIVE GENERATION
+    # =========================================================================
+    #
+    # KV caching reduces generation from O(n²) to O(n) by reusing computed
+    # key/value tensors from previous positions. This is critical for:
+    # 1. Fast inference (60x speedup for 60-token sequences)
+    # 2. REINFORCE training (need to sample many sequences quickly)
+    #
+    # Architecture:
+    #   - Cache stores (key, value) for self-attention in each decoder layer
+    #   - Cross-attention to memory doesn't need caching (memory is static)
+    #   - Each step processes only the NEW token, not the full sequence
+    # =========================================================================
+
+    def _init_kv_cache(
+        self,
+        batch_size: int,
+        device: torch.device
+    ) -> List[Dict[str, torch.Tensor]]:
+        """
+        Initialize empty KV cache for all decoder layers.
+
+        Returns:
+            List of dicts, one per layer, each containing:
+                'key': [batch, 0, d_model] - empty, will grow
+                'value': [batch, 0, d_model] - empty, will grow
+        """
+        cache = []
+        for _ in range(self.num_layers):
+            cache.append({
+                'key': torch.empty(batch_size, 0, self.d_model, device=device),
+                'value': torch.empty(batch_size, 0, self.d_model, device=device),
+            })
+        return cache
+
+    def _forward_one_step_with_cache(
+        self,
+        token_embedding: torch.Tensor,  # [batch, 1, d_model] - single token
+        memory: torch.Tensor,           # [batch, mem_len, d_model]
+        kv_cache: List[Dict[str, torch.Tensor]],
+        position: int,                  # Current position (for positional encoding)
+    ) -> Tuple[torch.Tensor, List[Dict[str, torch.Tensor]]]:
+        """
+        Forward pass for a single token using KV cache.
+
+        This manually iterates through decoder layers to manage the cache.
+        For each layer:
+        1. Self-attention: Use cached K,V + new K,V from current token
+        2. Cross-attention: Attend to memory (no caching needed)
+        3. FFN: Standard feed-forward
+
+        Args:
+            token_embedding: Embedded token [batch, 1, d_model]
+            memory: Encoder memory [batch, mem_len, d_model]
+            kv_cache: Current cache state
+            position: Current sequence position
+
+        Returns:
+            output: Hidden state [batch, 1, d_model]
+            updated_cache: Cache with new K,V appended
+        """
+        batch_size = token_embedding.size(0)
+        device = token_embedding.device
+
+        # Add positional encoding for this position
+        # pos_encoding.pe is [1, max_len, d_model]
+        x = token_embedding + self.pos_encoding.pe[:, position:position+1, :]
+        x = self.pos_encoding.dropout(x)
+
+        updated_cache = []
+
+        # Process through each decoder layer
+        for layer_idx, layer in enumerate(self.transformer_decoder.layers):
+            layer_cache = kv_cache[layer_idx]
+
+            # ===== Self-attention with KV cache =====
+            # Pre-norm (since norm_first=True)
+            x_norm = layer.norm1(x)
+
+            # Compute Q, K, V for the new token
+            # We need to access the in_proj_weight and in_proj_bias
+            # to compute Q, K, V manually
+            d_model = self.d_model
+            nhead = self.nhead
+            head_dim = d_model // nhead
+
+            # Get Q, K, V projections
+            # MultiheadAttention stores them concatenated in in_proj_weight
+            qkv_weight = layer.self_attn.in_proj_weight  # [3*d_model, d_model]
+            qkv_bias = layer.self_attn.in_proj_bias      # [3*d_model]
+
+            # Project to get Q, K, V for new token
+            qkv = F.linear(x_norm, qkv_weight, qkv_bias)  # [batch, 1, 3*d_model]
+            q, k, v = qkv.chunk(3, dim=-1)  # Each [batch, 1, d_model]
+
+            # Append new K, V to cache
+            cached_k = layer_cache['key']
+            cached_v = layer_cache['value']
+
+            new_k = torch.cat([cached_k, k], dim=1)  # [batch, seq_len, d_model]
+            new_v = torch.cat([cached_v, v], dim=1)
+
+            # Update cache for this layer
+            updated_cache.append({
+                'key': new_k,
+                'value': new_v,
+            })
+
+            # Compute attention: Q attends to all K (cached + new)
+            # Reshape for multi-head attention
+            seq_len = new_k.size(1)
+
+            q = q.view(batch_size, 1, nhead, head_dim).transpose(1, 2)      # [batch, nhead, 1, head_dim]
+            k_all = new_k.view(batch_size, seq_len, nhead, head_dim).transpose(1, 2)  # [batch, nhead, seq_len, head_dim]
+            v_all = new_v.view(batch_size, seq_len, nhead, head_dim).transpose(1, 2)
+
+            # Scaled dot-product attention (no mask needed - we attend to all cached positions)
+            scale = head_dim ** -0.5
+            attn_weights = torch.matmul(q, k_all.transpose(-2, -1)) * scale  # [batch, nhead, 1, seq_len]
+            attn_weights = F.softmax(attn_weights, dim=-1)
+            attn_weights = F.dropout(attn_weights, p=layer.self_attn.dropout, training=self.training)
+
+            attn_output = torch.matmul(attn_weights, v_all)  # [batch, nhead, 1, head_dim]
+            attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, 1, d_model)
+
+            # Output projection
+            attn_output = layer.self_attn.out_proj(attn_output)
+
+            # Residual connection
+            x = x + layer.dropout1(attn_output)
+
+            # ===== Cross-attention to memory =====
+            x_norm = layer.norm2(x)
+
+            # Standard cross-attention (no caching needed for memory)
+            cross_attn_output, _ = layer.multihead_attn(
+                query=x_norm,
+                key=memory,
+                value=memory,
+                need_weights=False
+            )
+            x = x + layer.dropout2(cross_attn_output)
+
+            # ===== Feed-forward =====
+            x_norm = layer.norm3(x)
+            ff_output = layer.linear2(layer.dropout(layer.activation(layer.linear1(x_norm))))
+            x = x + layer.dropout3(ff_output)
+
+        # Final layer norm (if TransformerDecoder has it)
+        if self.transformer_decoder.norm is not None:
+            x = self.transformer_decoder.norm(x)
+
+        return x, updated_cache
+
+    def generate_with_kv_cache(
+        self,
+        z: torch.Tensor,
+        encoder_skip: Optional[torch.Tensor] = None,
+        stoich_pred: Optional[torch.Tensor] = None,
+        temperature: float = 1.0,
+        top_k: Optional[int] = None,
+        top_p: Optional[float] = None,
+        max_len: Optional[int] = None,
+        return_log_probs: bool = False,
+        return_entropy: bool = False,  # V12.8: Return proper entropy from full distribution
+        cached_memory: Optional[torch.Tensor] = None,  # V12.8: Pre-computed memory
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """
+        Generate token sequences with KV caching for O(n) complexity.
+
+        This is ~60x faster than the non-cached version for 60-token sequences.
+
+        Args:
+            z: Latent vectors [batch, latent_dim]
+            encoder_skip: Optional skip connection [batch, encoder_skip_dim]
+            stoich_pred: Optional stoichiometry conditioning [batch, max_elements + 1]
+            temperature: Sampling temperature (lower = more deterministic)
+            top_k: If set, only sample from top k tokens
+            top_p: If set, use nucleus sampling
+            max_len: Maximum sequence length
+            return_log_probs: If True, also return log probabilities of sampled tokens
+            return_entropy: If True, also return proper entropy H(p) = -sum(p * log(p))
+            cached_memory: V12.8 Pre-computed memory from precompute_memory()
+
+        Returns:
+            generated_tokens: Token indices [batch, seq_len] (excluding START)
+            log_probs: Log probabilities [batch, seq_len] if return_log_probs=True, else None
+            entropy: Proper entropy per position [batch, seq_len] if return_entropy=True, else None
+        """
+        self.eval()
+        batch_size = z.size(0)
+        device = z.device
+        max_len = max_len or self.max_len
+
+        with torch.no_grad():
+            # V12.8: Use cached memory if provided, otherwise create it
+            if cached_memory is not None:
+                memory = cached_memory
+            else:
+                memory = self._create_memory(z, encoder_skip, stoich_pred)
+
+            # Initialize KV cache
+            kv_cache = self._init_kv_cache(batch_size, device)
+
+            # Start with START token
+            current_token = torch.full((batch_size, 1), START_IDX, dtype=torch.long, device=device)
+            finished = torch.zeros(batch_size, dtype=torch.bool, device=device)
+
+            generated_tokens = []
+            log_probs_list = [] if return_log_probs else None
+            entropy_list = [] if return_entropy else None  # V12.8: Track proper entropy
+
+            for position in range(max_len - 1):
+                # Embed current token
+                token_emb = self.token_embedding(current_token)  # [batch, 1, d_model]
+
+                # Forward with cache
+                output, kv_cache = self._forward_one_step_with_cache(
+                    token_emb, memory, kv_cache, position
+                )
+
+                # Get logits for this position
+                logits = self.output_proj(output).squeeze(1)  # [batch, vocab_size]
+
+                # V12.8: Compute proper entropy BEFORE temperature/filtering
+                # H(p) = -sum(p * log(p)) over vocabulary
+                if return_entropy:
+                    # Use raw logits (no temperature) for true distribution entropy
+                    probs_for_entropy = F.softmax(logits, dim=-1)
+                    log_probs_for_entropy = F.log_softmax(logits, dim=-1)
+                    # Entropy: -sum(p * log(p)), sum over vocab dimension
+                    step_entropy = -(probs_for_entropy * log_probs_for_entropy).sum(dim=-1)  # [batch]
+                    entropy_list.append(step_entropy)
+
+                # Apply temperature
+                if temperature != 1.0:
+                    logits = logits / temperature
+
+                # Apply top-k filtering
+                if top_k is not None and top_k > 0:
+                    indices_to_remove = logits < torch.topk(logits, top_k)[0][..., -1, None]
+                    logits[indices_to_remove] = float('-inf')
+
+                # Apply top-p (nucleus) filtering
+                if top_p is not None and top_p < 1.0:
+                    sorted_logits, sorted_indices = torch.sort(logits, descending=True)
+                    cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+                    sorted_indices_to_remove = cumulative_probs > top_p
+                    sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+                    sorted_indices_to_remove[..., 0] = 0
+                    indices_to_remove = sorted_indices_to_remove.scatter(
+                        1, sorted_indices, sorted_indices_to_remove
+                    )
+                    logits[indices_to_remove] = float('-inf')
+
+                # Sample or argmax
+                if temperature < 0.01:
+                    next_token = logits.argmax(dim=-1, keepdim=True)
+                    if return_log_probs:
+                        log_prob = torch.zeros(batch_size, device=device)
+                else:
+                    probs = F.softmax(logits, dim=-1)
+                    next_token = torch.multinomial(probs, num_samples=1)
+                    if return_log_probs:
+                        log_prob = F.log_softmax(logits, dim=-1).gather(1, next_token).squeeze(-1)
+
+                # Record generated token and log prob
+                generated_tokens.append(next_token)
+                if return_log_probs:
+                    log_probs_list.append(log_prob)
+
+                # Update finished status
+                finished = finished | (next_token.squeeze(-1) == END_IDX)
+
+                # Next input is the sampled token
+                current_token = next_token
+
+                if finished.all():
+                    break
+
+            # Stack results
+            generated = torch.cat(generated_tokens, dim=1)  # [batch, seq_len]
+
+            # V12.8: Return log_probs and entropy as requested
+            log_probs = torch.stack(log_probs_list, dim=1) if return_log_probs else None
+            entropy = torch.stack(entropy_list, dim=1) if return_entropy else None  # [batch, seq_len]
+
+            return generated, log_probs, entropy
+
+    def sample_for_reinforce(
+        self,
+        z: torch.Tensor,
+        encoder_skip: Optional[torch.Tensor] = None,
+        stoich_pred: Optional[torch.Tensor] = None,
+        temperature: float = 0.8,
+        max_len: Optional[int] = None,
+        cached_memory: Optional[torch.Tensor] = None,  # V12.8: Pre-computed memory
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Sample sequences for REINFORCE training with KV caching.
+
+        Returns sampled tokens, log probabilities, proper entropy, and a mask for valid positions.
+        This is optimized for RLOO (REINFORCE Leave-One-Out) training.
+
+        Args:
+            z: Latent vectors [batch, latent_dim]
+            encoder_skip: Optional skip connection
+            stoich_pred: Optional stoichiometry conditioning
+            temperature: Sampling temperature
+            max_len: Maximum sequence length
+            cached_memory: V12.8 Pre-computed memory from precompute_memory()
+
+        Returns:
+            sampled_tokens: [batch, seq_len] - sampled token indices
+            log_probs: [batch, seq_len] - log probability of each sampled token
+            entropy: [batch, seq_len] - proper entropy H(p) = -sum(p * log(p)) per position
+            mask: [batch, seq_len] - 1 for valid positions, 0 for padding
+        """
+        max_len = max_len or self.max_len
+
+        # V12.8: Sample with log probs AND entropy using KV cache
+        sampled_tokens, log_probs, entropy = self.generate_with_kv_cache(
+            z=z,
+            encoder_skip=encoder_skip,
+            stoich_pred=stoich_pred,
+            temperature=temperature,
+            max_len=max_len,
+            return_log_probs=True,
+            return_entropy=True,  # V12.8: Get proper entropy
+            cached_memory=cached_memory,  # V12.8: Pass through cached memory
+        )
+
+        # Create mask: 1 for valid tokens, 0 after END
+        batch_size, seq_len = sampled_tokens.shape
+        device = sampled_tokens.device
+
+        # Find END positions
+        is_end = (sampled_tokens == END_IDX)
+
+        # Create cumulative mask (0 after first END)
+        # First, get position of first END in each sequence
+        end_positions = torch.argmax(is_end.int(), dim=1)  # [batch]
+        has_end = is_end.any(dim=1)  # [batch]
+
+        # For sequences without END, mask all positions
+        end_positions = torch.where(has_end, end_positions, torch.tensor(seq_len, device=device))
+
+        # Create position indices
+        positions = torch.arange(seq_len, device=device).unsqueeze(0).expand(batch_size, -1)
+
+        # Mask: 1 for positions <= END position (include END in loss)
+        mask = (positions <= end_positions.unsqueeze(1)).float()
+
+        return sampled_tokens, log_probs, entropy, mask
+
+    def generate_formulas_fast(
+        self,
+        z: torch.Tensor,
+        encoder_skip: Optional[torch.Tensor] = None,
+        stoich_pred: Optional[torch.Tensor] = None,
+        temperature: float = 1.0,
+        max_len: Optional[int] = None,
+        cached_memory: Optional[torch.Tensor] = None,  # V12.8: Pre-computed memory
+    ) -> List[str]:
+        """
+        Generate formula strings using fast KV-cached generation.
+
+        Drop-in replacement for generate() but ~60x faster.
+
+        Args:
+            cached_memory: V12.8 Pre-computed memory from precompute_memory()
+        """
+        generated_tokens, _, _ = self.generate_with_kv_cache(
+            z=z,
+            encoder_skip=encoder_skip,
+            stoich_pred=stoich_pred,
+            temperature=temperature,
+            max_len=max_len,
+            return_log_probs=False,
+            return_entropy=False,
+            cached_memory=cached_memory,  # V12.8
+        )
+
+        # Convert to formula strings
+        formulas = []
+        for i in range(generated_tokens.size(0)):
+            formula = indices_to_formula(generated_tokens[i])
+            formulas.append(formula)
 
         return formulas

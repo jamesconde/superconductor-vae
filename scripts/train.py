@@ -126,7 +126,7 @@ signal.signal(signal.SIGTERM, _signal_handler)  # kill command
 atexit.register(lambda: _save_latest_model("exit") if not _shutdown_state['should_stop'] else None)
 
 # Setup paths
-PROJECT_ROOT = Path(__file__).parent.parent.parent
+PROJECT_ROOT = Path(__file__).parent.parent  # scripts/ -> superconductor-vae/
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 from superconductor.data.dataset import SuperconductorDataset
@@ -590,15 +590,12 @@ class AdaptiveLossWeighter:
 # CONFIGURATION
 # ============================================================================
 
-# V12.5: Warm-start DECODER from 93.14% checkpoint (learned fraction syntax)
-# Encoder is initialized fresh (needs to learn fraction input format)
-V12_DECODER_WARMSTART = PROJECT_ROOT / 'onboarding/scratch/fraction_vae_v12_output/best_model_pre_v12.5_decoder_stoich_93.14pct.pt'
-V12_CHECKPOINT = PROJECT_ROOT / 'onboarding/scratch/fraction_vae_v12_output/best_model.pt'
-V11_CHECKPOINT = PROJECT_ROOT / 'onboarding/scratch/fraction_vae_v11_output/best_model.pt'
-V10_CHECKPOINT = PROJECT_ROOT / 'onboarding/scratch/fraction_vae_v10_output/best_model.pt'
+# Checkpoint paths - set to None to train from scratch
+# These can be set to resume from a previous checkpoint
+RESUME_CHECKPOINT = 'outputs/checkpoint_epoch_0699.pt'  # Resume from epoch 699
 
 # Holdout file - these 45 superconductors are NEVER used in training
-HOLDOUT_FILE = PROJECT_ROOT / 'data/superconductor/GENERATIVE_HOLDOUT_DO_NOT_TRAIN.json'
+HOLDOUT_FILE = PROJECT_ROOT / 'data/GENERATIVE_HOLDOUT_DO_NOT_TRAIN.json'
 
 # V12 Architecture - FULL MATERIALS ENCODER
 MODEL_CONFIG = {
@@ -622,12 +619,13 @@ TRAIN_CONFIG = {
     'keep_last_n_checkpoints': 3,  # Delete old checkpoints to save disk (keeps last N)
 
     # OPTIMIZATION 1: Batch size
-    # V12.5: Reduced to 32 due to WSL2 GPU memory residency issues (dxgkio_make_resident failures)
-    'batch_size': 32,          # Reduced from 128 to avoid GPU memory pressure
+    # V12.6: Reduced to 16 due to PyTorch 2.4.0 using more VRAM (OOM at 32)
+    'batch_size': 16,          # Reduced from 32 to avoid GPU memory pressure
     'accumulation_steps': 1,   # No accumulation = better GPU utilization
 
     # OPTIMIZATION 2: Multi-worker data loading
-    'num_workers': 8,          # Parallel data loading (half of 22 cores)
+    # V12.6: Set to 0 to avoid WSL2 CUDA handle corruption issues with PyTorch 2.4.0
+    'num_workers': 0,          # Single-process loading (safer for WSL2)
     'pin_memory': True,        # Faster GPU transfer
     'prefetch_factor': 4,      # Prefetch more batches
 
@@ -645,14 +643,18 @@ TRAIN_CONFIG = {
     'magpie_weight': 2.0,    # Magpie reconstruction (MSE) → ~1.0 contrib (was 0.1!)
     'kl_weight': 0.0,        # Zero for jagged latent
 
-    # REINFORCE settings - AGGRESSIVE INTERVENTION (was: rl=1.0, temp=0.8)
-    'ce_weight': 0.3,
-    'rl_weight': 2.5,        # AGGRESSIVE: 1.0 → 2.5 (2.5x REINFORCE signal)
+    # REINFORCE settings - V12.6: DISABLED FOR DEBUGGING
+    'ce_weight': 1.0,        # V12.6: Full CE weight (focus on supervised with focal loss)
+    'rl_weight': 0.0,        # V12.6: DISABLED to debug slow training (was 2.5)
     'n_samples_rloo': 2,
     'temperature': 0.5,      # AGGRESSIVE: 0.8 → 0.5 (sharper distributions)
     'entropy_weight': 0.01,
+    # V12.7: True autoregressive REINFORCE with KV caching
+    # When True, samples using decoder's sample_for_reinforce() with KV cache
+    # instead of sampling from teacher-forced logits (more accurate but slower)
+    'use_autoregressive_reinforce': True,  # Enable KV-cached autoregressive sampling
 
-    'max_formula_len': 80,
+    'max_formula_len': 60,  # V12.6: Match checkpoint (pos_encoding.pe shape)
 
     # Teacher forcing - V12.5: Decay TF to force autoregressive learning
     # Without TF decay, model never learns to handle its own errors
@@ -667,8 +669,8 @@ TRAIN_CONFIG = {
     'tf_medium': 0.5,
     'tf_mastered': 0.0,
 
-    # Mastery-aware sampling - AGGRESSIVE INTERVENTION (was: focus=1.5)
-    'use_mastery_sampling': True,
+    # Mastery-aware sampling - DISABLED (was causing issues, PyTorch 2.4 approach)
+    'use_mastery_sampling': False,
     'use_multitask_mastery': True,   # V12.1: Track formula + Tc + Magpie separately
     'mastery_window': 5,             # Rolling window for mastery tracking
     'mastery_threshold': 0.8,        # Score to consider "mastered" (for stats)
@@ -695,9 +697,97 @@ TRAIN_CONFIG = {
     'use_error_specific_boost': True,
     'digit_error_boost': 5.0,        # 5x weight for samples with recent digit errors
     'error_boost_decay': 0.8,        # Decay error boost each epoch (0.8 = 80% retained)
+
+    # V12.6: FOCAL LOSS + LABEL SMOOTHING (to break 98.8% plateau)
+    'use_focal_loss': True,          # Use focal loss instead of standard CE
+    'focal_gamma': 2.0,              # Focal loss gamma (0=CE, 2=typical focal)
+    'label_smoothing': 0.1,          # Label smoothing factor (0=no smoothing)
 }
 
-OUTPUT_DIR = PROJECT_ROOT / 'onboarding/scratch/fraction_vae_v12_output'
+OUTPUT_DIR = PROJECT_ROOT / 'outputs'
+
+
+# ============================================================================
+# FOCAL LOSS WITH LABEL SMOOTHING - Added for V12.6
+# ============================================================================
+
+class FocalLossWithLabelSmoothing(nn.Module):
+    """
+    Focal Loss with Label Smoothing for formula token prediction.
+
+    Focal Loss: FL(p_t) = -alpha * (1 - p_t)^gamma * log(p_t)
+    - Down-weights easy examples (high p_t), focuses on hard examples (low p_t)
+    - gamma=0: standard CE, gamma=2: typical focal loss
+
+    Label Smoothing: Softens one-hot targets to prevent overconfidence
+    - Instead of [0,0,1,0], uses [eps/K, eps/K, 1-eps, eps/K]
+    - Helps generalization by preventing extreme logits
+
+    Why this helps break 98.8% plateau:
+    1. At 98.8%, most tokens are "easy" - CE treats them all equally
+    2. Focal loss automatically focuses gradient on the 1.2% hard tokens
+    3. Label smoothing prevents the model from being overconfident on easy tokens
+    """
+
+    def __init__(
+        self,
+        gamma: float = 2.0,
+        alpha: float = 1.0,
+        smoothing: float = 0.1,
+        ignore_index: int = -100
+    ):
+        super().__init__()
+        self.gamma = gamma
+        self.alpha = alpha
+        self.smoothing = smoothing
+        self.ignore_index = ignore_index
+
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            logits: [batch*seq, vocab_size] or [batch, seq, vocab_size]
+            targets: [batch*seq] or [batch, seq]
+
+        Returns:
+            Scalar focal loss
+        """
+        # Flatten if needed
+        if logits.dim() == 3:
+            batch_size, seq_len, vocab_size = logits.shape
+            logits = logits.contiguous().view(-1, vocab_size)
+            targets = targets.contiguous().view(-1)
+        else:
+            vocab_size = logits.shape[-1]
+
+        # Create mask for valid tokens (not padding)
+        valid_mask = targets != self.ignore_index
+        if not valid_mask.any():
+            return torch.tensor(0.0, device=logits.device)
+
+        # Filter to valid tokens only
+        logits = logits[valid_mask]
+        targets = targets[valid_mask]
+
+        # Apply label smoothing to targets
+        # Smooth targets: (1 - smoothing) for correct class, smoothing/(K-1) for others
+        n_classes = vocab_size
+        smooth_targets = torch.zeros_like(logits)
+        smooth_targets.fill_(self.smoothing / (n_classes - 1))
+        smooth_targets.scatter_(1, targets.unsqueeze(1), 1.0 - self.smoothing)
+
+        # Compute log probabilities
+        log_probs = F.log_softmax(logits, dim=-1)
+        probs = torch.exp(log_probs)
+
+        # Focal weight: (1 - p_t)^gamma for each class
+        # p_t is the probability of the smoothed target
+        focal_weight = (1 - probs) ** self.gamma
+
+        # Focal loss with label smoothing
+        # Loss = -sum_c(smooth_target_c * focal_weight_c * log_prob_c)
+        focal_loss = -self.alpha * (smooth_targets * focal_weight * log_probs).sum(dim=-1)
+
+        return focal_loss.mean()
 
 
 # ============================================================================
@@ -737,6 +827,12 @@ class REINFORCELossV12(nn.Module):
         reward_config: Optional[RewardConfigV10] = None,
         target_cache: Optional[TargetCacheV10] = None,
         use_gpu_reward: bool = True,  # V12: GPU-native rewards
+        # V12.6: Focal loss parameters
+        focal_gamma: float = 2.0,
+        label_smoothing: float = 0.1,
+        use_focal_loss: bool = True,
+        # V12.7: True autoregressive REINFORCE with KV caching
+        use_autoregressive_reinforce: bool = False,  # Use KV-cached sampling for REINFORCE
     ):
         super().__init__()
 
@@ -755,10 +851,133 @@ class REINFORCELossV12(nn.Module):
         self.target_cache = target_cache
         self.use_gpu_reward = use_gpu_reward  # V12: Use GPU-native rewards
 
-        self.ce_loss = nn.CrossEntropyLoss(reduction='none', ignore_index=PAD_IDX)
+        # V12.6: Use focal loss with label smoothing to break 98.8% plateau
+        self.use_focal_loss = use_focal_loss
+        self.focal_gamma = focal_gamma
+        self.label_smoothing = label_smoothing
+
+        # V12.7: Autoregressive REINFORCE with KV caching
+        # When True, uses decoder.sample_for_reinforce() instead of sampling from logits
+        # This is more accurate but requires passing decoder and z to forward()
+        self.use_autoregressive_reinforce = use_autoregressive_reinforce
+        self._decoder = None  # Set via set_decoder()
+        self._max_len = 60    # Max sequence length for autoregressive sampling
+
+        if use_focal_loss:
+            self.ce_loss = FocalLossWithLabelSmoothing(
+                gamma=focal_gamma,
+                smoothing=label_smoothing,
+                ignore_index=PAD_IDX
+            )
+        else:
+            self.ce_loss = nn.CrossEntropyLoss(reduction='none', ignore_index=PAD_IDX)
 
     def set_target_cache(self, target_cache: TargetCacheV10):
         self.target_cache = target_cache
+
+    def set_decoder(self, decoder, max_len: int = 60):
+        """
+        Set the decoder for autoregressive REINFORCE sampling (V12.7).
+
+        Args:
+            decoder: EnhancedTransformerDecoder instance
+            max_len: Maximum sequence length for sampling
+        """
+        self._decoder = decoder
+        self._max_len = max_len
+
+    def compute_rloo_autoregressive(
+        self,
+        z: torch.Tensor,
+        targets: torch.Tensor,
+        encoder_skip: torch.Tensor = None,
+        stoich_pred: torch.Tensor = None,
+    ):
+        """
+        V12.7: Compute RLOO advantages using true autoregressive sampling with KV cache.
+
+        This is more accurate than sampling from teacher-forced logits because it
+        uses the model's actual autoregressive behavior. The KV caching makes this
+        ~60x faster than naive autoregressive sampling.
+
+        Args:
+            z: Latent vectors [batch, latent_dim]
+            targets: Target tokens [batch, seq_len]
+            encoder_skip: Optional skip connection
+            stoich_pred: Optional stoichiometry conditioning
+
+        Returns:
+            advantages: RLOO advantages [batch]
+            mean_log_probs: Mean log probabilities [batch]
+            mean_rewards: Mean rewards [batch]
+        """
+        if self._decoder is None:
+            raise RuntimeError("Decoder not set. Call set_decoder() first.")
+
+        batch_size = z.shape[0]
+        n_samples = self.n_samples_rloo
+        all_rewards = []
+        all_log_probs = []
+
+        # Create target mask
+        target_mask = (targets != PAD_IDX)
+
+        for _ in range(n_samples):
+            # Sample autoregressively using KV-cached generation
+            # V12.8: Now returns 4 values (tokens, log_probs, entropy, mask)
+            sampled_tokens, log_probs, _entropy, mask = self._decoder.sample_for_reinforce(
+                z=z,
+                encoder_skip=encoder_skip,
+                stoich_pred=stoich_pred,
+                temperature=self.temperature,
+                max_len=self._max_len,
+            )
+
+            # Compute rewards using GPU-native method
+            if self.use_gpu_reward:
+                # Pad sampled tokens to match target length if needed
+                if sampled_tokens.size(1) < targets.size(1):
+                    pad_len = targets.size(1) - sampled_tokens.size(1)
+                    sampled_tokens = F.pad(sampled_tokens, (0, pad_len), value=PAD_IDX)
+                    log_probs = F.pad(log_probs, (0, pad_len), value=0.0)
+                    mask = F.pad(mask, (0, pad_len), value=0.0)
+                elif sampled_tokens.size(1) > targets.size(1):
+                    sampled_tokens = sampled_tokens[:, :targets.size(1)]
+                    log_probs = log_probs[:, :targets.size(1)]
+                    mask = mask[:, :targets.size(1)]
+
+                rewards = compute_reward_gpu_native(
+                    sampled_tokens, targets, mask,
+                    config=self.gpu_reward_config,
+                    pad_idx=PAD_IDX, end_idx=END_IDX
+                )
+            else:
+                rewards = compute_reward_v10(
+                    sampled_tokens, targets, IDX_TO_TOKEN,
+                    mask, self.reward_config, self.target_cache
+                )
+
+            # Sum log probs over sequence
+            seq_log_prob = (log_probs * mask).sum(dim=1)
+            all_rewards.append(rewards)
+            all_log_probs.append(seq_log_prob)
+
+        # RLOO baseline computation
+        rewards_stack = torch.stack(all_rewards, dim=0)
+        log_probs_stack = torch.stack(all_log_probs, dim=0)
+        total_reward = rewards_stack.sum(dim=0)
+
+        advantages_list = []
+        for i in range(n_samples):
+            baseline_i = (total_reward - rewards_stack[i]) / (n_samples - 1)
+            advantage_i = rewards_stack[i] - baseline_i
+            advantages_list.append(advantage_i)
+
+        advantages = torch.stack(advantages_list, dim=0).mean(dim=0)
+        mean_log_probs = log_probs_stack.mean(dim=0)
+        mean_rewards = rewards_stack.mean(dim=0)
+
+        return advantages, mean_log_probs, mean_rewards
 
     def sample_from_logits(self, logits: torch.Tensor, temperature: float):
         batch_size, seq_len, vocab_size = logits.shape
@@ -830,25 +1049,69 @@ class REINFORCELossV12(nn.Module):
         element_fractions: Optional[torch.Tensor] = None,
         element_mask: Optional[torch.Tensor] = None,
         element_count_pred: Optional[torch.Tensor] = None,
+        # V12.7: Autoregressive REINFORCE inputs (optional)
+        z: Optional[torch.Tensor] = None,
+        encoder_skip: Optional[torch.Tensor] = None,
+        stoich_pred_for_reinforce: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
-        """Compute V12 combined loss with stoichiometry awareness (V12.4)."""
+        """Compute V12 combined loss with stoichiometry awareness (V12.4).
+
+        V12.7: When use_autoregressive_reinforce=True and z is provided, uses
+        true autoregressive sampling with KV caching for REINFORCE instead of
+        sampling from teacher-forced logits.
+        """
+        import time
+        t0 = time.time()
+
         batch_size, seq_len, vocab_size = formula_logits.shape
 
         if mask is None:
             mask = formula_targets != PAD_IDX
 
-        # 1. Formula CE Loss
-        logits_flat = formula_logits.contiguous().view(-1, vocab_size)
-        targets_flat = formula_targets.contiguous().view(-1)
-        ce_loss_per_token = self.ce_loss(logits_flat, targets_flat)
-        ce_loss_per_token = ce_loss_per_token.view(batch_size, seq_len)
-        formula_ce_loss = (ce_loss_per_token * mask.float()).sum(dim=1).mean()
+        # 1. Formula CE Loss (V12.6: handles both focal loss and standard CE)
+        t1 = time.time()
+        if self.use_focal_loss:
+            # FocalLossWithLabelSmoothing returns a scalar directly
+            # Pass the full tensors with mask handled internally
+            targets_with_pad = formula_targets.clone()
+            targets_with_pad[~mask] = PAD_IDX  # Mark non-valid positions
+            formula_ce_loss = self.ce_loss(formula_logits, targets_with_pad)
+        else:
+            # Standard CE returns per-token loss
+            logits_flat = formula_logits.contiguous().view(-1, vocab_size)
+            targets_flat = formula_targets.contiguous().view(-1)
+            ce_loss_per_token = self.ce_loss(logits_flat, targets_flat)
+            ce_loss_per_token = ce_loss_per_token.view(batch_size, seq_len)
+            formula_ce_loss = (ce_loss_per_token * mask.float()).sum(dim=1).mean()
 
-        # 2. Formula REINFORCE Loss
-        advantages, mean_log_probs, mean_rewards = self.compute_rloo_advantages(
-            formula_logits, formula_targets, mask
-        )
-        reinforce_loss = -(advantages * mean_log_probs).mean()
+        t2 = time.time()
+        # 2. Formula REINFORCE Loss - SKIP if rl_weight=0
+        if self.rl_weight > 0:
+            # V12.7: Use true autoregressive sampling with KV cache if enabled
+            if self.use_autoregressive_reinforce and z is not None and self._decoder is not None:
+                advantages, mean_log_probs, mean_rewards = self.compute_rloo_autoregressive(
+                    z=z,
+                    targets=formula_targets,
+                    encoder_skip=encoder_skip,
+                    stoich_pred=stoich_pred_for_reinforce,
+                )
+            else:
+                # Original: sample from teacher-forced logits (faster but less accurate)
+                advantages, mean_log_probs, mean_rewards = self.compute_rloo_advantages(
+                    formula_logits, formula_targets, mask
+                )
+            reinforce_loss = -(advantages * mean_log_probs).mean()
+        else:
+            # Skip REINFORCE computation entirely
+            reinforce_loss = torch.tensor(0.0, device=formula_logits.device)
+            mean_rewards = torch.tensor(0.0, device=formula_logits.device)
+        t3 = time.time()
+        # Print timing for first 5 calls
+        if not hasattr(self, '_timing_count'):
+            self._timing_count = 0
+        if self._timing_count < 5:
+            print(f"  [TIMING] CE: {(t2-t1)*1000:.1f}ms, REINFORCE: {(t3-t2)*1000:.1f}ms", flush=True)
+            self._timing_count += 1
 
         # 3. Entropy Bonus
         probs = F.softmax(formula_logits, dim=-1)
@@ -956,7 +1219,7 @@ def load_data():
     print("STEP 1: Loading Full Materials Data (V12.5 - FIXED)")
     print("=" * 60)
 
-    fraction_path = PROJECT_ROOT / 'data/superconductor/processed/supercon_fractions.csv'
+    fraction_path = PROJECT_ROOT / 'data/processed/supercon_fractions.csv'
     df = pd.read_csv(fraction_path)
 
     print(f"Loaded {len(df)} samples from {fraction_path}")
@@ -1136,26 +1399,33 @@ def prepare_data(df, holdout_indices, magpie_cols, config):
                 perfection_threshold=config.get('perfection_threshold', 0.95),
             )
 
-        train_loader = DataLoader(
-            train_dataset,
-            batch_size=config['batch_size'],
-            sampler=mastery_sampler,  # Use mastery-weighted sampling
-            num_workers=config.get('num_workers', 8),
-            pin_memory=config.get('pin_memory', True),
-            persistent_workers=True if config.get('num_workers', 8) > 0 else False,
-            prefetch_factor=config.get('prefetch_factor', 4),
-        )
+        # V12.6: Build DataLoader kwargs conditionally (prefetch_factor requires num_workers > 0)
+        num_workers = config.get('num_workers', 0)
+        loader_kwargs = {
+            'batch_size': config['batch_size'],
+            'sampler': mastery_sampler,
+            'num_workers': num_workers,
+            'pin_memory': config.get('pin_memory', True),
+        }
+        if num_workers > 0:
+            loader_kwargs['prefetch_factor'] = config.get('prefetch_factor', 4)
+            loader_kwargs['persistent_workers'] = False
+
+        train_loader = DataLoader(train_dataset, **loader_kwargs)
     else:
         # Standard random sampling
-        train_loader = DataLoader(
-            train_dataset,
-            batch_size=config['batch_size'],
-            shuffle=True,
-            num_workers=config.get('num_workers', 8),
-            pin_memory=config.get('pin_memory', True),
-            persistent_workers=True if config.get('num_workers', 8) > 0 else False,
-            prefetch_factor=config.get('prefetch_factor', 4),
-        )
+        num_workers = config.get('num_workers', 0)
+        loader_kwargs = {
+            'batch_size': config['batch_size'],
+            'shuffle': True,
+            'num_workers': num_workers,
+            'pin_memory': config.get('pin_memory', True),
+        }
+        if num_workers > 0:
+            loader_kwargs['prefetch_factor'] = config.get('prefetch_factor', 4)
+            loader_kwargs['persistent_workers'] = False
+
+        train_loader = DataLoader(train_dataset, **loader_kwargs)
 
     # Store normalization stats for later
     norm_stats = {
@@ -1366,7 +1636,11 @@ def train_epoch(encoder, formula_decoder, train_loader, loss_fn,
     encoder_optimizer.zero_grad()
     decoder_optimizer.zero_grad()
 
+    import time
+    batch_times = []
+
     for batch_idx, batch in enumerate(train_loader):
+        batch_start = time.time()
         elem_idx, elem_frac, elem_mask, tokens, tc, magpie = [b.to(device) for b in batch]
 
         # PER-BATCH ADAPTIVE TEACHER FORCING based on sample mastery
@@ -1391,10 +1665,8 @@ def train_epoch(encoder, formula_decoder, train_loader, loss_fn,
                 batch_tf_ratio = config.get('tf_mastered', 0.0)
 
         # OPTIMIZATION: Mixed precision forward pass
-        # V12.5: Disable autocast for scheduled sampling (TF < 1.0) to avoid CUDA issues
-        use_amp_this_batch = use_amp and (batch_tf_ratio >= 1.0)
-
-        with autocast(enabled=use_amp_this_batch):
+        # V12.6: Always use AMP - the V12.5 workaround was causing epoch boundary crashes
+        with autocast(enabled=use_amp):
             # V12: Full materials encoding
             encoder_out = encoder(elem_idx, elem_frac, elem_mask, magpie, tc)
             z = encoder_out['z']
@@ -1439,6 +1711,10 @@ def train_epoch(encoder, formula_decoder, train_loader, loss_fn,
                 element_fractions=elem_frac,
                 element_mask=elem_mask,
                 element_count_pred=element_count_pred,
+                # V12.7: Autoregressive REINFORCE inputs
+                z=z,
+                encoder_skip=attended_input,
+                stoich_pred_for_reinforce=stoich_pred,
             )
 
             loss = loss_dict['total'] / config['accumulation_steps']
@@ -1486,6 +1762,12 @@ def train_epoch(encoder, formula_decoder, train_loader, loss_fn,
         # V12.5: Track actual TF used (for logging)
         total_tf_used += batch_tf_ratio
         n_batches += 1
+
+        # TIMING DEBUG: Track batch time
+        batch_time = time.time() - batch_start
+        batch_times.append(batch_time)
+        if batch_idx < 5 or batch_idx % 100 == 0:
+            print(f"  [Batch {batch_idx}: {batch_time:.2f}s]", flush=True)
 
         # Track per-sample mastery (V12.1: multi-task)
         if track_mastery:
@@ -1639,7 +1921,20 @@ def train_v12(encoder, formula_decoder, train_loader, target_cache, device, conf
         n_samples_rloo=config['n_samples_rloo'],
         temperature=config['temperature'],
         target_cache=target_cache,
+        # V12.6: Focal loss parameters
+        use_focal_loss=config.get('use_focal_loss', True),
+        focal_gamma=config.get('focal_gamma', 2.0),
+        label_smoothing=config.get('label_smoothing', 0.1),
+        # V12.7: Autoregressive REINFORCE with KV caching
+        use_autoregressive_reinforce=config.get('use_autoregressive_reinforce', False),
     )
+
+    # V12.7: Set decoder for autoregressive REINFORCE (if enabled)
+    if config.get('use_autoregressive_reinforce', False):
+        loss_fn.set_decoder(formula_decoder, max_len=config['max_formula_len'])
+        print(f"\n*** V12.7: AUTOREGRESSIVE REINFORCE ENABLED ***")
+        print(f"  Using KV-cached sampling for REINFORCE (true autoregressive)")
+        print(f"  Max sequence length: {config['max_formula_len']}")
 
     # OPTIMIZATION: Mixed precision scaler
     scaler = GradScaler(enabled=config.get('use_amp', True))
@@ -1664,6 +1959,15 @@ def train_v12(encoder, formula_decoder, train_loader, target_cache, device, conf
     print(f"  Magpie weight: {config['magpie_weight']}")
     print(f"  KL weight: {config['kl_weight']}")
     print(f"  Epochs: {config['num_epochs']}")
+
+    # V12.6: Log focal loss settings
+    if config.get('use_focal_loss', True):
+        print(f"\n*** V12.6: FOCAL LOSS ENABLED ***")
+        print(f"  Gamma: {config.get('focal_gamma', 2.0)} (0=CE, 2=typical focal)")
+        print(f"  Label smoothing: {config.get('label_smoothing', 0.1)}")
+        print(f"  Purpose: Focus gradient on the ~1% hard tokens to break plateau")
+    else:
+        print(f"\n  Using standard CrossEntropyLoss (focal loss disabled)")
 
     history = {
         'train_loss': [], 'train_reward': [], 'train_exact': [],
@@ -1868,25 +2172,15 @@ def main():
         df, holdout_indices, magpie_cols, TRAIN_CONFIG
     )
 
-    # V12.5: Decoder-only warm-start from 93.14% checkpoint
-    # The decoder learned correct fraction syntax, encoder was trained on wrong format
-    # Encoder needs fresh init to learn correct fraction input mapping
-    is_v12_checkpoint = False  # Decoder-only loading
-
-    if V12_DECODER_WARMSTART.exists():
-        checkpoint_path = V12_DECODER_WARMSTART
-        print(f"V12.5: DECODER warm-start from 93.14% checkpoint")
-        print(f"  -> Decoder: Loading pretrained weights (learned fraction syntax)")
-        print(f"  -> Encoder: Fresh initialization (learning fraction input)")
-    elif V11_CHECKPOINT.exists():
-        checkpoint_path = V11_CHECKPOINT
-        print(f"Using V11 checkpoint for formula decoder warm-start")
-    elif V10_CHECKPOINT.exists():
-        checkpoint_path = V10_CHECKPOINT
-        print(f"Using V10 checkpoint for formula decoder warm-start")
+    # Check for resume checkpoint
+    is_v12_checkpoint = False
+    if RESUME_CHECKPOINT is not None and Path(RESUME_CHECKPOINT).exists():
+        checkpoint_path = Path(RESUME_CHECKPOINT)
+        is_v12_checkpoint = True  # Full resume
+        print(f"Resuming training from checkpoint: {checkpoint_path}")
     else:
         checkpoint_path = Path('/nonexistent')  # Will use fresh weights
-        print(f"No checkpoint found, using fresh weights")
+        print(f"Training from scratch (no checkpoint)")
 
     # Create models (with full resume if V12 checkpoint)
     encoder, formula_decoder, resume_state = load_models(device, checkpoint_path, len(magpie_cols), is_v12_checkpoint)

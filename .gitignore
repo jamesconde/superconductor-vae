@@ -43,6 +43,14 @@ checkpoints/
 outputs/
 logs/
 
+# Scratch directory (keep README)
+scratch/*
+!scratch/README.md
+
 # OS
 .DS_Store
 Thumbs.db
+*:Zone.Identifier
+
+# Personal/private documents
+docs/PERSONAL_*.md

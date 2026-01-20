@@ -25,6 +25,21 @@ from .soft_token_sampling import (
     create_soft_token_training_components,
 )
 
+from .entropy_maintenance import (
+    EntropyManager,
+    EntropyConfig,
+    EntropyStrategy,
+    AdaptiveEntropyScheduler,
+    CausalEntropyScheduler,
+    TemperatureWarmRestartScheduler,
+    PerPositionEntropyWeighter,
+    NoveltyBonus,
+    UncertaintyGuidedExploration,
+    create_entropy_manager,
+    get_adaptive_entropy_weight,
+    compute_position_weighted_entropy_loss,
+)
+
 __all__ = [
     # Mastery-aware sampling
     'MasteryTracker',
@@ -43,4 +58,17 @@ __all__ = [
     'SoftTokenMixer',
     'SoftTokenDecoder',
     'create_soft_token_training_components',
+    # Entropy maintenance
+    'EntropyManager',
+    'EntropyConfig',
+    'EntropyStrategy',
+    'AdaptiveEntropyScheduler',
+    'CausalEntropyScheduler',
+    'TemperatureWarmRestartScheduler',
+    'PerPositionEntropyWeighter',
+    'NoveltyBonus',
+    'UncertaintyGuidedExploration',
+    'create_entropy_manager',
+    'get_adaptive_entropy_weight',
+    'compute_position_weighted_entropy_loss',
 ]
