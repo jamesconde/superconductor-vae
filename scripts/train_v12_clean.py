@@ -1477,7 +1477,11 @@ def train():
     # AMP scaler (updated API for PyTorch 2.4+)
     # Note: GradScaler may not be needed for bfloat16 (no underflow issues)
     use_scaler = TRAIN_CONFIG['use_amp'] and amp_dtype_str != 'bfloat16'
-    scaler = GradScaler('cuda', enabled=use_scaler)
+    # Old PyTorch GradScaler doesn't accept device argument
+    try:
+        scaler = GradScaler('cuda', enabled=use_scaler)
+    except TypeError:
+        scaler = GradScaler(enabled=use_scaler)
     print(f"AMP: dtype={amp_dtype_str}, scaler={'enabled' if use_scaler else 'disabled'}")
 
     print("\n" + "=" * 60)
