@@ -111,7 +111,7 @@ TRAIN_CONFIG = {
 
     # V12.8: Mixed Precision Optimizations
     'use_amp': True,
-    'amp_dtype': 'bfloat16',    # bfloat16 for better stability (or 'float16')
+    'amp_dtype': 'auto',        # 'auto' detects GPU capability, or force 'bfloat16'/'float16'
     'matmul_precision': 'medium',  # 'highest', 'high', 'medium' for TF32
 
     # V12.8: Learning Rate Schedule
@@ -1436,8 +1436,21 @@ def train():
     _shutdown_state['enc_scheduler'] = enc_scheduler
     _shutdown_state['dec_scheduler'] = dec_scheduler
 
-    # V12.8: AMP dtype configuration
-    amp_dtype_str = TRAIN_CONFIG.get('amp_dtype', 'float16')
+    # V12.8: AMP dtype configuration with auto-detection
+    # bfloat16 requires compute capability 8.0+ (Ampere: RTX 30xx, A100, etc.)
+    # Older GPUs (GTX 1080 Ti, RTX 20xx, etc.) only support float16
+    amp_dtype_str = TRAIN_CONFIG.get('amp_dtype', 'auto')
+    if amp_dtype_str == 'auto':
+        if torch.cuda.is_available():
+            capability = torch.cuda.get_device_capability()
+            if capability[0] >= 8:  # Ampere or newer
+                amp_dtype_str = 'bfloat16'
+                print(f"GPU compute capability {capability[0]}.{capability[1]} - using bfloat16")
+            else:
+                amp_dtype_str = 'float16'
+                print(f"GPU compute capability {capability[0]}.{capability[1]} - using float16 (bfloat16 not supported)")
+        else:
+            amp_dtype_str = 'float16'
     amp_dtype = torch.bfloat16 if amp_dtype_str == 'bfloat16' else torch.float16
 
     # AMP scaler (updated API for PyTorch 2.4+)
