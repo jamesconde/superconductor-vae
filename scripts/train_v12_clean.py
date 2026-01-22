@@ -67,7 +67,7 @@ MODEL_CONFIG = {
 
 TRAIN_CONFIG = {
     'num_epochs': 2000,
-    'learning_rate': 1e-4,
+    'learning_rate': 3e-5,      # Reduced for stable fine-tuning (was 1e-4)
     'max_formula_len': 60,
     'checkpoint_interval': 50,
 
@@ -83,7 +83,7 @@ TRAIN_CONFIG = {
     # Effective batch size = batch_size * accumulation_steps
     # Larger effective batch = smoother gradients, but may need LR scaling
     # =========================================================================
-    'batch_size': 16,           # Per-GPU batch size (reduce if OOM)
+    'batch_size': 32,           # Per-GPU batch size (reduce if OOM)
     'accumulation_steps': 1,    # Gradient accumulation (increase for larger effective batch)
     'auto_batch_size': False,   # If True, automatically find max batch size (experimental)
 
@@ -99,13 +99,13 @@ TRAIN_CONFIG = {
     'matmul_precision': 'medium',  # 'highest', 'high', 'medium' for TF32
 
     # V12.8: Learning Rate Schedule
-    'lr_scheduler': 'cosine_warm_restarts',  # 'cosine', 'cosine_warm_restarts', 'one_cycle'
+    'lr_scheduler': 'cosine',  # Plain cosine decay - no restarts for stable fine-tuning
     'lr_restart_period': 100,   # T_0 for warm restarts
     'lr_restart_mult': 2,       # T_mult - double period after each restart
     'lr_min_factor': 0.01,      # eta_min = lr * this factor
 
     # V12.8: Compute Optimizations
-    'use_torch_compile': False,  # Enable torch.compile (requires PyTorch 2.0+)
+    'use_torch_compile': True,   # V12.10: Works with resume (gcc installed in conda env)
     'compile_mode': 'reduce-overhead',  # 'default', 'reduce-overhead', 'max-autotune'
     'use_gradient_checkpointing': False,  # Trade compute for memory (enables larger batch)
     'enable_flash_sdp': True,   # Enable Flash Attention via SDPA
@@ -172,7 +172,7 @@ TRAIN_CONFIG = {
     'entropy_plateau_relative': True,    # If True, threshold scales with performance
 
     # Resume from checkpoint (set to None to train from scratch)
-    'resume_checkpoint': 'outputs/checkpoint_interrupt.pt',  # V12.10: Resume from interrupt checkpoint
+    'resume_checkpoint': 'outputs/checkpoint_best.pt',  # V12.10: Resume from best checkpoint
 }
 
 DATA_PATH = PROJECT_ROOT / 'data/processed/supercon_fractions.csv'
@@ -938,6 +938,7 @@ def save_checkpoint(encoder, decoder, epoch, suffix='', entropy_manager=None,
         checkpoint_data['dec_optimizer_state_dict'] = dec_opt.state_dict()
     if enc_scheduler is not None:
         checkpoint_data['enc_scheduler_state_dict'] = enc_scheduler.state_dict()
+        checkpoint_data['scheduler_type'] = type(enc_scheduler).__name__  # V12.11: Track scheduler type
     if dec_scheduler is not None:
         checkpoint_data['dec_scheduler_state_dict'] = dec_scheduler.state_dict()
 
@@ -951,6 +952,25 @@ def save_checkpoint(encoder, decoder, epoch, suffix='', entropy_manager=None,
     print(f"  Saved checkpoint: {path.name}", flush=True)
 
 
+def _strip_compiled_prefix(state_dict):
+    """Strip '_orig_mod.' prefix from compiled model state dict keys.
+
+    Handles both top-level prefixes (encoder) and nested prefixes (decoder's
+    transformer_decoder was compiled separately, creating keys like
+    'transformer_decoder._orig_mod.layers.0...').
+    """
+    new_state_dict = {}
+    for key, value in state_dict.items():
+        new_key = key
+        # Handle top-level _orig_mod. prefix
+        if new_key.startswith('_orig_mod.'):
+            new_key = new_key[len('_orig_mod.'):]
+        # Handle nested _orig_mod. prefixes (from separately compiled submodules)
+        new_key = new_key.replace('._orig_mod.', '.')
+        new_state_dict[new_key] = value
+    return new_state_dict
+
+
 def load_checkpoint(encoder, decoder, checkpoint_path, entropy_manager=None,
                     enc_opt=None, dec_opt=None, enc_scheduler=None, dec_scheduler=None):
     """Load model checkpoint with full training state for proper resumption.
@@ -959,8 +979,24 @@ def load_checkpoint(encoder, decoder, checkpoint_path, entropy_manager=None,
         dict with keys: 'start_epoch', 'prev_exact', 'best_exact'
     """
     checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
-    encoder.load_state_dict(checkpoint['encoder_state_dict'])
-    decoder.load_state_dict(checkpoint['decoder_state_dict'])
+
+    # V12.10: Handle checkpoints saved with torch.compile (have '_orig_mod.' prefix)
+    enc_state = checkpoint['encoder_state_dict']
+    dec_state = checkpoint['decoder_state_dict']
+
+    # Check if checkpoint was saved with compiled model
+    # Check for top-level prefix (encoder) or nested prefix (decoder's transformer_decoder)
+    has_compiled_prefix = (
+        any(k.startswith('_orig_mod.') for k in enc_state.keys()) or
+        any('._orig_mod.' in k for k in dec_state.keys())
+    )
+    if has_compiled_prefix:
+        print("  Detected compiled checkpoint - stripping '_orig_mod.' prefixes", flush=True)
+        enc_state = _strip_compiled_prefix(enc_state)
+        dec_state = _strip_compiled_prefix(dec_state)
+
+    encoder.load_state_dict(enc_state)
+    decoder.load_state_dict(dec_state)
     start_epoch = checkpoint.get('epoch', 0) + 1  # Resume from next epoch
     print(f"  Loaded checkpoint from epoch {checkpoint.get('epoch', 'unknown')}", flush=True)
 
@@ -977,13 +1013,26 @@ def load_checkpoint(encoder, decoder, checkpoint_path, entropy_manager=None,
         dec_opt.load_state_dict(checkpoint['dec_optimizer_state_dict'])
         print(f"  Restored decoder optimizer state", flush=True)
 
-    # V12.10: Load scheduler state if available
+    # V12.11: Load scheduler state if available AND scheduler type matches
+    # Incompatible scheduler types (e.g., CosineAnnealingWarmRestarts vs CosineAnnealingLR)
+    # have different internal states and loading across types causes training instability
+    saved_scheduler_type = checkpoint.get('scheduler_type', None)
+    current_scheduler_type = type(enc_scheduler).__name__ if enc_scheduler else None
+
     if enc_scheduler is not None and 'enc_scheduler_state_dict' in checkpoint:
-        enc_scheduler.load_state_dict(checkpoint['enc_scheduler_state_dict'])
-        print(f"  Restored encoder scheduler state", flush=True)
+        if saved_scheduler_type is None:
+            # Old checkpoint without scheduler type - skip to be safe
+            print(f"  Skipping scheduler restore (old checkpoint, type unknown)", flush=True)
+        elif saved_scheduler_type == current_scheduler_type:
+            enc_scheduler.load_state_dict(checkpoint['enc_scheduler_state_dict'])
+            print(f"  Restored encoder scheduler state", flush=True)
+        else:
+            print(f"  Skipping scheduler restore (type changed: {saved_scheduler_type} → {current_scheduler_type})", flush=True)
     if dec_scheduler is not None and 'dec_scheduler_state_dict' in checkpoint:
-        dec_scheduler.load_state_dict(checkpoint['dec_scheduler_state_dict'])
-        print(f"  Restored decoder scheduler state", flush=True)
+        if saved_scheduler_type is not None and saved_scheduler_type == current_scheduler_type:
+            dec_scheduler.load_state_dict(checkpoint['dec_scheduler_state_dict'])
+            print(f"  Restored decoder scheduler state", flush=True)
+        # Skip silently if types don't match (warning printed above)
 
     # V12.10: Return training state variables
     result = {
@@ -1246,16 +1295,8 @@ def train():
     # Create models
     encoder, decoder = create_models(magpie_dim, device)
 
-    # V12.8: Optional torch.compile for speedup
-    if TRAIN_CONFIG.get('use_torch_compile', False):
-        compile_mode = TRAIN_CONFIG.get('compile_mode', 'reduce-overhead')
-        print(f"Compiling models with mode='{compile_mode}'...")
-        encoder = torch.compile(encoder, mode=compile_mode)
-        # Compile decoder's transformer, not the whole decoder (KV cache needs dynamic shapes)
-        decoder.transformer_decoder = torch.compile(
-            decoder.transformer_decoder, mode=compile_mode
-        )
-        print("  Encoder and decoder.transformer_decoder compiled")
+    # NOTE: torch.compile moved to AFTER checkpoint loading (see below)
+    # This allows loading checkpoints saved without compile into models that will be compiled
 
     _shutdown_state['encoder'] = encoder
     _shutdown_state['decoder'] = decoder
@@ -1442,6 +1483,25 @@ def train():
             print(f"\nWarning: Checkpoint not found: {checkpoint_path}")
             print("  Starting from scratch...")
 
+    # V12.10: torch.compile AFTER checkpoint loading (allows loading non-compiled checkpoints)
+    if TRAIN_CONFIG.get('use_torch_compile', False):
+        compile_mode = TRAIN_CONFIG.get('compile_mode', 'reduce-overhead')
+        print(f"\nCompiling models with mode='{compile_mode}'...")
+        encoder = torch.compile(encoder, mode=compile_mode)
+        # Compile decoder's transformer, not the whole decoder (KV cache needs dynamic shapes)
+        decoder.transformer_decoder = torch.compile(
+            decoder.transformer_decoder, mode=compile_mode
+        )
+        # Update references
+        _shutdown_state['encoder'] = encoder
+        loss_fn.set_decoder(decoder, max_len=TRAIN_CONFIG['max_formula_len'])
+        print("  Encoder and decoder.transformer_decoder compiled")
+
+    # V12.11: Rollback loop detection
+    rollback_count = 0
+    max_rollbacks = 3  # Stop training if we hit this many rollbacks
+    last_rollback_epoch = -100  # Track when last rollback occurred
+
     for epoch in range(start_epoch, TRAIN_CONFIG['num_epochs']):
         _shutdown_state['epoch'] = epoch
 
@@ -1473,9 +1533,63 @@ def train():
             accumulation_steps=TRAIN_CONFIG.get('accumulation_steps', 1),  # V12.8: Grad accumulation
         )
 
-        # Update prev_exact for adaptive teacher forcing
+        # V12.11: Catastrophic drop detection - rollback to best checkpoint and halve LR
+        # This protects against scheduler bugs, gradient explosions, or other instabilities
+        current_exact = metrics['exact_match']
+        best_checkpoint_path = OUTPUT_DIR / 'checkpoint_best.pt'
+        rolled_back = False
+
+        # Reset rollback counter if training has been stable for 50+ epochs
+        if epoch - last_rollback_epoch > 50:
+            rollback_count = 0
+
+        if prev_exact > 0.1 and (prev_exact - current_exact) > 0.05:
+            drop_pct = (prev_exact - current_exact) * 100
+            rollback_count += 1
+            last_rollback_epoch = epoch
+            print(f"  [SAFETY] Catastrophic drop detected ({drop_pct:.1f}%) - rollback #{rollback_count}", flush=True)
+
+            # Check for rollback loop
+            if rollback_count >= max_rollbacks:
+                print(f"\n[SAFETY] ERROR: Hit {max_rollbacks} rollbacks - something is fundamentally wrong!", flush=True)
+                print(f"[SAFETY] Saving emergency checkpoint and stopping training.", flush=True)
+                save_checkpoint(encoder, decoder, epoch, 'emergency',
+                               entropy_manager=entropy_manager,
+                               enc_opt=enc_opt, dec_opt=dec_opt,
+                               enc_scheduler=enc_scheduler, dec_scheduler=dec_scheduler,
+                               prev_exact=prev_exact, best_exact=best_exact)
+                raise RuntimeError(f"Training stopped: {max_rollbacks} consecutive rollbacks detected. "
+                                   f"Check data, model architecture, or hyperparameters.")
+
+            # Halve LR to prevent recurrence
+            for opt in [enc_opt, dec_opt]:
+                for param_group in opt.param_groups:
+                    param_group['lr'] *= 0.5
+            new_lr = enc_opt.param_groups[0]['lr']
+            print(f"  [SAFETY] LR halved → {new_lr:.2e}", flush=True)
+
+            # Rollback to best checkpoint if available
+            if best_checkpoint_path.exists():
+                print(f"  [SAFETY] Rolling back to checkpoint_best.pt...", flush=True)
+                rollback_state = load_checkpoint(
+                    encoder, decoder, best_checkpoint_path,
+                    entropy_manager=entropy_manager,
+                    # Don't restore optimizers/schedulers - keep current (halved) LR
+                )
+                prev_exact = rollback_state['prev_exact']
+                best_exact = rollback_state['best_exact']
+                _shutdown_state['prev_exact'] = prev_exact
+                _shutdown_state['best_exact'] = best_exact
+                rolled_back = True
+                print(f"  [SAFETY] Rolled back to epoch {rollback_state['start_epoch']-1} "
+                      f"(exact={prev_exact*100:.1f}%)", flush=True)
+            else:
+                print(f"  [SAFETY] No checkpoint_best.pt found, continuing with halved LR", flush=True)
+
+        # Update prev_exact for adaptive teacher forcing (skip if we just rolled back)
         # PyTorch 2.4+ should fix the CUDA bug that required keeping TF=1.0
-        prev_exact = metrics['exact_match']
+        if not rolled_back:
+            prev_exact = metrics['exact_match']
         _shutdown_state['prev_exact'] = prev_exact  # V12.10: Keep shutdown state current
 
         # V12.9: Update entropy manager with this epoch's metrics
