@@ -21,11 +21,23 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset, Subset
-# PyTorch 2.4+ moved GradScaler to torch.amp, older versions have it in torch.cuda.amp
+# PyTorch version compatibility for AMP (Automatic Mixed Precision)
+# PyTorch 2.0+ has unified torch.amp with device_type argument
+# Older versions use torch.cuda.amp without device_type
+import torch.cuda.amp as _cuda_amp
 try:
-    from torch.amp import autocast, GradScaler
-except ImportError:
-    from torch.cuda.amp import autocast, GradScaler
+    from torch.amp import GradScaler
+    # Test if new API works (device_type argument)
+    _test_autocast = torch.amp.autocast(device_type='cuda', enabled=False)
+    from torch.amp import autocast
+    PYTORCH_NEW_AMP = True
+except (ImportError, TypeError):
+    from torch.cuda.amp import autocast as _old_autocast, GradScaler
+    PYTORCH_NEW_AMP = False
+    # Wrapper to match new API signature
+    def autocast(device_type='cuda', dtype=None, enabled=True):
+        # Old API doesn't support dtype directly, use enabled only
+        return _old_autocast(enabled=enabled)
 from pathlib import Path
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
