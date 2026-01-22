@@ -21,7 +21,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset, Subset
-from torch.amp import autocast, GradScaler  # Updated for PyTorch 2.4+
+# PyTorch 2.4+ moved GradScaler to torch.amp, older versions have it in torch.cuda.amp
+try:
+    from torch.amp import autocast, GradScaler
+except ImportError:
+    from torch.cuda.amp import autocast, GradScaler
 from pathlib import Path
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
