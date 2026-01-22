@@ -90,18 +90,18 @@ TRAIN_CONFIG = {
     # =========================================================================
     # BATCH SIZE CONFIGURATION
     # =========================================================================
-    # Adjust these based on your GPU memory:
-    #   - RTX 3090/4090 (24GB): batch_size=16-32, accumulation_steps=1-2
-    #   - A100 (40GB):          batch_size=64, accumulation_steps=1
-    #   - A100 (80GB):          batch_size=128, accumulation_steps=1
-    #   - H100 (80GB):          batch_size=128-256, accumulation_steps=1
+    # Set to 'auto' to automatically scale based on GPU memory:
+    #   - 8GB  (RTX 4060):      batch_size=32
+    #   - 11GB (GTX 1080 Ti):   batch_size=48
+    #   - 16GB (V100 16GB):     batch_size=64
+    #   - 24GB (RTX 3090/4090): batch_size=96
+    #   - 40GB+ (A100):         batch_size=128
     #
     # Effective batch size = batch_size * accumulation_steps
     # Larger effective batch = smoother gradients, but may need LR scaling
     # =========================================================================
-    'batch_size': 32,           # Per-GPU batch size (reduce if OOM)
+    'batch_size': 'auto',       # 'auto' scales with GPU memory, or set fixed value (32, 48, etc.)
     'accumulation_steps': 1,    # Gradient accumulation (increase for larger effective batch)
-    'auto_batch_size': False,   # If True, automatically find max batch size (experimental)
 
     # V12.8: Data Loading Optimizations
     'num_workers': 4,           # Parallel data loading (set to 0 if WSL2 CUDA issues)
@@ -483,10 +483,31 @@ def load_and_prepare_data():
 
     train_dataset = Subset(dataset, train_indices)
 
+    # V12.11: Auto batch size based on GPU memory
+    batch_size = TRAIN_CONFIG['batch_size']
+    if batch_size == 'auto':
+        if torch.cuda.is_available():
+            gpu_mem_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+            # Scale batch size with GPU memory (conservative estimates)
+            if gpu_mem_gb >= 40:
+                batch_size = 128
+            elif gpu_mem_gb >= 24:
+                batch_size = 96
+            elif gpu_mem_gb >= 16:
+                batch_size = 64
+            elif gpu_mem_gb >= 11:
+                batch_size = 48
+            else:
+                batch_size = 32
+            print(f"Auto batch size: {batch_size} (GPU memory: {gpu_mem_gb:.1f}GB)")
+        else:
+            batch_size = 16  # CPU fallback
+            print(f"Auto batch size: {batch_size} (CPU mode)")
+
     # Create DataLoader with V12.8 optimizations
     use_workers = TRAIN_CONFIG['num_workers']
     loader_kwargs = {
-        'batch_size': TRAIN_CONFIG['batch_size'],
+        'batch_size': batch_size,
         'shuffle': True,
         'num_workers': use_workers,
     }
@@ -1463,7 +1484,8 @@ def train():
     print("Training")
     print("=" * 60)
     print(f"Epochs: {TRAIN_CONFIG['num_epochs']}")
-    print(f"Batch size: {TRAIN_CONFIG['batch_size']} (effective: {TRAIN_CONFIG['batch_size'] * TRAIN_CONFIG.get('accumulation_steps', 1)})")
+    actual_batch_size = train_loader.batch_size
+    print(f"Batch size: {actual_batch_size} (effective: {actual_batch_size * TRAIN_CONFIG.get('accumulation_steps', 1)})")
     print(f"Accumulation steps: {TRAIN_CONFIG.get('accumulation_steps', 1)}")
     print(f"Workers: {TRAIN_CONFIG['num_workers']}")
 
