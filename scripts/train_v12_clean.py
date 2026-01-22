@@ -488,16 +488,17 @@ def load_and_prepare_data():
     if batch_size == 'auto':
         if torch.cuda.is_available():
             gpu_mem_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
-            # Scale batch size with GPU memory (conservative estimates)
-            if gpu_mem_gb >= 40:
+            # Scale batch size with GPU memory (thresholds account for ~0.5GB reserved)
+            # GPUs report slightly less than advertised (e.g., 11GB 1080 Ti → 10.9GB)
+            if gpu_mem_gb >= 38:      # 40GB GPUs (A100)
                 batch_size = 128
-            elif gpu_mem_gb >= 24:
+            elif gpu_mem_gb >= 22:    # 24GB GPUs (RTX 3090/4090)
                 batch_size = 96
-            elif gpu_mem_gb >= 16:
+            elif gpu_mem_gb >= 15:    # 16GB GPUs (V100 16GB)
                 batch_size = 64
-            elif gpu_mem_gb >= 11:
+            elif gpu_mem_gb >= 10:    # 11GB GPUs (GTX 1080 Ti → reports 10.9GB)
                 batch_size = 48
-            else:
+            else:                     # 8GB GPUs (RTX 4060, RTX 3070)
                 batch_size = 32
             print(f"Auto batch size: {batch_size} (GPU memory: {gpu_mem_gb:.1f}GB)")
         else:
