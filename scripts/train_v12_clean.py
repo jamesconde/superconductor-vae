@@ -1513,7 +1513,15 @@ def train():
             print("  Starting from scratch...")
 
     # V12.10: torch.compile AFTER checkpoint loading (allows loading non-compiled checkpoints)
-    if TRAIN_CONFIG.get('use_torch_compile', False):
+    # V12.11: Auto-disable on older GPUs (Triton requires compute capability 7.0+)
+    use_compile = TRAIN_CONFIG.get('use_torch_compile', False)
+    if use_compile and torch.cuda.is_available():
+        capability = torch.cuda.get_device_capability()
+        if capability[0] < 7:
+            print(f"\ntorch.compile disabled: GPU compute capability {capability[0]}.{capability[1]} < 7.0 (Triton requirement)")
+            use_compile = False
+
+    if use_compile:
         compile_mode = TRAIN_CONFIG.get('compile_mode', 'reduce-overhead')
         print(f"\nCompiling models with mode='{compile_mode}'...")
         encoder = torch.compile(encoder, mode=compile_mode)
