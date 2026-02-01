@@ -50,21 +50,31 @@ superconductor-vae/
 │   ├── raw/                 # Original superconductor data (16,521 samples)
 │   └── processed/           # Fraction-notation formulas
 ├── scripts/
-│   └── train.py             # Main training script
-└── notebooks/               # Analysis notebooks
+│   ├── train.py             # Legacy training script
+│   └── train_v12_clean.py   # Main training script (V12, recommended)
+└── notebooks/
+    └── train_colab.ipynb    # Google Colab training notebook
 ```
 
 ## Usage
 
-### Training
+### Training (Local)
 
 ```bash
-PYTHONPATH=src python scripts/train.py
+PYTHONPATH=src python scripts/train_v12_clean.py
 ```
 
 Training typically requires:
 - ~2000 epochs to reach 90%+ reconstruction accuracy
 - 8-12 hours on a modern GPU (RTX 3080/4080 or better)
+
+### Training (Google Colab)
+
+A ready-to-use notebook is provided at `notebooks/train_colab.ipynb`. Upload the repo to Google Drive, open the notebook in Colab, and run the cells in order. Checkpoints are saved to Drive and persist across sessions.
+
+**Remote monitoring**: The notebook supports optional live metrics logging via GitHub Gist. Set `GIST_ID` in Cell 2 and store a GitHub token in Colab secrets to push training progress (loss, exact match, accuracy, etc.) to a gist on every checkpoint save. The current training log is viewable at:
+
+https://gist.github.com/jamesconde/acceed7daef4d6893801cc7337531b68
 
 ### Key Components
 
