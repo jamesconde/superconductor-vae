@@ -13,6 +13,7 @@ Removes complexity to isolate CUDA crash issue while keeping:
 import os
 import sys
 import json
+import hashlib
 import signal
 import re
 import numpy as np
@@ -191,7 +192,7 @@ TRAIN_CONFIG = {
     'resume_checkpoint': 'outputs/checkpoint_best.pt',  # V12.10: Resume from best checkpoint
 }
 
-DATA_PATH = PROJECT_ROOT / 'data/processed/supercon_fractions.csv'
+DATA_PATH = PROJECT_ROOT / 'data/processed/supercon_fractions_combined.csv'
 HOLDOUT_PATH = PROJECT_ROOT / 'data/GENERATIVE_HOLDOUT_DO_NOT_TRAIN.json'
 OUTPUT_DIR = PROJECT_ROOT / 'outputs'
 
@@ -387,101 +388,254 @@ def parse_fraction_formula(formula: str) -> Optional[Dict[str, float]]:
     return result if result else None
 
 
-def load_holdout_indices(holdout_path: Path) -> set:
-    """Load holdout sample indices."""
+def load_holdout_indices(holdout_path: Path, formulas: list) -> set:
+    """Load holdout sample indices by matching formulas (robust to row reordering).
+
+    Args:
+        holdout_path: Path to GENERATIVE_HOLDOUT_DO_NOT_TRAIN.json
+        formulas: List of formula strings from the loaded CSV
+
+    Returns:
+        Set of integer indices into the formulas list that are holdout samples.
+    """
     with open(holdout_path, 'r') as f:
         data = json.load(f)
-    return {s['original_index'] for s in data['holdout_samples']}
+    holdout_formulas = {s['formula'] for s in data['holdout_samples']}
+    indices = {i for i, f in enumerate(formulas) if f in holdout_formulas}
+    if len(indices) != len(holdout_formulas):
+        print(f"  WARNING: Found {len(indices)}/{len(holdout_formulas)} holdout samples in data")
+    return indices
+
+
+def _get_cache_dir():
+    """Get the data preprocessing cache directory."""
+    return PROJECT_ROOT / 'data' / 'processed' / 'cache'
+
+
+def _compute_csv_hash(csv_path: Path) -> str:
+    """Compute a fast hash of the CSV file for cache invalidation.
+
+    Uses file size + mtime as a proxy (much faster than hashing 29MB).
+    Falls back to MD5 of first+last 8KB if mtime is unreliable (e.g., Drive).
+    """
+    stat = csv_path.stat()
+    # size + mtime is fast and reliable for local files
+    quick_hash = f"{stat.st_size}_{stat.st_mtime_ns}"
+    return hashlib.md5(quick_hash.encode()).hexdigest()[:16]
+
+
+def _try_load_cache(csv_hash: str, max_formula_len: int):
+    """Try to load preprocessed tensors from cache.
+
+    Returns (tensors_dict, norm_stats, n_magpie_cols, train_indices) or None if cache miss.
+    """
+    cache_dir = _get_cache_dir()
+    meta_path = cache_dir / 'cache_meta.json'
+
+    if not meta_path.exists():
+        return None
+
+    try:
+        with open(meta_path, 'r') as f:
+            meta = json.load(f)
+
+        # Validate cache matches current data and config
+        if meta.get('csv_hash') != csv_hash:
+            print("  Cache stale: CSV changed")
+            return None
+        if meta.get('max_formula_len') != max_formula_len:
+            print("  Cache stale: max_formula_len changed")
+            return None
+
+        # Load tensors
+        tensors = {
+            'formula_tokens': torch.load(cache_dir / 'formula_tokens.pt', weights_only=True),
+            'element_indices': torch.load(cache_dir / 'element_indices.pt', weights_only=True),
+            'element_fractions': torch.load(cache_dir / 'element_fractions.pt', weights_only=True),
+            'element_mask': torch.load(cache_dir / 'element_mask.pt', weights_only=True),
+            'tc_tensor': torch.load(cache_dir / 'tc_tensor.pt', weights_only=True),
+            'magpie_tensor': torch.load(cache_dir / 'magpie_tensor.pt', weights_only=True),
+        }
+
+        norm_stats = {
+            'tc_mean': meta['tc_mean'],
+            'tc_std': meta['tc_std'],
+            'magpie_mean': meta['magpie_mean'],
+            'magpie_std': meta['magpie_std'],
+        }
+
+        train_indices = meta['train_indices']
+        n_magpie_cols = meta['n_magpie_cols']
+
+        print(f"  Loaded from cache ({len(train_indices)} train samples, {n_magpie_cols} Magpie features)")
+        return tensors, norm_stats, n_magpie_cols, train_indices
+
+    except Exception as e:
+        print(f"  Cache load failed: {e}")
+        return None
+
+
+def _save_cache(tensors: dict, norm_stats: dict, n_magpie_cols: int,
+                train_indices: list, csv_hash: str, max_formula_len: int):
+    """Save preprocessed tensors to cache for fast reload."""
+    cache_dir = _get_cache_dir()
+    cache_dir.mkdir(parents=True, exist_ok=True)
+
+    # Save tensors
+    for name, tensor in tensors.items():
+        torch.save(tensor, cache_dir / f'{name}.pt')
+
+    # Save metadata
+    meta = {
+        'csv_hash': csv_hash,
+        'max_formula_len': max_formula_len,
+        'n_magpie_cols': n_magpie_cols,
+        'train_indices': train_indices,
+        'tc_mean': norm_stats['tc_mean'],
+        'tc_std': norm_stats['tc_std'],
+        'magpie_mean': norm_stats['magpie_mean'],
+        'magpie_std': norm_stats['magpie_std'],
+    }
+    with open(cache_dir / 'cache_meta.json', 'w') as f:
+        json.dump(meta, f)
+
+    print(f"  Saved preprocessing cache to {cache_dir}")
 
 
 def load_and_prepare_data():
-    """Load and prepare full materials dataset."""
+    """Load and prepare full materials dataset.
+
+    Uses a tensor cache to skip tokenization/normalization on subsequent runs.
+    Cache is invalidated when the CSV file changes or max_formula_len changes.
+    """
     print("=" * 60)
     print("Loading Data")
     print("=" * 60)
 
-    df = pd.read_csv(DATA_PATH)
-    print(f"Loaded {len(df)} samples")
-
-    formulas = df['formula'].tolist()
-    tc_values = df['Tc'].values
-
-    # Normalize Tc
-    tc_mean, tc_std = tc_values.mean(), tc_values.std()
-    tc_normalized = (tc_values - tc_mean) / tc_std
-    print(f"Tc: mean={tc_mean:.2f}K, std={tc_std:.2f}K")
-
-    # Get Magpie features
-    exclude = ['formula', 'Tc', 'composition', 'category', 'compound possible', 'formula_original']
-    numeric_cols = df.select_dtypes(include=['number']).columns.tolist()
-    magpie_cols = [c for c in numeric_cols if c not in exclude]
-    print(f"Found {len(magpie_cols)} Magpie features")
-
-    magpie_data = df[magpie_cols].values.astype(np.float32)
-
-    # Handle NaN
-    nan_mask = np.isnan(magpie_data)
-    if nan_mask.any():
-        col_means = np.nanmean(magpie_data, axis=0)
-        for col_idx in range(magpie_data.shape[1]):
-            magpie_data[nan_mask[:, col_idx], col_idx] = col_means[col_idx]
-
-    magpie_mean = magpie_data.mean(axis=0)
-    magpie_std = magpie_data.std(axis=0) + 1e-8
-    magpie_normalized = (magpie_data - magpie_mean) / magpie_std
-
-    # Tokenize formulas
-    print("Tokenizing formulas...")
     max_len = TRAIN_CONFIG['max_formula_len']
-    all_tokens = []
-    for formula in formulas:
-        tokens = tokenize_formula(formula)
-        indices = tokens_to_indices(tokens, max_len=max_len)
-        all_tokens.append(indices)
-    formula_tokens = torch.stack(all_tokens)
 
-    # Parse element compositions
-    print("Parsing element compositions...")
-    MAX_ELEMENTS = 12
-    element_indices = torch.zeros(len(formulas), MAX_ELEMENTS, dtype=torch.long)
-    element_fractions = torch.zeros(len(formulas), MAX_ELEMENTS, dtype=torch.float32)
-    element_mask = torch.zeros(len(formulas), MAX_ELEMENTS, dtype=torch.bool)
+    # Check for valid cache
+    csv_hash = _compute_csv_hash(DATA_PATH)
+    cached = _try_load_cache(csv_hash, max_len)
 
-    for i, formula in enumerate(formulas):
-        parsed = parse_fraction_formula(formula)
-        if not parsed:
-            continue
-        total = sum(parsed.values())
-        for j, (element, frac) in enumerate(parsed.items()):
-            if j >= MAX_ELEMENTS:
-                break
-            try:
-                atomic_num = get_atomic_number(element)
-                element_indices[i, j] = atomic_num
-                element_fractions[i, j] = frac / total if total > 0 else frac
-                element_mask[i, j] = True
-            except:
+    if cached is not None:
+        tensors, norm_stats, n_magpie_cols, train_indices = cached
+
+        # Rebuild dataset from cached tensors
+        dataset = TensorDataset(
+            tensors['element_indices'], tensors['element_fractions'],
+            tensors['element_mask'], tensors['formula_tokens'],
+            tensors['tc_tensor'], tensors['magpie_tensor']
+        )
+        train_dataset = Subset(dataset, train_indices)
+        print(f"Training samples: {len(train_indices)} (from cache)")
+
+    else:
+        # Full preprocessing path
+        df = pd.read_csv(DATA_PATH)
+        print(f"Loaded {len(df)} samples")
+
+        formulas = df['formula'].tolist()
+        tc_values = df['Tc'].values
+
+        # Normalize Tc
+        tc_mean, tc_std = float(tc_values.mean()), float(tc_values.std())
+        tc_normalized = (tc_values - tc_mean) / tc_std
+        print(f"Tc: mean={tc_mean:.2f}K, std={tc_std:.2f}K")
+
+        # Get Magpie features
+        exclude = ['formula', 'Tc', 'composition', 'category', 'is_superconductor', 'compound possible', 'formula_original']
+        numeric_cols = df.select_dtypes(include=['number']).columns.tolist()
+        magpie_cols = [c for c in numeric_cols if c not in exclude]
+        n_magpie_cols = len(magpie_cols)
+        print(f"Found {n_magpie_cols} Magpie features")
+
+        magpie_data = df[magpie_cols].values.astype(np.float32)
+
+        # Handle NaN
+        nan_mask = np.isnan(magpie_data)
+        if nan_mask.any():
+            col_means = np.nanmean(magpie_data, axis=0)
+            for col_idx in range(magpie_data.shape[1]):
+                magpie_data[nan_mask[:, col_idx], col_idx] = col_means[col_idx]
+
+        magpie_mean = magpie_data.mean(axis=0)
+        magpie_std = magpie_data.std(axis=0) + 1e-8
+        magpie_normalized = (magpie_data - magpie_mean) / magpie_std
+
+        # Tokenize formulas
+        print("Tokenizing formulas...")
+        all_tokens = []
+        for formula in formulas:
+            tokens = tokenize_formula(formula)
+            indices = tokens_to_indices(tokens, max_len=max_len)
+            all_tokens.append(indices)
+        formula_tokens = torch.stack(all_tokens)
+
+        # Parse element compositions
+        print("Parsing element compositions...")
+        MAX_ELEMENTS = 12
+        element_indices = torch.zeros(len(formulas), MAX_ELEMENTS, dtype=torch.long)
+        element_fractions = torch.zeros(len(formulas), MAX_ELEMENTS, dtype=torch.float32)
+        element_mask = torch.zeros(len(formulas), MAX_ELEMENTS, dtype=torch.bool)
+
+        for i, formula in enumerate(formulas):
+            parsed = parse_fraction_formula(formula)
+            if not parsed:
                 continue
+            total = sum(parsed.values())
+            for j, (element, frac) in enumerate(parsed.items()):
+                if j >= MAX_ELEMENTS:
+                    break
+                try:
+                    atomic_num = get_atomic_number(element)
+                    element_indices[i, j] = atomic_num
+                    element_fractions[i, j] = frac / total if total > 0 else frac
+                    element_mask[i, j] = True
+                except:
+                    continue
 
-    # Create tensors
-    tc_tensor = torch.tensor(tc_normalized, dtype=torch.float32).unsqueeze(1)
-    magpie_tensor = torch.tensor(magpie_normalized, dtype=torch.float32)
+        # Create tensors
+        tc_tensor = torch.tensor(tc_normalized, dtype=torch.float32).unsqueeze(1)
+        magpie_tensor = torch.tensor(magpie_normalized, dtype=torch.float32)
 
-    # Create dataset
-    dataset = TensorDataset(
-        element_indices, element_fractions, element_mask,
-        formula_tokens, tc_tensor, magpie_tensor
-    )
+        # Get train indices (exclude holdout — matched by formula, not position)
+        holdout_indices = load_holdout_indices(HOLDOUT_PATH, formulas)
+        all_indices = set(range(len(formulas)))
+        train_indices = sorted(all_indices - holdout_indices)
 
-    # Get train indices (exclude holdout)
-    holdout_indices = load_holdout_indices(HOLDOUT_PATH)
-    all_indices = set(range(len(formulas)))
-    train_indices = sorted(all_indices - holdout_indices)
+        print(f"Training samples: {len(train_indices)}")
+        print(f"Holdout samples (NEVER TRAIN): {len(holdout_indices)}")
 
-    print(f"Training samples: {len(train_indices)}")
-    print(f"Holdout samples: {len(holdout_indices)}")
+        norm_stats = {
+            'tc_mean': tc_mean, 'tc_std': tc_std,
+            'magpie_mean': magpie_mean.tolist(),
+            'magpie_std': magpie_std.tolist(),
+        }
 
-    train_dataset = Subset(dataset, train_indices)
+        # Save cache for next run
+        _save_cache(
+            tensors={
+                'formula_tokens': formula_tokens,
+                'element_indices': element_indices,
+                'element_fractions': element_fractions,
+                'element_mask': element_mask,
+                'tc_tensor': tc_tensor,
+                'magpie_tensor': magpie_tensor,
+            },
+            norm_stats=norm_stats,
+            n_magpie_cols=n_magpie_cols,
+            train_indices=train_indices,
+            csv_hash=csv_hash,
+            max_formula_len=max_len,
+        )
+
+        # Create dataset
+        dataset = TensorDataset(
+            element_indices, element_fractions, element_mask,
+            formula_tokens, tc_tensor, magpie_tensor
+        )
+        train_dataset = Subset(dataset, train_indices)
 
     # V12.11: Auto batch size based on GPU memory
     batch_size = TRAIN_CONFIG['batch_size']
@@ -522,13 +676,7 @@ def load_and_prepare_data():
     train_loader = DataLoader(train_dataset, **loader_kwargs)
     print(f"DataLoader: workers={use_workers}, pin_memory={loader_kwargs.get('pin_memory', False)}")
 
-    norm_stats = {
-        'tc_mean': tc_mean, 'tc_std': tc_std,
-        'magpie_mean': magpie_mean.tolist(),
-        'magpie_std': magpie_std.tolist(),
-    }
-
-    return train_loader, norm_stats, len(magpie_cols)
+    return train_loader, norm_stats, n_magpie_cols
 
 
 # ============================================================================

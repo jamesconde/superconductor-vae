@@ -54,3 +54,18 @@ Thumbs.db
 
 # Personal/private documents
 docs/PERSONAL_*.md
+
+# Large raw data (DSC288 course materials)
+DSC288 Data/
+DSC288 Data*.zip
+
+# Large generated CSVs not needed for training
+data/processed/non_sc_fractions.csv
+data/processed/nemad_fractions.csv
+data/processed/supercon_fractions_contrastive.csv
+
+# Data preprocessing cache (regenerated automatically)
+data/processed/cache/
+
+# Reports directory
+reports/

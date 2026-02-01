@@ -1190,20 +1190,36 @@ class REINFORCELossV12(nn.Module):
 # DATA LOADING - V12: FULL MATERIALS (Formula + Tc + Magpie)
 # ============================================================================
 
-def load_holdout_indices(holdout_file: Path) -> set:
-    """Load the 45 holdout superconductor indices."""
+def load_holdout_indices(holdout_file: Path, formulas: list = None) -> set:
+    """Load holdout sample indices by matching formulas (robust to row reordering).
+
+    Args:
+        holdout_file: Path to GENERATIVE_HOLDOUT_DO_NOT_TRAIN.json
+        formulas: List of formula strings from the loaded CSV. If provided,
+                  matches by formula text. Falls back to original_index if not provided.
+
+    Returns:
+        Set of integer indices that are holdout samples.
+    """
     with open(holdout_file, 'r') as f:
         holdout_data = json.load(f)
-    holdout_indices = set()
-    for sample in holdout_data['holdout_samples']:
-        holdout_indices.add(sample['original_index'])
-    return holdout_indices
+
+    if formulas is not None:
+        # Robust: match by formula string
+        holdout_formulas = {s['formula'] for s in holdout_data['holdout_samples']}
+        indices = {i for i, f in enumerate(formulas) if f in holdout_formulas}
+        if len(indices) != len(holdout_formulas):
+            print(f"  WARNING: Found {len(indices)}/{len(holdout_formulas)} holdout samples in data")
+        return indices
+    else:
+        # Legacy fallback: positional index
+        return {s['original_index'] for s in holdout_data['holdout_samples']}
 
 
 def get_magpie_columns(df: pd.DataFrame) -> List[str]:
     """Get list of numeric Magpie feature columns."""
     # Exclude non-feature columns
-    exclude = ['formula', 'Tc', 'composition', 'category', 'compound possible']
+    exclude = ['formula', 'Tc', 'composition', 'category', 'is_superconductor', 'compound possible']
     numeric_cols = df.select_dtypes(include=['number']).columns.tolist()
     magpie_cols = [c for c in numeric_cols if c not in exclude]
     return magpie_cols
@@ -1219,7 +1235,7 @@ def load_data():
     print("STEP 1: Loading Full Materials Data (V12.5 - FIXED)")
     print("=" * 60)
 
-    fraction_path = PROJECT_ROOT / 'data/processed/supercon_fractions.csv'
+    fraction_path = PROJECT_ROOT / 'data/processed/supercon_fractions_combined.csv'
     df = pd.read_csv(fraction_path)
 
     print(f"Loaded {len(df)} samples from {fraction_path}")
@@ -1228,7 +1244,7 @@ def load_data():
     magpie_cols = get_magpie_columns(df)
     print(f"Found {len(magpie_cols)} Magpie feature columns")
 
-    holdout_indices = load_holdout_indices(HOLDOUT_FILE)
+    holdout_indices = load_holdout_indices(HOLDOUT_FILE, df['formula'].tolist())
     print(f"Loaded {len(holdout_indices)} holdout indices from {HOLDOUT_FILE.name}")
 
     # V12.5: Return single df instead of fraction_df, raw_df

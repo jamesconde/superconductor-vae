@@ -1,5 +1,16 @@
 # Processed Superconductor Data
 
+## Git Tracking
+
+| File | In Git | Notes |
+|------|--------|-------|
+| `supercon_fractions.csv` | Yes | Original SuperCon dataset (pre-existing) |
+| `supercon_fractions_combined.csv` | Yes | Combined training data (29MB) — **the only CSV needed for training** |
+| `nemad_fractions.csv` | No | Regenerate with `scripts/ingest_nemad.py` |
+| `non_sc_fractions.csv` | No | Regenerate with `scripts/ingest_non_sc.py` |
+| `supercon_fractions_contrastive.csv` | No | Regenerate with `scripts/ingest_non_sc.py` |
+| `cache/` | No | Auto-generated preprocessing cache (speeds up training restarts) |
+
 ## Files
 
 ### `supercon_fractions.csv` (Original)

@@ -49,10 +49,13 @@ pip install --quiet --user pandas numpy
 # Check if data exists
 echo ""
 echo "Checking data files..."
-if [ -f "data/processed/supercon_fractions.csv" ]; then
-    echo "  [OK] Training data found"
+if [ -f "data/processed/supercon_fractions_combined.csv" ]; then
+    echo "  [OK] Training data found (combined SuperCon + NEMAD)"
+elif [ -f "data/processed/supercon_fractions.csv" ]; then
+    echo "  [OK] Training data found (original SuperCon only)"
+    echo "  NOTE: Run 'python scripts/ingest_nemad.py' to create combined dataset"
 else
-    echo "  [MISSING] data/processed/supercon_fractions.csv"
+    echo "  [MISSING] data/processed/supercon_fractions_combined.csv"
     echo "  You need to upload the data file!"
 fi
 
