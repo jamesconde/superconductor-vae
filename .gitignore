@@ -52,8 +52,9 @@ scratch/*
 Thumbs.db
 *:Zone.Identifier
 
-# Personal/private documents
+# Personal/private/speculative documents
 docs/PERSONAL_*.md
+docs/VISION_*.md
 
 # Large raw data (DSC288 course materials)
 DSC288 Data/
