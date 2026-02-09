@@ -1,0 +1,347 @@
+# Training Records
+
+Chronological record of training runs, architecture changes, and optimization decisions for the Superconductor VAE.
+
+---
+
+## Run 6: Training Resumed After NaN Fix (2026-02-03)
+
+**Status**: Running
+**Script**: `scripts/train_v12_clean.py` V12.14 (NaN gradient guards)
+**Resume from**: checkpoint_final.pt → checkpoint_best.pt (epoch 1354, exact=28.0%)
+**Log**: `outputs/training_deterministic_overnight_v4.log`
+**GPU**: RTX 4060 Laptop 8GB (local)
+
+### V12.14 NaN Gradient Guards
+
+Run 5 encountered progressive optimizer corruption from sporadic NaN in the encoder latent `z`. The NaN did not always propagate to the total loss (masked by bfloat16 autocast or loss component structure), so the existing loss-level NaN guard (V12.13) did not catch it. NaN gradients accumulated into Adam's `exp_avg` and `exp_avg_sq` momentum buffers, causing permanent corruption.
+
+**Root cause evidence**:
+- `z_norm` logged `nan` intermittently during Run 5 (epochs 1353-1373)
+- `checkpoint_best.pt` (epoch 1373): 74 encoder weight tensors + 148 optimizer momentum tensors contained NaN
+- `checkpoint_final.pt` (epoch 1354): 0 NaN in weights or optimizer — last clean checkpoint
+
+**Fixes applied**:
+1. **z-level NaN guard** (line ~1547): After encoder forward, if `z` contains any NaN, batch is skipped before decoder forward and before backward pass. Catches the root cause at the source.
+2. **Gradient-level NaN guard** (line ~1712): After `scaler.unscale_()` and `clip_grad_norm_()`, if gradient norm is NaN/Inf for encoder or decoder, that optimizer's step is skipped independently. Prevents NaN from entering Adam momentum buffers.
+3. **Checkpoint swap**: Corrupted `checkpoint_best.pt` renamed to `checkpoint_best_corrupted.pt`. Clean `checkpoint_final.pt` copied to `checkpoint_best.pt`.
+
+**Cost**: Lost ~19 epochs of progress (28.9% → 28.0% exact). Model weights and optimizer state fully healthy.
+
+### Early Results (Post-Fix)
+
+| Epoch | Loss | Exact | Acc | zN | Skip |
+|-------|------|-------|-----|----|------|
+| 1356 | 0.8521 | 28.1% | 80.6% | 18.0 | 2% |
+| 1357 | 0.9487 | 27.4% | 78.2% | 18.3 | 1% |
+| 1358 | 0.9432 | 27.7% | 78.3% | 18.6 | 2% |
+| 1359 | 0.9299 | 27.6% | 78.4% | 18.8 | 2% |
+
+- z_norm consistently real numbers (no NaN) — fix working
+- Loss decreasing, metrics stable
+- Skip rate normal (1-2%, selective backprop only)
+
+### Progress Through Epoch 1574 (2026-02-04)
+
+Training stopped at epoch 1548 (process killed externally, no error in log). Restarted with explicit `CC` env var for `torch.compile` gcc dependency.
+
+| Epoch | Loss | Exact | Acc | zN |
+|-------|------|-------|-----|----|
+| 1548 | 0.4681 | 41.6% | 88.4% | 29.0 |
+| 1560 | 0.4536 | 42.7% | 88.8% | 29.2 |
+| 1574 | 0.4288 | 43.5% | 89.2% | 29.5 |
+
+### Epoch Timing Baseline (2026-02-04)
+
+**Measured**: 27 epochs in 2h 59m 14s = **6.63 minutes/epoch (398 seconds)**
+
+This is the baseline for Run 6 on the local RTX 4060 Laptop GPU with all current optimizations active. Use this to measure the impact of future training changes.
+
+#### Hardware
+
+| Component | Spec |
+|-----------|------|
+| **GPU** | NVIDIA GeForce RTX 4060 Laptop GPU, 8 GB VRAM, Compute 8.9 |
+| **CPU** | Intel Core Ultra 7 155H |
+| **RAM** | 7.5 GB (WSL2 allocation) |
+| **Platform** | WSL2 (Linux 6.6.87.2-microsoft-standard-WSL2) |
+
+#### Model
+
+| Component | Parameters |
+|-----------|-----------|
+| Encoder (FullMaterialsVAE) | 4,887,200 |
+| Decoder (EnhancedTransformerDecoder) | 102,796,948 |
+| **Total** | **107,684,148** |
+
+#### Training Configuration
+
+| Setting | Value | Impact |
+|---------|-------|--------|
+| Batch size | 32 (effective 64 w/ accumulation) | Memory-limited by 8GB VRAM |
+| Accumulation steps | 2 | Smoother convergence |
+| AMP dtype | bfloat16 | No GradScaler needed, ~1.5x speedup |
+| torch.compile | `reduce-overhead` (CUDA graphs) | ~1.3x speedup (one-time warmup cost) |
+| Selective backprop | threshold=0.33 | Skips ~2% of batches (backward only) |
+| Gradient checkpointing | Disabled | Not needed at batch_size=32 |
+| REINFORCE | Disabled (rl_weight=0.0) | ~2x speedup vs enabled |
+| DataLoader workers | Auto-detected by `detect_environment()` | WSL2: 2 workers, pin_memory=False; Colab: up to 4 workers, pin_memory=True |
+| Training samples | 46,600 (contrastive SC + non-SC) | 1,457 batches/epoch |
+| Flash Attention (SDPA) | Enabled | ~1.2x attention speedup |
+
+#### Historical Timing Comparison
+
+| Run | Config | Epoch Time | Notes |
+|-----|--------|-----------|-------|
+| Run 3 | REINFORCE enabled, contrastive | ~30 min | Autoregressive sampling bottleneck |
+| Run 4 | CE-only, selective backprop | ~4-5 min | ~6-7x faster than Run 3 |
+| **Run 6 (baseline)** | **CE-only, torch.compile, selective backprop** | **~6.6 min** | **Current baseline** |
+
+Note: Run 6 is slightly slower than Run 4's measured range due to the larger number of training samples (46,600 vs initial runs) and the torch.compile CUDA graph overhead stabilizing over longer runs. The 4-5 min figure from Run 4 was measured early in training when selective backprop was skipping more batches (higher relative loss variance).
+
+---
+
+## Run 5: Deterministic Latent Space Overnight Training (2026-02-02)
+
+**Status**: Stopped — optimizer corrupted by sporadic NaN (see Run 6 for analysis)
+**Script**: `scripts/train_v12_clean.py` (deterministic encoder, L2 reg)
+**Resume from**: checkpoint_best.pt (epoch 1351, exact=27.6%)
+**Log**: `outputs/training_deterministic_overnight.log`
+**GPU**: RTX 4060 Laptop 8GB (local)
+
+### Validation (3-epoch test before overnight run)
+
+| Epoch | Loss | Exact | Tc | Magpie | zN |
+|-------|------|-------|----|--------|----|
+| 1352 | 0.920 | 28.0% | 0.017 | 0.038 | 16.2 |
+| 1353 | 1.001 | 27.2% | 0.017 | 0.034 | 16.8 |
+| 1354 | 0.979 | 27.2% | 0.016 | 0.031 | 17.3 |
+
+- Checkpoint loaded successfully (`fc_logvar` weights ignored via `strict=False`)
+- Encoder optimizer fresh init (param count changed) — expected
+- z_norm stable at ~16-17, not exploding
+- Loss finite and reasonable, no accuracy regression
+- New best exact match 28.0% on first deterministic epoch
+
+---
+
+## Architectural Change: VAE → Deterministic Latent Space (2026-02-02)
+
+**Files modified**:
+- `src/superconductor/models/attention_vae.py` — `AttentionVAEEncoder` gains `deterministic=True` mode (skips `fc_logvar`, returns `None` for logvar). `FullMaterialsVAE` uses deterministic mode by default. `reparameterize()` passes through when logvar is None. KL loss replaced with L2 regularization `mean(z²)` under same `kl_loss` key.
+- `scripts/train_v12_clean.py` — Checkpoint loading uses `strict=False` to ignore old `fc_logvar` weights. Encoder optimizer restore wrapped in try/except (param count changed). Added `z_norm` metric tracking per epoch (monitors for z explosion/collapse).
+
+**Rationale**: The VAE's probabilistic sampling (reparameterization trick) adds noise to z that hinders contrastive learning and downstream deterministic tasks. Switching to deterministic coordinates means z = fc_mean(h) directly — same z for same input every time. L2 regularization replaces KL to keep z bounded without the distributional constraint.
+
+**Checkpoint compatibility**: `fc_mean` weights load directly (same parameter name). Old `fc_logvar` weights silently ignored via `strict=False`. Encoder optimizer gets fresh init; decoder checkpoint loads unchanged.
+
+**Monitoring**: `zN` field in epoch summary shows mean L2 norm of z vectors. Should be stable (not growing unboundedly).
+
+---
+
+## Run 4b: CE-Phase Contrastive Training (continued, 2026-02-02)
+
+**Status**: Running
+**Script**: `scripts/train_v12_clean.py` V12.13
+**Resume from**: checkpoint_best.pt (epoch 1318, exact=25.5%)
+**Log**: `outputs/training_contrastive_ce_phase_v2.log`
+
+### V12.13 Bugfixes (applied after Run 4a NaN crash at epoch 1319)
+
+1. **NaN guard**: Skip backward pass on batches with NaN/Inf loss (prevents single bad batch from corrupting entire epoch)
+2. **Rollback into compiled model fix**: `load_checkpoint` now detects whether target model is compiled and preserves/adds `_orig_mod.` prefixes accordingly, instead of always stripping them
+
+---
+
+## Run 4a: CE-Phase Contrastive Training (2026-02-02)
+
+**Status**: Crashed at epoch 1319 (NaN loss → rollback failed)
+**Script**: `scripts/train_v12_clean.py` V12.12
+**Data**: `supercon_fractions_contrastive.csv` (46,645 samples: 23,451 SC + 23,194 non-SC)
+**Resume from**: checkpoint_best.pt (epoch 1289, exact=25.7%)
+**GPU**: RTX 4060 Laptop 8GB (local)
+**Log**: `outputs/training_contrastive_ce_phase.log`
+
+### Crash Analysis
+
+- Epochs 1290-1318 trained successfully with steadily improving metrics
+- Epoch 1319: Random NaN loss (likely bfloat16 numerical edge case in contrastive/focal loss)
+- Catastrophic drop detector triggered rollback, but `load_checkpoint` crashed with `RuntimeError` — it stripped `_orig_mod.` prefixes from the checkpoint but tried to load into compiled `OptimizedModule` that expects those prefixes
+- Best checkpoint saved at epoch 1318 (exact=25.5%) was preserved intact
+
+### Run 4a Results (29 epochs: 1290-1318)
+
+| Metric | Start (1290) | End (1318) | Trend |
+|---|---|---|---|
+| Loss | 1.4426 | 1.1856 | -17.8% |
+| Accuracy | 71.8% | 74.6% | +2.8pp |
+| SC Exact Match | 22.5% | 25.5% | +3.0pp |
+| Magpie MSE | 0.0710 | 0.0460 | -35.2% |
+| Contrastive | 4.2427 | 3.9414 | -7.1% |
+
+### Training Paradigm: Two-Phase (CE then RL)
+
+Based on literature review of RLHF/RL training pipelines (OpenAI, Anthropic, DeepMind) and analysis of our own training metrics, we adopted a **two-phase training strategy**:
+
+**Phase 1 (Current): Cross-Entropy Convergence**
+- REINFORCE disabled (`rl_weight=0.0`)
+- Model learns reconstruction + contrastive objectives without RL noise
+- Target: SC exact match > 70-80% before moving to Phase 2
+
+**Phase 2 (Future): REINFORCE Fine-Tuning**
+- Re-enable `rl_weight=1.0-2.5` once CE-trained model is competent
+- RL rewards become meaningful when model can mostly reconstruct formulas
+- KL divergence penalty keeps RL policy close to CE-pretrained model
+
+**Rationale**: During Run 3 (epochs 1289-1291), REINFORCE was contributing zero useful signal:
+- Reward: -22.8 (model can't reconstruct formulas → meaningless rewards)
+- RL loss: ~0.0000 (no gradient signal)
+- Meanwhile, autoregressive sampling (2 RLOO samples × KV cache × 60 tokens per batch) was the most expensive computation, roughly doubling epoch time for zero benefit.
+
+### Optimizations Applied
+
+| Optimization | Setting | Expected Speedup | Rationale |
+|---|---|---|---|
+| **Disable REINFORCE** | `rl_weight=0.0` | ~2x | No autoregressive sampling overhead |
+| **Gradient Accumulation** | `accumulation_steps=2` | Smoother convergence | Effective batch=64 (was 32) |
+| **Selective Backpropagation** | `threshold=0.33` | 1.3-1.5x | Skip backward on easy batches (loss < 33% of running avg) |
+| Contrastive loss | `weight=0.1, warmup=100 epochs` | — | SC/non-SC latent separation |
+| Balanced sampling | `WeightedRandomSampler` | — | ~50/50 SC/non-SC per batch |
+| torch.compile | `reduce-overhead` | ~1.3x | CUDA graph capture (one-time warmup cost) |
+| bfloat16 AMP | Compute 8.9 GPU | ~1.5x | No GradScaler needed |
+| Flash Attention (SDPA) | Enabled | ~1.2x | Memory-efficient attention |
+
+**Measured speedup**: **~6-7x** vs Run 3 (REINFORCE-enabled contrastive).
+- Run 3 (with REINFORCE): ~30 min/epoch
+- Run 4 (CE-only + selective backprop): **~4-5 min/epoch**
+- Overnight projection: ~107 epochs (epoch 1290 → ~1397)
+
+### Loss Architecture
+
+```
+SC Samples (full loss):
+  CE formula loss (focal, gamma=2.0, smoothing=0.1)
+  + 10.0 * Tc MSE
+  + 2.0 * Magpie MSE
+  + 2.0 * Stoichiometry MSE
+  + 0.0001 * KL divergence
+
+Non-SC Samples (formula-only, reduced weight):
+  0.5 * CE formula loss
+
+All Samples:
+  + 0.1 * SupCon contrastive loss (warmup over 100 epochs)
+```
+
+### Key Design Decisions
+
+1. **Tc normalization from SC samples only**: Non-SC materials have Tc=0.0 which would skew the mean. Normalizing from SC samples (mean=32.2K, std=35.4K) preserves the model's learned Tc representation.
+
+2. **No REINFORCE for non-SC samples**: Non-SC formulas have no reward signal (no Tc to predict, no SC-specific quality metric). Formula CE alone trains the decoder.
+
+3. **Selective backprop with EMA threshold**: Uses exponential moving average (momentum=0.95) of batch loss as baseline. Batches with loss < 33% of running average are "easy" — forward pass computed (for metrics) but backward pass skipped. This saves ~30% of gradient computation once the model has learned common patterns.
+
+4. **Retrain mode active**: Catastrophic drop detector reset to prevent rollback loops when transitioning to new data distribution.
+
+### References
+
+- [RLHF Deciphered (ACM Computing Surveys)](https://dl.acm.org/doi/full/10.1145/3743127) — Formal pretrain→SFT→RL workflow
+- [CMU RLHF 101 Tutorial (June 2025)](https://blog.ml.cmu.edu/2025/06/01/rlhf-101-a-technical-tutorial-on-reinforcement-learning-from-human-feedback/)
+- [VarCon: Variational Supervised Contrastive Learning (Dec 2025)](https://arxiv.org/html/2506.07413) — Faster convergence, lower batch size dependency
+- [Contrastive Learning Mitigates Posterior Collapse (OpenReview)](https://openreview.net/forum?id=SrgIkwLjql9) — VAE + contrastive synergy
+- [SelectiveBackprop (Angela Jiang et al.)](https://github.com/angelajiang/SelectiveBackprop) — Up to 3.5x speedup skipping easy samples
+- [Nathan Lambert RLHF Book (2025)](https://arxiv.org/abs/2504.12501) — Complete RLHF methodology
+
+---
+
+## Run 3: Contrastive Training with REINFORCE (2026-02-02)
+
+**Status**: Stopped — replaced by Run 4
+**Data**: `supercon_fractions_contrastive.csv` (46,645 samples)
+**Epochs completed**: 1289-1291 (3 epochs)
+**Log**: `outputs/training_contrastive.log`
+
+### Results
+
+| Epoch | Exact | Acc | Tc Loss | Contrastive | Reward |
+|---|---|---|---|---|---|
+| 1289 | 25.7% | 72.1% | 0.0182 | 4.293 | -20.7 |
+| 1290 | 25.3% | 70.8% | 0.0181 | 4.229 | -22.6 |
+| 1291 | 25.3% | 71.3% | 0.0180 | 4.193 | -22.8 |
+
+- TRUE autoregressive at epoch 1290: **23.7%** (477/2016)
+- Non-SC exact match: **0.0-0.1%** (completely new territory for the model)
+- Each epoch: ~30 min on RTX 4060 (too slow with REINFORCE overhead)
+
+### Why Stopped
+REINFORCE consuming ~50% of compute for zero useful signal. Switched to two-phase paradigm (Run 4).
+
+---
+
+## Run 2: SC-Only Combined Training (2026-02-02)
+
+**Status**: Never completed first epoch — replaced by contrastive approach
+**Data**: `supercon_fractions_combined.csv` (23,451 SC samples)
+**Log**: `outputs/training_combined_retrain.log`
+
+Started but killed before first epoch completed (torch.compile warmup). User decided to go with full contrastive dataset instead.
+
+---
+
+## Run 1: Original SuperCon Training (2025-2026)
+
+**Status**: Completed
+**Data**: `supercon_fractions.csv` (16,521 SC samples)
+**Epochs**: ~1284 epochs
+**Best Checkpoint**: `outputs/checkpoint_best.pt`
+
+### Final Metrics
+
+| Metric | Value |
+|---|---|
+| Exact Match (teacher-forced) | 93.1% |
+| TRUE Autoregressive Exact | ~92.2% |
+| Token Accuracy | 99.0%+ |
+| Tc Prediction Error | 0.0001K |
+| Magpie MSE | 0.0038 |
+| REINFORCE Reward | 73.1 |
+
+### Architecture
+- Encoder: FullMaterialsVAE (5.4M params) — element attention + Magpie + Tc
+- Decoder: EnhancedTransformerDecoder (102.8M params) — 12 layers, pointer-generator
+- Latent: 2048-dim
+- Total: 108.2M parameters
+
+### Training Progression
+- Epochs 0-100: CE-only, curriculum learning (ramp Tc/Magpie weights)
+- Epochs 100-800: CE + REINFORCE introduced, teacher forcing decay
+- Epochs 800-1284: Fine-tuning with causal entropy maintenance
+- Training on DSMLP and local RTX 4060
+
+---
+
+## Data Evolution
+
+| Version | File | Samples | Date | Notes |
+|---|---|---|---|---|
+| V1 (Original) | `supercon_fractions.csv` | 16,521 SC | 2025 | SuperCon database |
+| V2 (Combined) | `supercon_fractions_combined.csv` | 23,451 SC | Jan 2026 | + 6,930 NEMAD SC |
+| V3 (Contrastive) | `supercon_fractions_contrastive.csv` | 46,645 mixed | Jan 2026 | + 23,194 non-SC |
+
+All versions exclude 45 generative holdout samples at training time.
+
+---
+
+## Model Checkpoint History
+
+| Checkpoint | Epoch | Exact Match | Data | Notes |
+|---|---|---|---|---|
+| `checkpoint_epoch_1299.pt` | 1299 | ~93% | V1 (16.5K SC) | Run 1 late stage |
+| `checkpoint_best.pt` | 1574+ | 43.5%+ | V3 (46K contrastive) | Run 6 active (updating) |
+| `checkpoint_best_corrupted.pt` | 1373 | 28.9% | V3 (46K contrastive) | Run 5 best — NaN-corrupted optimizer+weights |
+| `checkpoint_final.pt` | 1354 | 28.0% | V3 (46K contrastive) | Run 5 last clean checkpoint |
+
+Note: The drop from 93% to 25.7% is expected when transitioning from V1→V3 data due to:
+1. New normalization statistics (2x more samples shift Tc/Magpie distributions)
+2. 50% of each batch is non-SC formulas the model has never seen
+3. Balanced sampling reduces SC samples seen per epoch by ~2x

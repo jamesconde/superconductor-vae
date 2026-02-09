@@ -119,8 +119,55 @@ The memory bandwidth difference (~8x) directly impacts autoregressive generation
 | Mixed Precision (bfloat16) | Enabled | ~1.5-2x speedup |
 | Flash Attention (SDPA) | Enabled | ~1.3x speedup, less memory |
 | KV-Cache for Generation | Enabled | ~2-3x faster AR generation |
-| Multi-worker DataLoader | Enabled (4 workers) | Reduces CPU bottleneck |
-| Pin Memory | Enabled | Faster CPU→GPU transfer |
+| Multi-worker DataLoader | Environment-aware | Auto-tuned by `detect_environment()` (see below) |
+| Pin Memory | Environment-aware | Auto-tuned by `detect_environment()` |
+
+### Environment-Aware DataLoader Auto-Detection
+
+DataLoader settings (num_workers, pin_memory, persistent_workers, prefetch_factor) are
+automatically tuned by `detect_environment()` in `src/superconductor/utils/env_config.py`.
+This runs once at the start of `train()` and prints a one-line banner.
+
+| Setting | WSL2 | Colab A100 (40GB+) | Colab T4/V100 | Bare Linux (big) |
+|---------|------|--------------------|---------------|-------------------|
+| num_workers | 2 | min(4, cpus-1) | min(2, cpus-1) | min(8, cpus-1) |
+| pin_memory | False | True | True | True |
+| persistent_workers | False | True | True | True |
+| prefetch_factor | 1 | 2 | 2 | 2 |
+
+**Why**: WSL2 has 7.5GB RAM shared with Windows. Spawning workers (one per CPU thread = 22) caused OOM.
+Hardcoding `num_workers=2` everywhere fixed WSL2 but handicapped Colab A100 training.
+
+### V12.9/V12.16: Speculative Decoding
+
+| Optimization | Status | Impact |
+|--------------|--------|--------|
+| V2 Position-Aware Draft Model | **DISABLED (V12.16.1)** | See explanation below |
+
+Speculative decoding was intended to use a lightweight draft model (n-gram + structural rules) to predict k tokens ahead, then verify all k in a single forward pass.
+
+**V12.16.1 Finding (February 2026): Architecture Mismatch**
+
+Testing revealed that speculative decoding with an n-gram draft model doesn't work well for VAE generation:
+
+| Metric | Expected | Actual |
+|--------|----------|--------|
+| Acceptance rate | 60-70% | 1-4% |
+| Speedup | 2.5-3.4x | **0.2x (5x slower!)** |
+
+**Why it doesn't work:**
+1. **N-gram draft model**: Predicts based on corpus statistics (common patterns like "La-Sr-Cu-O")
+2. **VAE decoder**: Predicts based on the latent vector z, which encodes a *specific* material
+3. The two models have fundamentally different information sources - they don't agree
+
+**This is different from LLM speculative decoding** where both draft and main model see the same context. In VAE generation, only the main decoder knows what z encodes.
+
+**Potential future fix:** A z-conditioned draft model (mini-decoder) that takes the latent as input.
+
+**Files (for reference):**
+- `src/superconductor/models/ngram_draft.py` - V2 draft model implementation
+- `src/superconductor/models/autoregressive_decoder.py` - Contains `speculative_sample_for_reinforce()`
+- `data/processed/draft_model_v2.pkl` - V2 cached draft model (position-aware)
 
 ### Not Currently Used
 
@@ -209,8 +256,109 @@ The TF-based metric is computed during training with dropout **active**, resulti
 
 1. **Quantization** (INT8) for faster inference
 2. **ONNX export** for optimized inference runtime
-3. **Speculative decoding** for faster AR generation
+3. **Speculative decoding** for faster AR generation (now implemented!)
 4. **Distillation** to smaller model for deployment
+
+## Speculative Decoding Details (V12.9)
+
+### Overview
+
+Speculative decoding speeds up autoregressive generation by using a fast "draft" model to predict multiple tokens ahead, then verifying them in batch with the main model. This exploits the observation that chemical formulas have predictable structure.
+
+### Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    Hybrid Draft Model                           │
+├─────────────────────────────────────────────────────────────────┤
+│  ┌───────────────┐    ┌───────────────────┐                     │
+│  │  N-gram Model │    │ Structural Rules  │                     │
+│  │  (Trigram)    │    │ (State Machine)   │                     │
+│  └───────┬───────┘    └─────────┬─────────┘                     │
+│          │     Intersection     │                               │
+│          └──────────┬───────────┘                               │
+│                     ▼                                           │
+│              Draft k tokens                                     │
+└─────────────────────────────────────────────────────────────────┘
+                      │
+                      ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                Main Transformer Decoder                         │
+├─────────────────────────────────────────────────────────────────┤
+│  Verify all k tokens in ONE forward pass                        │
+│  Accept via rejection sampling: r < p_model(token)              │
+│  Sample at rejection point from adjusted distribution           │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### Formula Structure Rules
+
+The structural draft model encodes the grammar of fraction-format formulas:
+
+| Current State | Valid Next Tokens |
+|---------------|-------------------|
+| `<START>` | Element only |
+| Element | `(`, Element, digit, `<END>` |
+| `(` | Digit only (numerator start) |
+| Numerator digit | Digit, `/` |
+| `/` | Digit only (denominator start) |
+| Denominator digit | Digit, `)` |
+| `)` | Element, `<END>` |
+
+### N-gram Statistics
+
+The n-gram model learns from training data:
+- **Trigrams**: P(token | prev_2_tokens) - e.g., P(")" | "1", "0") for common /10 denominator
+- **Bigrams**: Fallback when trigram unseen
+- **Unigrams**: Final fallback
+
+Common patterns learned:
+- Top denominators: /10 (3.06%), /5 (2.05%), /100 (1.8%)
+- Top elements: O, Cu, Ba, La, Sr (cuprate superconductors)
+- Strong element transitions: Cu→O, Ba→Cu, etc.
+
+### Configuration
+
+In `train_v12_clean.py`:
+
+```python
+TRAIN_CONFIG = {
+    # ...
+    'use_speculative_decoding': True,   # Enable/disable
+    'speculative_k': 5,                  # Tokens to draft at once
+    'draft_model_path': 'data/processed/draft_model_v2.pkl',  # V2 (position-aware)
+}
+```
+
+### Building the Draft Model
+
+```bash
+python scripts/build_ngram_draft.py
+```
+
+This builds the draft model from training data and caches to disk. The model is automatically loaded during training if available.
+
+### Performance Metrics
+
+During training, speculative decoding metrics are logged:
+- **spec_acceptance_rate**: Fraction of drafted tokens accepted (target: 60-70%)
+- **spec_tokens_per_step**: Average tokens generated per speculative step (target: >2.5)
+
+Example output:
+```
+Epoch  100 | TF: 0.15 | Loss: 0.234 | Exact: 82.1% | ... | Spec: 65% (2.8t/s)
+```
+
+### When to Use
+
+Speculative decoding is most beneficial when:
+1. **REINFORCE is enabled** (rl_weight > 0) - sampling is the bottleneck
+2. **Autoregressive mode** (use_autoregressive_reinforce=True)
+3. **Formula structure is predictable** - which it is for superconductors
+
+It provides minimal benefit for:
+- Pure teacher forcing (TF=1.0)
+- Non-autoregressive sampling from logits
 
 ## References
 

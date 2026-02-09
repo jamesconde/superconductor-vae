@@ -1,4 +1,4 @@
-# Latent Space as Effective Theory: A Philosophical Argument
+﻿# Latent Space as Effective Theory: A Philosophical Argument
 
 **Project**: Superconductor Formula VAE
 **Date**: January 2026
@@ -34,6 +34,8 @@
 The VAE's latent space z ∈ ℝ²⁰⁴⁸ represents an **effective parameterization** of superconductor space. If the decoder can reconstruct all properties (formula, Tc, Magpie features) from z, then z contains sufficient information to specify a superconductor.
 
 **Strong form of the claim**: If z-space perfectly correlates with all observable properties of superconductors, then z-space IS a valid physical parameterization—equivalent to (not merely approximating) a physical theory.
+
+> **Note (2026-02-02)**: The encoder has been converted from probabilistic (VAE with reparameterization) to **deterministic** — z is now a fixed coordinate for each input, not a sample from a distribution. This strengthens the "z as coordinate system" interpretation: each material maps to a unique point, not a cloud. KL divergence replaced with light L2 regularization.
 
 ## Comparison to Established Theories
 
@@ -869,3 +871,4 @@ The **holdout test** is the decisive experiment:
 - DFT Scaling: Bowler, "Scaling of DFT calculations with system size"
 - Electron-Phonon Bottleneck: Nature Computational Science (2024), "Accelerating EPC with ML"
 - DFPT Theory: Heid, "Density Functional Perturbation Theory and Electron Phonon Coupling" (2013)
+

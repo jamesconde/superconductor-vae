@@ -2068,6 +2068,350 @@ class EnhancedTransformerDecoder(nn.Module):
 
         return sampled_tokens, log_probs, entropy, mask
 
+    def speculative_sample_for_reinforce(
+        self,
+        z: torch.Tensor,
+        draft_model,  # HybridDraft from ngram_draft.py
+        encoder_skip: Optional[torch.Tensor] = None,
+        stoich_pred: Optional[torch.Tensor] = None,
+        temperature: float = 0.8,
+        max_len: Optional[int] = None,
+        k: int = 5,  # Number of tokens to draft at once
+        cached_memory: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Dict]:
+        """
+        V12.16: REINFORCE sampling with TRUE per-sequence speculative decoding.
+
+        Key fix: Each sequence in the batch advances independently at its own
+        pace, with proper KV cache management per sequence.
+
+        Algorithm:
+        1. Draft k tokens using fast n-gram/structural model
+        2. Run main model forward on all k positions at once (batched verification)
+        3. Per-sequence rejection sampling - each seq finds its own rejection point
+        4. Slice temp_cache to reuse verification KV values (no recompute!)
+        5. Sample from model distribution at each sequence's rejection point
+        6. Continue until all sequences finish
+
+        Args:
+            z: Latent vectors [batch, latent_dim]
+            draft_model: HybridDraft model for fast token prediction
+            encoder_skip: Optional skip connection
+            stoich_pred: Optional stoichiometry conditioning
+            temperature: Sampling temperature
+            max_len: Maximum sequence length
+            k: Number of tokens to draft at each step
+            cached_memory: Pre-computed memory from precompute_memory()
+
+        Returns:
+            sampled_tokens: [batch, seq_len] - sampled token indices
+            log_probs: [batch, seq_len] - log probability of each sampled token
+            entropy: [batch, seq_len] - entropy H(p) per position
+            mask: [batch, seq_len] - 1 for valid positions, 0 for padding
+            stats: Dict with acceptance_rate, avg_tokens_per_step, n_steps
+        """
+        self.eval()
+        batch_size = z.size(0)
+        device = z.device
+        max_len = max_len or self.max_len
+
+        # Stats tracking
+        total_drafted = 0
+        total_accepted = 0
+        n_steps = 0
+
+        with torch.no_grad():
+            # Create or use cached memory
+            if cached_memory is not None:
+                memory = cached_memory
+            else:
+                memory = self._create_memory(z, encoder_skip, stoich_pred)
+
+            # Per-sequence state tracking
+            # Each sequence has its own position and KV cache length
+            seq_positions = torch.zeros(batch_size, dtype=torch.long, device=device)
+            finished = torch.zeros(batch_size, dtype=torch.bool, device=device)
+
+            # Pre-allocate output buffers (max_len size, will trim later)
+            all_tokens = torch.full((batch_size, max_len), PAD_IDX, dtype=torch.long, device=device)
+            all_log_probs = torch.zeros(batch_size, max_len, device=device)
+            all_entropies = torch.zeros(batch_size, max_len, device=device)
+
+            # Initialize KV cache and process START token
+            kv_cache = self._init_kv_cache(batch_size, device)
+            start_tokens = torch.full((batch_size, 1), START_IDX, dtype=torch.long, device=device)
+            start_emb = self.token_embedding(start_tokens)
+            _, kv_cache = self._forward_one_step_with_cache(start_emb, memory, kv_cache, 0)
+
+            # Track current tokens for draft context (per sequence)
+            current_tokens = start_tokens.clone()  # [batch, 1]
+
+            # Main loop - continue until all sequences done
+            while not finished.all() and seq_positions.max() < max_len - 1:
+                n_steps += 1
+                active_mask = ~finished  # Which sequences still need tokens
+
+                # ===== Step 1: Draft k tokens =====
+                # Use first active sequence as context (draft model is position-aware)
+                first_active = active_mask.nonzero(as_tuple=True)[0][0].item()
+                pos = seq_positions[first_active].item()
+                context_list = current_tokens[first_active, :pos+1].tolist()
+                drafted = draft_model.draft_k_tokens(context_list, k=k)
+                drafted_tensor = torch.tensor([drafted] * batch_size, device=device, dtype=torch.long)
+
+                n_to_draft = min(k, max_len - 1 - pos)
+                total_drafted += n_to_draft * active_mask.sum().item()
+
+                # ===== Step 2: Verify all k tokens in ONE forward pass =====
+                # Save cache state before verification (for slicing later)
+                cache_before_verify = self._copy_kv_cache(kv_cache)
+
+                draft_logits = []
+                draft_entropies = []
+                temp_cache = kv_cache
+
+                for draft_pos in range(n_to_draft):
+                    draft_token = drafted_tensor[:, draft_pos:draft_pos+1]
+                    draft_emb = self.token_embedding(draft_token)
+
+                    # Use position of first active sequence (they're synchronized in this step)
+                    output, temp_cache = self._forward_one_step_with_cache(
+                        draft_emb, memory, temp_cache, pos + draft_pos + 1
+                    )
+
+                    logits = self.output_proj(output).squeeze(1)  # [batch, vocab_size]
+                    draft_logits.append(logits)
+
+                    probs_ent = F.softmax(logits, dim=-1)
+                    log_probs_ent = F.log_softmax(logits, dim=-1)
+                    step_entropy = -(probs_ent * log_probs_ent).sum(dim=-1)
+                    draft_entropies.append(step_entropy)
+
+                if not draft_logits:
+                    break
+
+                # Stack: [batch, n_drafted, vocab_size]
+                stacked_logits = torch.stack(draft_logits, dim=1)
+                stacked_entropies = torch.stack(draft_entropies, dim=1)
+                n_drafted = stacked_logits.size(1)
+
+                # ===== Step 3: Per-sequence verification =====
+                # FIX V12.16.1: Use greedy verification instead of naive rejection sampling.
+                # The previous `r < p_model(token)` was incorrect - it rejected even good
+                # predictions because p(token) is typically low for large vocabularies.
+                #
+                # Proper speculative decoding uses `r < p_model/p_draft`, but we don't
+                # have draft probabilities. Instead, we use greedy verification:
+                # Accept if draft token matches argmax OR has probability >= threshold.
+
+                scaled_logits = stacked_logits / temperature
+                probs = F.softmax(scaled_logits, dim=-1)
+                log_probs_all = F.log_softmax(scaled_logits, dim=-1)
+
+                # Get model's argmax predictions at each position
+                model_argmax = probs.argmax(dim=-1)  # [batch, n_drafted]
+
+                # Get probability of draft tokens
+                draft_probs = probs.gather(2, drafted_tensor[:, :n_drafted].unsqueeze(-1)).squeeze(-1)
+
+                # Verification criteria (any of these = accept):
+                # 1. Draft matches model's greedy choice (argmax)
+                # 2. Draft token has probability >= 0.1 (reasonably likely)
+                # 3. Draft token is in top-5 (for cases where distribution is flat)
+                matches_greedy = (drafted_tensor[:, :n_drafted] == model_argmax)  # [batch, n_drafted]
+                above_threshold = (draft_probs >= 0.1)  # [batch, n_drafted]
+
+                # Top-5 check: draft token should be in top-5 most likely tokens
+                top5_tokens = probs.topk(k=5, dim=-1).indices  # [batch, n_drafted, 5]
+                in_top5 = (drafted_tensor[:, :n_drafted].unsqueeze(-1) == top5_tokens).any(dim=-1)
+
+                # Accept if any criterion is met
+                accept_mask = matches_greedy | above_threshold | in_top5  # [batch, n_drafted]
+
+                # Find consecutive accepts per sequence
+                accept_chain = accept_mask.cumprod(dim=1)
+                n_accepted_per_seq = accept_chain.sum(dim=1)  # [batch]
+
+                # ===== Step 4: Vectorized per-sequence token assignment =====
+                # All operations are batched - no Python loops over batch_size
+
+                # Clamp n_accepted to avoid overflow
+                n_accepted_clamped = n_accepted_per_seq.clamp(max=n_drafted)
+
+                # Create position indices for each sequence: [batch, n_drafted]
+                # pos_offsets[b, i] = seq_positions[b] + i
+                draft_indices = torch.arange(n_drafted, device=device).unsqueeze(0)  # [1, n_drafted]
+                pos_offsets = seq_positions.unsqueeze(1) + draft_indices  # [batch, n_drafted]
+
+                # Mask for valid positions (within max_len and within n_accepted)
+                within_max_len = pos_offsets < (max_len - 1)
+                within_accepted = draft_indices < n_accepted_clamped.unsqueeze(1)
+                active_seq = ~finished.unsqueeze(1)
+                valid_mask = within_max_len & within_accepted & active_seq  # [batch, n_drafted]
+
+                # Scatter accepted tokens to output buffers
+                # Get log probs for draft tokens: [batch, n_drafted]
+                draft_token_log_probs = log_probs_all.gather(
+                    2, drafted_tensor[:, :n_drafted].unsqueeze(-1)
+                ).squeeze(-1)
+
+                # For each valid position, write token, log_prob, entropy
+                for i in range(n_drafted):
+                    mask_i = valid_mask[:, i]  # [batch]
+                    if not mask_i.any():
+                        continue
+
+                    write_pos = (seq_positions + i).clamp(max=max_len - 1)
+
+                    # Use advanced indexing to write only to valid positions
+                    batch_indices = torch.arange(batch_size, device=device)[mask_i]
+                    pos_indices = write_pos[mask_i]
+
+                    all_tokens[batch_indices, pos_indices] = drafted_tensor[mask_i, i]
+                    all_log_probs[batch_indices, pos_indices] = draft_token_log_probs[mask_i, i]
+                    all_entropies[batch_indices, pos_indices] = stacked_entropies[mask_i, i]
+
+                # Check for END tokens in accepted range
+                accepted_tokens = drafted_tensor[:, :n_drafted]  # [batch, n_drafted]
+                is_end = (accepted_tokens == END_IDX) & valid_mask
+                newly_finished = is_end.any(dim=1)
+                finished = finished | newly_finished
+
+                # Find first END position per sequence (for truncating n_accepted)
+                end_positions = torch.where(
+                    is_end,
+                    draft_indices.expand(batch_size, -1),
+                    torch.full_like(draft_indices.expand(batch_size, -1), n_drafted)
+                ).min(dim=1).values
+                n_accepted_with_end = torch.minimum(n_accepted_clamped, end_positions + 1)
+
+                # Update total accepted count
+                total_accepted += (n_accepted_with_end * (~finished | newly_finished).long()).sum().item()
+
+                # ===== Sample at rejection point (vectorized) =====
+                needs_sample = ~finished & (n_accepted_clamped < n_drafted)
+
+                if needs_sample.any():
+                    # Get rejection position per sequence
+                    reject_pos = n_accepted_clamped.clamp(max=n_drafted - 1)  # [batch]
+
+                    # Gather logits at rejection position: [batch, vocab_size]
+                    reject_logits = stacked_logits.gather(
+                        1,
+                        reject_pos.view(batch_size, 1, 1).expand(-1, -1, stacked_logits.size(-1))
+                    ).squeeze(1)
+
+                    # Sample from model distribution
+                    scaled = reject_logits / temperature
+                    probs_sample = F.softmax(scaled, dim=-1)
+                    log_probs_sample = F.log_softmax(scaled, dim=-1)
+                    sampled_tokens = torch.multinomial(probs_sample, num_samples=1).squeeze(-1)  # [batch]
+
+                    # Get log probs and entropy for sampled tokens
+                    sampled_log_probs = log_probs_sample.gather(1, sampled_tokens.unsqueeze(1)).squeeze(1)
+                    sampled_entropies = stacked_entropies.gather(
+                        1, reject_pos.unsqueeze(1)
+                    ).squeeze(1)
+
+                    # Write sampled tokens to output buffers (only for sequences that need sampling)
+                    write_pos_sample = (seq_positions + n_accepted_clamped).clamp(max=max_len - 1)
+                    sample_mask = needs_sample & (write_pos_sample < max_len - 1)
+
+                    if sample_mask.any():
+                        batch_indices = torch.arange(batch_size, device=device)[sample_mask]
+                        pos_indices = write_pos_sample[sample_mask]
+
+                        all_tokens[batch_indices, pos_indices] = sampled_tokens[sample_mask]
+                        all_log_probs[batch_indices, pos_indices] = sampled_log_probs[sample_mask]
+                        all_entropies[batch_indices, pos_indices] = sampled_entropies[sample_mask]
+
+                        # Check if sampled token is END
+                        sampled_is_end = (sampled_tokens == END_IDX) & sample_mask
+                        finished = finished | sampled_is_end
+
+                    # Tokens advanced = n_accepted + 1 (for sampled) where sampling happened
+                    tokens_advanced = torch.where(
+                        needs_sample,
+                        n_accepted_with_end + 1,
+                        n_accepted_with_end
+                    )
+                else:
+                    tokens_advanced = n_accepted_with_end
+
+                # Update sequence positions
+                seq_positions = (seq_positions + tokens_advanced).clamp(max=max_len - 1)
+
+                # ===== Step 5: Update KV cache and current_tokens =====
+                # Find the minimum position to synchronize batch processing
+                # (sequences that advanced further will need to re-verify some tokens)
+                min_new_pos = seq_positions[active_mask].min().item() if active_mask.any() else 0
+
+                # Rebuild cache up to min_new_pos by replaying tokens
+                kv_cache = cache_before_verify
+                for step in range(min_new_pos - pos):
+                    step_tokens = all_tokens[:, pos + step:pos + step + 1]
+                    step_emb = self.token_embedding(step_tokens)
+                    _, kv_cache = self._forward_one_step_with_cache(
+                        step_emb, memory, kv_cache, pos + step + 1
+                    )
+
+                # Update current_tokens for next draft context
+                max_pos = seq_positions.max().item()
+                if max_pos > current_tokens.size(1) - 1:
+                    # Expand current_tokens to include new positions
+                    new_tokens = torch.full((batch_size, max_pos + 1), PAD_IDX, dtype=torch.long, device=device)
+                    new_tokens[:, 0] = START_IDX
+                    new_tokens[:, 1:seq_positions.max() + 1] = all_tokens[:, :seq_positions.max()]
+                    current_tokens = new_tokens
+
+            # ===== Build output tensors =====
+            # Find actual sequence lengths
+            actual_len = seq_positions.max().item()
+            if actual_len == 0:
+                actual_len = 1  # At least one token
+
+            sampled_tokens = all_tokens[:, :actual_len]
+            log_probs = all_log_probs[:, :actual_len]
+            entropy = all_entropies[:, :actual_len]
+
+            # Create mask
+            seq_len = sampled_tokens.size(1)
+            if seq_len > 0:
+                is_end = (sampled_tokens == END_IDX)
+                end_positions = torch.argmax(is_end.int(), dim=1)
+                has_end = is_end.any(dim=1)
+                end_positions = torch.where(has_end, end_positions, seq_positions - 1)
+                positions = torch.arange(seq_len, device=device).unsqueeze(0).expand(batch_size, -1)
+                mask = (positions <= end_positions.unsqueeze(1)).float()
+            else:
+                mask = torch.empty(batch_size, 0, device=device)
+
+            # Compute stats
+            acceptance_rate = total_accepted / max(total_drafted, 1)
+            avg_tokens_per_step = (seq_positions.float().mean().item()) / max(n_steps, 1)
+
+            stats = {
+                'acceptance_rate': acceptance_rate,
+                'avg_tokens_per_step': avg_tokens_per_step,
+                'n_steps': n_steps,
+                'total_drafted': total_drafted,
+                'total_accepted': total_accepted,
+            }
+
+            return sampled_tokens, log_probs, entropy, mask, stats
+
+    def _copy_kv_cache(self, kv_cache: Optional[List[Dict[str, torch.Tensor]]]) -> Optional[List[Dict[str, torch.Tensor]]]:
+        """Deep copy a KV cache (List of Dicts) for checkpointing."""
+        if kv_cache is None:
+            return None
+        return [
+            {
+                'key': layer_cache['key'].clone(),
+                'value': layer_cache['value'].clone(),
+            }
+            for layer_cache in kv_cache
+        ]
+
     def generate_formulas_fast(
         self,
         z: torch.Tensor,

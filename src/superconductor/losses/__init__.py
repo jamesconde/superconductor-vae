@@ -5,6 +5,8 @@ Includes:
 - formula_loss: Token-weighted cross-entropy with accuracy tracking
 - semantic_unit_loss: Semantic-level loss (elements, fractions, subscripts)
 - reinforce_loss: REINFORCE-based sequence-level optimization with RLOO baseline
+- consistency_losses: Self-consistency and bidirectional consistency losses
+- theory_losses: BCS, cuprate, and other theory-based regularization
 """
 
 from .formula_loss import (
@@ -34,6 +36,24 @@ from .reinforce_loss import (
     MixedCEReinforce,
 )
 
+from .consistency_losses import (
+    ConsistencyLossConfig,
+    SelfConsistencyLoss,
+    BidirectionalConsistencyLoss,
+    CombinedConsistencyLoss,
+    compute_consistency_reward,
+)
+
+from .theory_losses import (
+    TheoryLossConfig,
+    BCSTheoryLoss,
+    CuprateTheoryLoss,
+    IronBasedTheoryLoss,
+    UnknownTheoryLoss,
+    TheoryRegularizationLoss,
+    compute_theory_regularization,
+)
+
 __all__ = [
     # formula_loss
     'TokenType',
@@ -56,4 +76,18 @@ __all__ = [
     'compute_semantic_reward',
     'REINFORCELoss',
     'MixedCEReinforce',
+    # consistency_losses
+    'ConsistencyLossConfig',
+    'SelfConsistencyLoss',
+    'BidirectionalConsistencyLoss',
+    'CombinedConsistencyLoss',
+    'compute_consistency_reward',
+    # theory_losses
+    'TheoryLossConfig',
+    'BCSTheoryLoss',
+    'CuprateTheoryLoss',
+    'IronBasedTheoryLoss',
+    'UnknownTheoryLoss',
+    'TheoryRegularizationLoss',
+    'compute_theory_regularization',
 ]

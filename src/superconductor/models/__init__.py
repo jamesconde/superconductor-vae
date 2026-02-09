@@ -6,6 +6,7 @@ Provides:
 - AttentionBidirectionalVAE: VAE with integrated element attention (recommended)
 - TcPredictor: Expert network for Tc prediction
 - SuperconductorRMENN: R-MENN adapted for superconductors
+- FamilyClassifier: Classify superconductors by physical mechanism
 
 Architecture Comparison:
 
@@ -47,6 +48,15 @@ from .autoregressive_decoder import (
     VOCAB_SIZE,
 )
 
+from .family_classifier import (
+    SuperconductorFamily,
+    FamilyClassifierConfig,
+    RuleBasedFamilyClassifier,
+    LearnedFamilyClassifier,
+    HybridFamilyClassifier,
+    get_theory_applicable,
+)
+
 __all__ = [
     # Original VAE (Magpie features)
     'BidirectionalVAE',
@@ -70,4 +80,12 @@ __all__ = [
     'indices_to_formula',
     'create_formula_tokenizer',
     'VOCAB_SIZE',
+
+    # Family classifier (for theory-based regularization)
+    'SuperconductorFamily',
+    'FamilyClassifierConfig',
+    'RuleBasedFamilyClassifier',
+    'LearnedFamilyClassifier',
+    'HybridFamilyClassifier',
+    'get_theory_applicable',
 ]

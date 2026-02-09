@@ -158,9 +158,11 @@ class AttentionVAEEncoder(nn.Module):
         self,
         input_dim: int,
         hidden_dims: List[int],
-        latent_dim: int
+        latent_dim: int,
+        deterministic: bool = False
     ):
         super().__init__()
+        self.deterministic = deterministic
 
         layers = []
         prev_dim = input_dim
@@ -174,10 +176,13 @@ class AttentionVAEEncoder(nn.Module):
 
         self.encoder = nn.Sequential(*layers)
         self.fc_mean = nn.Linear(prev_dim, latent_dim)
-        self.fc_logvar = nn.Linear(prev_dim, latent_dim)
+        if not deterministic:
+            self.fc_logvar = nn.Linear(prev_dim, latent_dim)
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         h = self.encoder(x)
+        if self.deterministic:
+            return self.fc_mean(h), None
         return self.fc_mean(h), self.fc_logvar(h)
 
 
@@ -647,10 +652,12 @@ class FullMaterialsVAE(nn.Module):
         )
 
         # VAE encoder (from fused representation to latent)
+        # Deterministic mode: z = fc_mean(h) directly, no reparameterization noise
         self.vae_encoder = AttentionVAEEncoder(
             input_dim=total_fusion_dim,
             hidden_dims=encoder_hidden,
-            latent_dim=latent_dim
+            latent_dim=latent_dim,
+            deterministic=True
         )
 
         # =====================================================================
@@ -727,7 +734,9 @@ class FullMaterialsVAE(nn.Module):
         )
 
     def reparameterize(self, mean: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
-        """Reparameterization trick for VAE."""
+        """Reparameterization trick for VAE, or passthrough in deterministic mode."""
+        if logvar is None:
+            return mean
         std = torch.exp(0.5 * logvar)
         eps = torch.randn_like(std)
         return mean + eps * std
@@ -840,17 +849,30 @@ class FullMaterialsVAE(nn.Module):
         fraction_pred = fraction_output[:, :self.max_elements]  # [batch, max_elements]
         element_count_pred = fraction_output[:, -1]  # [batch]
 
-        # KL loss (for VAE training)
-        kl_loss = -0.5 * torch.mean(
-            1 + enc_out['z_logvar'] - enc_out['z_mean'].pow(2) - enc_out['z_logvar'].exp()
-        )
+        # Latent regularization: L2 on z (deterministic mode) or KL (VAE mode)
+        # IMPORTANT (2026-02-02): 'kl_loss' key is INTENTIONALLY reused for L2 reg.
+        # The entire downstream pipeline (CombinedLossWithREINFORCE, train_v12_clean.py,
+        # loss logging, checkpoint saving) reads loss via the 'kl_loss' key and multiplies
+        # by config['kl_weight']. Renaming would require touching 10+ callsites for no
+        # functional benefit. The value is L2 reg (mean(z²)) NOT KL divergence when
+        # deterministic=True. Config comment in train_v12_clean.py documents this too.
+        if enc_out['z_logvar'] is None:
+            # Deterministic mode: light L2 regularization keeps z bounded
+            z_reg = torch.mean(enc_out['z'].pow(2))
+        else:
+            # VAE mode: standard KL divergence
+            z_reg = -0.5 * torch.mean(
+                1 + enc_out['z_logvar'] - enc_out['z_mean'].pow(2) - enc_out['z_logvar'].exp()
+            )
 
         return {
             # Latent
             'z': enc_out['z'],
             'z_mean': enc_out['z_mean'],
-            'z_logvar': enc_out['z_logvar'],
-            'kl_loss': kl_loss,
+            'z_logvar': enc_out['z_logvar'],  # None in deterministic mode
+            # NOTE: 'kl_loss' key contains L2 reg (mean(z²)) in deterministic mode,
+            # NOT KL divergence. Key name kept for downstream compatibility.
+            'kl_loss': z_reg,
             # Encoder outputs
             'attention_weights': enc_out['attention_weights'],
             'element_embeddings': enc_out['element_embeddings'],

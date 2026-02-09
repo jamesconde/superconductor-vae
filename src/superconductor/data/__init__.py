@@ -6,6 +6,7 @@ Provides dataset classes for:
 - Contrastive learning with negative samples
 - Materials API integration
 - Attention-compatible datasets (for AttentionBidirectionalVAE)
+- Canonical ordering for formula standardization
 """
 
 from .dataset import (
@@ -20,6 +21,16 @@ from .attention_dataset import (
     create_attention_dataloaders,
 )
 
+from .canonical_ordering import (
+    OrderingMethod,
+    CanonicalOrderer,
+    OrderAugmentation,
+    to_electronegativity_order,
+    to_alphabetical_order,
+    to_abundance_order,
+    shuffle_element_order,
+)
+
 __all__ = [
     # Original datasets
     'SuperconductorDataset',
@@ -30,4 +41,13 @@ __all__ = [
     # Attention-compatible datasets
     'AttentionSuperconductorDataset',
     'create_attention_dataloaders',
+
+    # Canonical ordering
+    'OrderingMethod',
+    'CanonicalOrderer',
+    'OrderAugmentation',
+    'to_electronegativity_order',
+    'to_alphabetical_order',
+    'to_abundance_order',
+    'shuffle_element_order',
 ]

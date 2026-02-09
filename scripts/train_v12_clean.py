@@ -13,9 +13,29 @@ Removes complexity to isolate CUDA crash issue while keeping:
 import os
 import sys
 import json
+import math
 import hashlib
 import signal
 import re
+import time
+from collections import defaultdict
+
+# --- Ensure C compiler is available for torch.compile (triton/inductor) ---
+# This fixes the recurring issue where torch.compile fails with
+# "Failed to find C compiler" when the conda env isn't fully activated.
+# Works across local conda envs, Google Colab, and standard Linux installs.
+import shutil as _shutil
+if 'CC' not in os.environ:
+    # Priority: conda env gcc → system gcc
+    _conda_gcc = os.path.join(sys.prefix, 'bin', 'gcc')
+    _found_cc = _conda_gcc if os.path.isfile(_conda_gcc) else _shutil.which('gcc')
+    if _found_cc:
+        os.environ['CC'] = _found_cc
+        _cc_dir = os.path.dirname(_found_cc)
+        _path = os.environ.get('PATH', '')
+        if _cc_dir not in _path:
+            os.environ['PATH'] = _cc_dir + os.pathsep + _path
+
 import numpy as np
 import pandas as pd
 import torch
@@ -47,10 +67,11 @@ from typing import Dict, List, Optional, Tuple
 PROJECT_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
+from superconductor.utils.env_config import detect_environment
 from superconductor.models.attention_vae import FullMaterialsVAE
 from superconductor.models.autoregressive_decoder import (
     EnhancedTransformerDecoder, tokenize_formula, tokens_to_indices,
-    VOCAB_SIZE, PAD_IDX, START_IDX, END_IDX, IDX_TO_TOKEN
+    VOCAB_SIZE, PAD_IDX, START_IDX, END_IDX, IDX_TO_TOKEN, indices_to_formula
 )
 from superconductor.encoders.element_properties import get_atomic_number
 
@@ -63,6 +84,219 @@ from superconductor.losses.reward_gpu_native import (
 from superconductor.training.entropy_maintenance import (
     EntropyManager, create_entropy_manager, EntropyConfig
 )
+
+# V12.12: Contrastive learning for SC vs non-SC separation
+from superconductor.losses.contrastive import (
+    SuperconductorContrastiveLoss, category_to_label
+)
+from torch.utils.data import WeightedRandomSampler
+
+# V12.9: N-gram + Structural hybrid draft model for speculative decoding
+from superconductor.models.ngram_draft import (
+    HybridDraft, load_or_build_draft_model
+)
+
+# V12.16: Theory-guided consistency feedback
+from superconductor.losses.consistency_losses import (
+    ConsistencyLossConfig, CombinedConsistencyLoss, compute_consistency_reward
+)
+from superconductor.losses.theory_losses import (
+    TheoryLossConfig, TheoryRegularizationLoss
+)
+from superconductor.models.family_classifier import (
+    SuperconductorFamily, RuleBasedFamilyClassifier, HybridFamilyClassifier
+)
+
+
+# ============================================================================
+# V12.15: TIMING INSTRUMENTATION
+# ============================================================================
+
+class TimingStats:
+    """
+    Track timing for different phases of training.
+
+    Phases tracked:
+    - data_load: Time to fetch batch from DataLoader
+    - encoder_fwd: Encoder forward pass
+    - decoder_fwd: Decoder forward pass (teacher forcing)
+    - loss_compute: Loss computation (excluding REINFORCE)
+    - reinforce_sample: REINFORCE autoregressive sampling (the expensive part)
+    - backward: Backward pass (gradient computation)
+    - optimizer: Optimizer step (including gradient clipping)
+    - other: Everything else (metrics accumulation, etc.)
+    """
+
+    PHASES = [
+        'data_load',
+        'encoder_fwd',
+        'decoder_fwd',
+        'loss_compute',
+        'reinforce_sample',
+        'backward',
+        'optimizer',
+        'other'
+    ]
+
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        """Reset all timing accumulators."""
+        self.times = defaultdict(float)
+        self.counts = defaultdict(int)
+        self._phase_start = None
+        self._current_phase = None
+        self._epoch_start = None
+
+    def start_epoch(self):
+        """Mark the start of an epoch."""
+        self._epoch_start = time.perf_counter()
+
+    def start(self, phase: str):
+        """Start timing a phase."""
+        # Ensure CUDA operations are complete before timing
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        self._phase_start = time.perf_counter()
+        self._current_phase = phase
+
+    def stop(self, phase: str = None):
+        """Stop timing the current phase."""
+        if self._phase_start is None:
+            return
+        # Ensure CUDA operations are complete before timing
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        elapsed = time.perf_counter() - self._phase_start
+        phase = phase or self._current_phase
+        if phase:
+            self.times[phase] += elapsed
+            self.counts[phase] += 1
+        self._phase_start = None
+        self._current_phase = None
+
+    def get_epoch_time(self) -> float:
+        """Get total epoch time in seconds."""
+        if self._epoch_start is None:
+            return 0.0
+        return time.perf_counter() - self._epoch_start
+
+    def get_total_tracked(self) -> float:
+        """Get sum of all tracked phase times."""
+        return sum(self.times.values())
+
+    def get_breakdown(self) -> Dict[str, float]:
+        """
+        Get timing breakdown as percentages.
+
+        Returns:
+            Dict mapping phase name to percentage of total time.
+        """
+        total = self.get_total_tracked()
+        if total == 0:
+            return {phase: 0.0 for phase in self.PHASES}
+        return {phase: (self.times[phase] / total) * 100 for phase in self.PHASES}
+
+    def get_absolute(self) -> Dict[str, float]:
+        """Get absolute times in seconds for each phase."""
+        return dict(self.times)
+
+    def get_per_batch(self) -> Dict[str, float]:
+        """Get average time per batch for each phase (in ms)."""
+        result = {}
+        for phase in self.PHASES:
+            if self.counts[phase] > 0:
+                result[phase] = (self.times[phase] / self.counts[phase]) * 1000  # ms
+            else:
+                result[phase] = 0.0
+        return result
+
+    def format_summary(self, epoch_time: float = None) -> str:
+        """
+        Format timing summary for display.
+
+        Args:
+            epoch_time: Optional total epoch time (if not using start_epoch)
+
+        Returns:
+            Formatted string like "Fwd 28% | Sample 45% | Bwd 22% | Data 5%"
+        """
+        breakdown = self.get_breakdown()
+        epoch_time = epoch_time or self.get_epoch_time()
+
+        # Combine encoder + decoder forward
+        fwd_pct = breakdown['encoder_fwd'] + breakdown['decoder_fwd']
+
+        parts = []
+
+        # Main phases (sorted by typical importance)
+        if breakdown['reinforce_sample'] > 1:
+            parts.append(f"Sample {breakdown['reinforce_sample']:.0f}%")
+        if fwd_pct > 1:
+            parts.append(f"Fwd {fwd_pct:.0f}%")
+        if breakdown['backward'] > 1:
+            parts.append(f"Bwd {breakdown['backward']:.0f}%")
+        if breakdown['loss_compute'] > 1:
+            parts.append(f"Loss {breakdown['loss_compute']:.0f}%")
+        if breakdown['optimizer'] > 1:
+            parts.append(f"Opt {breakdown['optimizer']:.0f}%")
+        if breakdown['data_load'] > 1:
+            parts.append(f"Data {breakdown['data_load']:.0f}%")
+
+        # Calculate untracked time
+        tracked = self.get_total_tracked()
+        if epoch_time > 0:
+            untracked_pct = max(0, (epoch_time - tracked) / epoch_time * 100)
+            if untracked_pct > 5:
+                parts.append(f"Other {untracked_pct:.0f}%")
+
+        return " | ".join(parts) if parts else "No timing data"
+
+    def format_detailed(self) -> str:
+        """
+        Format detailed timing report.
+
+        Returns:
+            Multi-line string with detailed breakdown.
+        """
+        breakdown = self.get_breakdown()
+        absolute = self.get_absolute()
+        per_batch = self.get_per_batch()
+        epoch_time = self.get_epoch_time()
+
+        lines = [
+            "=" * 60,
+            "TIMING BREAKDOWN",
+            "=" * 60,
+            f"Total epoch time: {epoch_time:.1f}s",
+            f"Tracked time: {self.get_total_tracked():.1f}s ({self.get_total_tracked()/epoch_time*100:.1f}%)" if epoch_time > 0 else "",
+            "",
+            f"{'Phase':<20} {'Time (s)':<12} {'%':<8} {'ms/batch':<12}",
+            "-" * 60,
+        ]
+
+        for phase in self.PHASES:
+            if absolute[phase] > 0 or self.counts[phase] > 0:
+                lines.append(
+                    f"{phase:<20} {absolute[phase]:<12.2f} {breakdown[phase]:<8.1f} {per_batch[phase]:<12.2f}"
+                )
+
+        lines.append("-" * 60)
+        lines.append("")
+
+        return "\n".join(lines)
+
+
+# Global timing stats instance (set per-epoch in train_epoch)
+_timing_stats: Optional[TimingStats] = None
+
+
+def get_timing_stats() -> Optional[TimingStats]:
+    """Get the current timing stats instance."""
+    global _timing_stats
+    return _timing_stats
+
 
 # ============================================================================
 # CONFIG
@@ -92,7 +326,7 @@ TRAIN_CONFIG = {
     # BATCH SIZE CONFIGURATION
     # =========================================================================
     # Set to 'auto' to automatically scale based on GPU memory:
-    #   - 8GB  (RTX 4060):      batch_size=32
+    #   - 8GB  (RTX 4060):      batch_size=48
     #   - 11GB (GTX 1080 Ti):   batch_size=48
     #   - 16GB (V100 16GB):     batch_size=64
     #   - 24GB (RTX 3090/4090): batch_size=96
@@ -101,14 +335,14 @@ TRAIN_CONFIG = {
     # Effective batch size = batch_size * accumulation_steps
     # Larger effective batch = smoother gradients, but may need LR scaling
     # =========================================================================
-    'batch_size': 'auto',       # 'auto' scales with GPU memory, or set fixed value (32, 48, etc.)
-    'accumulation_steps': 1,    # Gradient accumulation (increase for larger effective batch)
+    'batch_size': 42,            # Full GPU budget (no other GPU apps running)
+    'accumulation_steps': 2,    # Gradient accumulation (increase for larger effective batch) V12.12: effective batch=64
 
-    # V12.8: Data Loading Optimizations
-    'num_workers': 4,           # Parallel data loading (set to 0 if WSL2 CUDA issues)
-    'pin_memory': True,
-    'prefetch_factor': 2,       # Prefetch 2 batches per worker
-    'persistent_workers': True, # Keep workers alive between epochs
+    # V12.8: Data Loading Optimizations (defaults — overridden by detect_environment())
+    'num_workers': 2,
+    'pin_memory': False,
+    'prefetch_factor': 1,
+    'persistent_workers': False,
 
     # V12.8: Mixed Precision Optimizations
     'use_amp': True,
@@ -124,7 +358,7 @@ TRAIN_CONFIG = {
     # V12.8: Compute Optimizations
     'use_torch_compile': True,   # V12.10: Works with resume (gcc installed in conda env)
     'compile_mode': 'reduce-overhead',  # 'default', 'reduce-overhead', 'max-autotune'
-    'use_gradient_checkpointing': False,  # Trade compute for memory (enables larger batch)
+    'use_gradient_checkpointing': False,  # Incompatible with torch.compile (tensor count mismatch during recomputation)
     'enable_flash_sdp': True,   # Enable Flash Attention via SDPA
 
     # Loss weights (final values - curriculum ramps up to these)
@@ -132,7 +366,7 @@ TRAIN_CONFIG = {
     'tc_weight': 10.0,
     'magpie_weight': 2.0,
     'stoich_weight': 2.0,  # V12.4: Stoichiometry loss weight
-    'kl_weight': 0.0001,
+    'kl_weight': 0.0001,  # Now L2 regularization weight on z (deterministic encoder)
 
     # Teacher forcing decay
     'tf_start': 1.0,           # Start with full teacher forcing
@@ -157,12 +391,61 @@ TRAIN_CONFIG = {
     #   - Then enable rl_weight=1.0-2.5 for fine-tuning
     #   - Higher n_samples_rloo = lower variance but slower
     # =========================================================================
-    'rl_weight': 1.0,            # REINFORCE weight (0=disabled, 1.0-2.5=typical)
+    'rl_weight': 1.5,            # REINFORCE weight (0=disabled, 1.0-2.5=typical) V12.12: Enabled for fine-tuning
     'ce_weight': 1.0,            # Cross-entropy weight (keep at 1.0)
     'n_samples_rloo': 2,         # Number of samples for RLOO baseline (2-4)
     'rl_temperature': 0.8,       # Sampling temperature for REINFORCE
     'entropy_weight': 0.2,       # Entropy bonus in REINFORCE reward (encourages exploration)
     'use_autoregressive_reinforce': True,  # Use KV-cached autoregressive sampling (recommended)
+
+    # =========================================================================
+    # V12.9: Speculative Decoding Settings
+    # =========================================================================
+    # Uses n-gram + structural draft model to predict tokens ahead, then verifies
+    # in batch. Speeds up autoregressive sampling by ~1.8-2.2x.
+    #
+    # The draft model is built from training data and cached to disk.
+    # Enable for REINFORCE training to reduce sampling overhead.
+    # V12.16: Fixed per-sequence tracking - now works with large batches.
+    # V12.16.1: DISABLED - N-gram draft model doesn't match VAE decoder well.
+    #   The draft model predicts based on corpus statistics, but the VAE decoder
+    #   predicts based on latent z. Acceptance rate is only 1-4%, making spec
+    #   decoding 5x SLOWER than standard sampling. For spec decoding to work,
+    #   we'd need a z-conditioned draft model (mini-decoder).
+    # =========================================================================
+    'use_speculative_decoding': False,      # V12.16.1: Disabled - doesn't match VAE architecture
+    'speculative_k': 5,                     # Number of tokens to draft at once
+    'draft_model_path': 'data/processed/draft_model_v2.pkl',  # Path to V2 draft model cache (position-aware)
+
+    # =========================================================================
+    # V12.17: Latent Z Caching & Prediction Logging
+    # =========================================================================
+    # Cache latent z vectors and decoder predictions for analysis.
+    # Useful for:
+    #   - Analyzing z-space structure (correlations with Tc, family, etc.)
+    #   - Training z-conditioned draft model for speculative decoding
+    #   - Debugging encoder/decoder behavior
+    #   - Post-training analysis of all predictions
+    #
+    # Cache modes:
+    #   - 'z_only': Just z vectors (fast, ~50MB per cache)
+    #   - 'z_and_predictions': Z + decoder predictions (slower, ~200MB per cache)
+    #   - 'full': Z + predictions + token log_probs (slow, ~500MB per cache)
+    # =========================================================================
+    'cache_z_vectors': True,                # Enable z-vector caching
+    'z_cache_interval': 50,                 # Cache every N epochs (0 = only on best checkpoint)
+    'z_cache_path': 'outputs/latent_cache.pt',  # Path to save z cache
+    'z_cache_mode': 'z_and_predictions',    # 'z_only', 'z_and_predictions', or 'full'
+    'z_cache_every_epoch': True,            # Cache EVERY epoch for full error analysis over time
+
+    # =========================================================================
+    # V12.15: Timing Instrumentation
+    # =========================================================================
+    # Track compute time breakdown to identify bottlenecks.
+    # Phases tracked: data_load, encoder_fwd, decoder_fwd, loss_compute,
+    #                 reinforce_sample, backward, optimizer
+    # =========================================================================
+    'enable_timing': True,                  # Enable timing instrumentation
 
     # =========================================================================
     # V12.9: Entropy Maintenance Settings
@@ -190,7 +473,55 @@ TRAIN_CONFIG = {
 
     # Resume from checkpoint (set to None to train from scratch)
     'resume_checkpoint': 'outputs/checkpoint_best.pt',  # V12.10: Resume from best checkpoint
+
+    # V12.12: Retrain on new/combined data - resets catastrophic drop detector
+    # Set to True when training data has changed (new normalization stats)
+    'retrain_new_data': True,
+
+    # =========================================================================
+    # V12.12: Contrastive Learning Settings
+    # =========================================================================
+    # Trains on 46K mixed SC + non-SC data with contrastive loss to:
+    # 1. Improve decoder on rare elements (more formula examples)
+    # 2. Separate SC vs non-SC in latent space
+    # 3. Cluster SC families together
+    # =========================================================================
+    'contrastive_mode': True,          # Enable contrastive training with non-SC data
+    'contrastive_weight': 0.1,         # Weight for contrastive loss
+    'contrastive_warmup_epochs': 100,  # Warm up contrastive loss over N epochs
+    'contrastive_temperature': 0.07,   # SupCon temperature (0.07 = standard)
+    'non_sc_formula_weight': 0.5,      # Formula loss weight for non-SC samples (lower)
+    'use_extended_labels': True,       # Use per-family labels (vs binary SC/non-SC)
+    'balanced_sampling': True,         # Balanced sampling: ~50/50 SC/non-SC per batch
+
+    # V12.12: Selective Backpropagation
+    # Skip backward pass on batches where loss is well below running average.
+    # Saves compute on "easy" batches the model has already learned.
+    'selective_backprop': True,
+    'selective_backprop_threshold': 0.33,  # Skip if batch loss < threshold * running_avg_loss
+
+    # =========================================================================
+    # V12.16: Theory-Guided Consistency Feedback
+    # =========================================================================
+    # Applies physics-based constraints during training:
+    # - Consistency loss: Ensures encoder-decoder property coherence
+    # - Theory loss: BCS, cuprate, iron-based constraints by family
+    # - Unknown materials get NO theory constraints (intentional)
+    # =========================================================================
+    'use_consistency_loss': False,         # Enable consistency feedback (disabled by default until tested)
+    'consistency_weight': 0.1,             # Weight for consistency loss
+    'consistency_tc_weight': 1.0,          # Weight for Tc consistency
+    'consistency_magpie_weight': 0.1,      # Weight for Magpie consistency
+
+    'use_theory_loss': False,              # Enable theory-based regularization (disabled by default)
+    'theory_weight': 0.05,                 # Weight for theory regularization
+    'theory_use_soft_constraints': True,   # Use soft (Huber) vs hard (MSE) constraints
+
+    'use_family_classifier': False,        # Train learned family classifier alongside
+    'family_classifier_weight': 0.01,      # Weight for family classification loss
 }
+
+CONTRASTIVE_DATA_PATH = PROJECT_ROOT / 'data/processed/supercon_fractions_contrastive.csv'
 
 DATA_PATH = PROJECT_ROOT / 'data/processed/supercon_fractions_combined.csv'
 HOLDOUT_PATH = PROJECT_ROOT / 'data/GENERATIVE_HOLDOUT_DO_NOT_TRAIN.json'
@@ -505,6 +836,10 @@ def _save_cache(tensors: dict, norm_stats: dict, n_magpie_cols: int,
 def load_and_prepare_data():
     """Load and prepare full materials dataset.
 
+    V12.12: Supports contrastive mode with mixed SC/non-SC data.
+    In contrastive mode, loads 46K samples and adds is_superconductor + category labels.
+    Uses balanced sampling to ensure ~50/50 SC/non-SC per batch.
+
     Uses a tensor cache to skip tokenization/normalization on subsequent runs.
     Cache is invalidated when the CSV file changes or max_formula_len changes.
     """
@@ -513,35 +848,86 @@ def load_and_prepare_data():
     print("=" * 60)
 
     max_len = TRAIN_CONFIG['max_formula_len']
+    contrastive = TRAIN_CONFIG.get('contrastive_mode', False)
 
-    # Check for valid cache
-    csv_hash = _compute_csv_hash(DATA_PATH)
-    cached = _try_load_cache(csv_hash, max_len)
+    # V12.12: Select data path based on mode
+    data_path = CONTRASTIVE_DATA_PATH if contrastive else DATA_PATH
+    if contrastive:
+        print(f"CONTRASTIVE MODE: Loading SC + non-SC data from {data_path.name}")
+    else:
+        print(f"SC-only mode: Loading from {data_path.name}")
+
+    # Check for valid cache (contrastive mode invalidates SC-only cache and vice versa)
+    csv_hash = _compute_csv_hash(data_path)
+    # Add mode to hash so contrastive and non-contrastive have separate caches
+    mode_suffix = '_contrastive' if contrastive else '_sc_only'
+    cached = _try_load_cache(csv_hash + mode_suffix, max_len)
+
+    is_sc_tensor = None  # Will be set below
+    label_tensor = None  # Will be set below
+    n_sc_train = 0
+    n_non_sc_train = 0
 
     if cached is not None:
         tensors, norm_stats, n_magpie_cols, train_indices = cached
 
         # Rebuild dataset from cached tensors
-        dataset = TensorDataset(
+        tensor_list = [
             tensors['element_indices'], tensors['element_fractions'],
             tensors['element_mask'], tensors['formula_tokens'],
-            tensors['tc_tensor'], tensors['magpie_tensor']
-        )
+            tensors['tc_tensor'], tensors['magpie_tensor'],
+        ]
+        if 'is_sc_tensor' in tensors and 'label_tensor' in tensors:
+            is_sc_tensor = tensors['is_sc_tensor']
+            label_tensor = tensors['label_tensor']
+            tensor_list.extend([is_sc_tensor, label_tensor])
+        else:
+            # Legacy cache without contrastive tensors — add dummy tensors (all SC)
+            n = tensors['element_indices'].size(0)
+            is_sc_tensor = torch.ones(n, dtype=torch.long)
+            label_tensor = torch.zeros(n, dtype=torch.long)
+            tensor_list.extend([is_sc_tensor, label_tensor])
+
+        dataset = TensorDataset(*tensor_list)
         train_dataset = Subset(dataset, train_indices)
+        is_sc_train = is_sc_tensor[train_indices]
+        n_sc_train = int(is_sc_train.sum().item())
+        n_non_sc_train = len(train_indices) - n_sc_train
         print(f"Training samples: {len(train_indices)} (from cache)")
 
     else:
         # Full preprocessing path
-        df = pd.read_csv(DATA_PATH)
+        df = pd.read_csv(data_path)
         print(f"Loaded {len(df)} samples")
 
         formulas = df['formula'].tolist()
         tc_values = df['Tc'].values
 
-        # Normalize Tc
-        tc_mean, tc_std = float(tc_values.mean()), float(tc_values.std())
+        # V12.12: Extract SC labels and category labels
+        if contrastive and 'is_superconductor' in df.columns:
+            is_sc_values = df['is_superconductor'].values.astype(np.int64)
+            print(f"  SC: {is_sc_values.sum()}, Non-SC: {(1 - is_sc_values).sum()}")
+        else:
+            is_sc_values = np.ones(len(df), dtype=np.int64)
+
+        # V12.12: Contrastive labels from category column
+        use_extended = TRAIN_CONFIG.get('use_extended_labels', True)
+        if 'category' in df.columns:
+            label_values = np.array([
+                category_to_label(cat, use_extended=use_extended)
+                for cat in df['category'].values
+            ], dtype=np.int64)
+            n_labels = len(set(label_values))
+            print(f"  Contrastive labels: {n_labels} classes (extended={use_extended})")
+        else:
+            label_values = np.zeros(len(df), dtype=np.int64)
+
+        # Normalize Tc (use SC samples only for Tc stats to avoid non-SC Tc=0 skewing)
+        sc_mask_np = is_sc_values == 1
+        tc_mean = float(tc_values[sc_mask_np].mean()) if sc_mask_np.any() else float(tc_values.mean())
+        tc_std = float(tc_values[sc_mask_np].std()) if sc_mask_np.any() else float(tc_values.std())
         tc_normalized = (tc_values - tc_mean) / tc_std
-        print(f"Tc: mean={tc_mean:.2f}K, std={tc_std:.2f}K")
+        print(f"Tc (SC-only stats): mean={tc_mean:.2f}K, std={tc_std:.2f}K")
 
         # Get Magpie features
         exclude = ['formula', 'Tc', 'composition', 'category', 'is_superconductor', 'compound possible', 'formula_original']
@@ -598,13 +984,19 @@ def load_and_prepare_data():
         # Create tensors
         tc_tensor = torch.tensor(tc_normalized, dtype=torch.float32).unsqueeze(1)
         magpie_tensor = torch.tensor(magpie_normalized, dtype=torch.float32)
+        is_sc_tensor = torch.tensor(is_sc_values, dtype=torch.long)
+        label_tensor = torch.tensor(label_values, dtype=torch.long)
 
         # Get train indices (exclude holdout — matched by formula, not position)
         holdout_indices = load_holdout_indices(HOLDOUT_PATH, formulas)
         all_indices = set(range(len(formulas)))
         train_indices = sorted(all_indices - holdout_indices)
 
-        print(f"Training samples: {len(train_indices)}")
+        is_sc_train = is_sc_tensor[train_indices]
+        n_sc_train = int(is_sc_train.sum().item())
+        n_non_sc_train = len(train_indices) - n_sc_train
+
+        print(f"Training samples: {len(train_indices)} (SC: {n_sc_train}, Non-SC: {n_non_sc_train})")
         print(f"Holdout samples (NEVER TRAIN): {len(holdout_indices)}")
 
         norm_stats = {
@@ -622,18 +1014,21 @@ def load_and_prepare_data():
                 'element_mask': element_mask,
                 'tc_tensor': tc_tensor,
                 'magpie_tensor': magpie_tensor,
+                'is_sc_tensor': is_sc_tensor,
+                'label_tensor': label_tensor,
             },
             norm_stats=norm_stats,
             n_magpie_cols=n_magpie_cols,
             train_indices=train_indices,
-            csv_hash=csv_hash,
+            csv_hash=csv_hash + mode_suffix,
             max_formula_len=max_len,
         )
 
-        # Create dataset
+        # Create dataset (8 tensors: 6 original + is_sc + label)
         dataset = TensorDataset(
             element_indices, element_fractions, element_mask,
-            formula_tokens, tc_tensor, magpie_tensor
+            formula_tokens, tc_tensor, magpie_tensor,
+            is_sc_tensor, label_tensor,
         )
         train_dataset = Subset(dataset, train_indices)
 
@@ -642,28 +1037,24 @@ def load_and_prepare_data():
     if batch_size == 'auto':
         if torch.cuda.is_available():
             gpu_mem_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
-            # Scale batch size with GPU memory (thresholds account for ~0.5GB reserved)
-            # GPUs report slightly less than advertised (e.g., 11GB 1080 Ti → 10.9GB)
-            if gpu_mem_gb >= 38:      # 40GB GPUs (A100)
+            if gpu_mem_gb >= 38:
                 batch_size = 128
-            elif gpu_mem_gb >= 22:    # 24GB GPUs (RTX 3090/4090)
+            elif gpu_mem_gb >= 22:
                 batch_size = 96
-            elif gpu_mem_gb >= 15:    # 16GB GPUs (V100 16GB)
+            elif gpu_mem_gb >= 15:
                 batch_size = 64
-            elif gpu_mem_gb >= 10:    # 11GB GPUs (GTX 1080 Ti → reports 10.9GB)
+            else:
+                # RTX 4060 (8GB) and similar - batch_size=48 works well with REINFORCE
                 batch_size = 48
-            else:                     # 8GB GPUs (RTX 4060, RTX 3070)
-                batch_size = 32
             print(f"Auto batch size: {batch_size} (GPU memory: {gpu_mem_gb:.1f}GB)")
         else:
-            batch_size = 16  # CPU fallback
+            batch_size = 16
             print(f"Auto batch size: {batch_size} (CPU mode)")
 
     # Create DataLoader with V12.8 optimizations
     use_workers = TRAIN_CONFIG['num_workers']
     loader_kwargs = {
         'batch_size': batch_size,
-        'shuffle': True,
         'num_workers': use_workers,
     }
     if use_workers > 0:
@@ -671,10 +1062,47 @@ def load_and_prepare_data():
         loader_kwargs['prefetch_factor'] = TRAIN_CONFIG['prefetch_factor']
         loader_kwargs['persistent_workers'] = TRAIN_CONFIG.get('persistent_workers', True)
     else:
-        loader_kwargs['pin_memory'] = False  # Not useful without workers
+        loader_kwargs['pin_memory'] = False
+
+    # V12.12: Balanced sampling for contrastive mode
+    if contrastive and TRAIN_CONFIG.get('balanced_sampling', True) and n_non_sc_train > 0:
+        # Assign sampling weights: oversample minority class for ~50/50 batches
+        is_sc_train_arr = is_sc_tensor[train_indices].numpy()
+        sc_weight = 1.0 / max(n_sc_train, 1)
+        non_sc_weight = 1.0 / max(n_non_sc_train, 1)
+        sample_weights = np.where(is_sc_train_arr == 1, sc_weight, non_sc_weight)
+        sampler = WeightedRandomSampler(
+            weights=torch.from_numpy(sample_weights).double(),
+            num_samples=len(train_indices),
+            replacement=True,
+        )
+        loader_kwargs['sampler'] = sampler
+        # Cannot use shuffle with sampler
+        print(f"Balanced sampling: SC weight={sc_weight:.6f}, Non-SC weight={non_sc_weight:.6f}")
+    else:
+        loader_kwargs['shuffle'] = True
 
     train_loader = DataLoader(train_dataset, **loader_kwargs)
     print(f"DataLoader: workers={use_workers}, pin_memory={loader_kwargs.get('pin_memory', False)}")
+
+    # V12.12: Save norm_stats.json for inference (always update when data changes)
+    norm_stats_path = OUTPUT_DIR / 'norm_stats.json'
+    norm_stats_with_cols = dict(norm_stats)
+    # Include magpie column names for reference
+    if 'magpie_cols' not in norm_stats_with_cols:
+        # Reconstruct column names from the data
+        try:
+            df_cols = pd.read_csv(DATA_PATH, nrows=0)
+            exclude = ['formula', 'Tc', 'composition', 'category', 'is_superconductor', 'compound possible', 'formula_original']
+            numeric_cols = [c for c in df_cols.columns if c not in exclude]
+            # Filter to only numeric columns that were actually used
+            norm_stats_with_cols['magpie_cols'] = [c for c in numeric_cols
+                                                    if c in df_cols.select_dtypes(include=['number']).columns]
+        except Exception:
+            pass
+    with open(norm_stats_path, 'w') as f:
+        json.dump(norm_stats_with_cols, f)
+    print(f"  Saved norm_stats to {norm_stats_path}")
 
     return train_loader, norm_stats, n_magpie_cols
 
@@ -794,10 +1222,21 @@ class CombinedLossWithREINFORCE(nn.Module):
         else:
             self.ce_loss = nn.CrossEntropyLoss(reduction='none', ignore_index=PAD_IDX)
 
-    def set_decoder(self, decoder, max_len: int = 60):
-        """Set decoder for autoregressive REINFORCE sampling (V12.8)."""
+    def set_decoder(self, decoder, max_len: int = 60, draft_model=None):
+        """Set decoder for autoregressive REINFORCE sampling (V12.8).
+
+        Args:
+            decoder: The EnhancedTransformerDecoder
+            max_len: Maximum sequence length
+            draft_model: Optional HybridDraft for speculative decoding (V12.9)
+        """
         self._decoder = decoder
         self._max_len = max_len
+        self._draft_model = draft_model
+
+    def set_draft_model(self, draft_model):
+        """Set draft model for speculative decoding (V12.9)."""
+        self._draft_model = draft_model
 
     def compute_rloo_autoregressive(
         self,
@@ -808,6 +1247,7 @@ class CombinedLossWithREINFORCE(nn.Module):
     ):
         """
         V12.8: Compute RLOO advantages using autoregressive sampling with KV cache.
+        V12.9: Supports speculative decoding when draft_model is set.
 
         This samples from the model's actual autoregressive behavior (not teacher-forced
         logits), which is more accurate for REINFORCE training.
@@ -831,14 +1271,41 @@ class CombinedLossWithREINFORCE(nn.Module):
         stoich_pred_expanded = stoich_pred.repeat(n_samples, 1) if stoich_pred is not None else None
         targets_expanded = targets.repeat(n_samples, 1)  # [batch * n_samples, seq_len]
 
-        # Generate ALL samples in one batched call (2x faster than sequential!)
-        sampled_tokens, log_probs, entropy, mask = self._decoder.sample_for_reinforce(
-            z=z_expanded,
-            encoder_skip=encoder_skip_expanded,
-            stoich_pred=stoich_pred_expanded,
-            temperature=self.temperature,
-            max_len=self._max_len,
-        )
+        # V12.15: Track REINFORCE sampling time separately (this is the expensive part)
+        timing = get_timing_stats()
+        if timing:
+            # Stop loss_compute timing, start reinforce_sample timing
+            timing.stop('loss_compute')
+            timing.start('reinforce_sample')
+
+        # V12.9: Use speculative decoding if draft model available
+        if self._draft_model is not None:
+            sampled_tokens, log_probs, entropy, mask, spec_stats = self._decoder.speculative_sample_for_reinforce(
+                z=z_expanded,
+                draft_model=self._draft_model,
+                encoder_skip=encoder_skip_expanded,
+                stoich_pred=stoich_pred_expanded,
+                temperature=self.temperature,
+                max_len=self._max_len,
+                k=5,  # Draft 5 tokens at a time
+            )
+            # Store stats for logging (accessible via self._last_spec_stats)
+            self._last_spec_stats = spec_stats
+        else:
+            # Generate ALL samples in one batched call (2x faster than sequential!)
+            sampled_tokens, log_probs, entropy, mask = self._decoder.sample_for_reinforce(
+                z=z_expanded,
+                encoder_skip=encoder_skip_expanded,
+                stoich_pred=stoich_pred_expanded,
+                temperature=self.temperature,
+                max_len=self._max_len,
+            )
+            self._last_spec_stats = None
+
+        # V12.15: Stop sampling timing, resume loss_compute
+        if timing:
+            timing.stop('reinforce_sample')
+            timing.start('loss_compute')
 
         # Pad/truncate to match target length
         if sampled_tokens.size(1) < targets.size(1):
@@ -1073,7 +1540,7 @@ class CombinedLossWithREINFORCE(nn.Module):
         seq_correct = (correct | ~mask).all(dim=1)
         exact_match = seq_correct.float().mean()
 
-        return {
+        result = {
             'total': total,
             'formula_loss': formula_ce_loss,  # CE component only for logging
             'reinforce_loss': reinforce_loss,
@@ -1086,6 +1553,13 @@ class CombinedLossWithREINFORCE(nn.Module):
             'token_accuracy': token_accuracy,
             'exact_match': exact_match,
         }
+
+        # V12.9: Add speculative decoding stats if available
+        if hasattr(self, '_last_spec_stats') and self._last_spec_stats is not None:
+            result['spec_acceptance_rate'] = self._last_spec_stats.get('acceptance_rate', 0)
+            result['spec_tokens_per_step'] = self._last_spec_stats.get('avg_tokens_per_step', 1)
+
+        return result
 
 
 # Backward compatibility alias
@@ -1138,6 +1612,273 @@ def save_checkpoint(encoder, decoder, epoch, suffix='', entropy_manager=None,
     print(f"  Saved checkpoint: {path.name}", flush=True)
 
 
+# ============================================================================
+# V12.17: LATENT Z CACHING & PREDICTION LOGGING
+# ============================================================================
+
+def cache_z_vectors(encoder, loader, device, epoch, cache_path, dataset_info=None,
+                    decoder=None, mode='z_only'):
+    """
+    Compute and cache latent z vectors and optionally decoder predictions.
+
+    This enables:
+    - Z-space analysis (correlations with Tc, family, element presence)
+    - Training z-conditioned mini-decoder for speculative decoding
+    - Debugging encoder/decoder behavior over training
+    - Post-training analysis linking z coordinates to predictions
+
+    Args:
+        encoder: Trained encoder model
+        loader: DataLoader for the dataset
+        device: Torch device
+        epoch: Current epoch number
+        cache_path: Path to save the cache
+        dataset_info: Optional dict with formulas, Tc values, etc.
+        decoder: Optional decoder for generating predictions (required for 'z_and_predictions' mode)
+        mode: Cache mode - 'z_only', 'z_and_predictions', or 'full'
+
+    Cache modes:
+        - 'z_only': Just z vectors (~50MB) - fast
+        - 'z_and_predictions': Z + generated formulas (~200MB) - includes decoder output
+        - 'full': Z + predictions + per-token log_probs (~500MB) - for detailed analysis
+
+    Saves:
+        {
+            'z_vectors': [N, latent_dim] tensor,
+            'tc_values': [N] tensor,
+            'tc_pred': [N] tensor (encoder's Tc prediction),
+            'is_sc': [N] tensor (1=superconductor, 0=non-SC),
+            'target_tokens': [N, seq_len] tensor (ground truth),
+            'generated_tokens': [N, seq_len] tensor (decoder output, if mode != 'z_only'),
+            'exact_match': [N] tensor (1=match, 0=mismatch, if mode != 'z_only'),
+            'log_probs': [N, seq_len] tensor (per-token log probs, if mode == 'full'),
+            'epoch': int,
+            'timestamp': str,
+            'mode': str,
+            'stats': dict,
+        }
+    """
+    import datetime
+    from superconductor.models.autoregressive_decoder import IDX_TO_TOKEN, END_IDX, PAD_IDX
+
+    encoder.eval()
+    if decoder is not None:
+        decoder.eval()
+
+    all_z = []
+    all_tc = []
+    all_tc_pred = []
+    all_is_sc = []
+    all_target_tokens = []
+    all_generated_tokens = []
+    all_exact_match = []
+    all_log_probs = []
+    all_attended_input = []
+
+    sample_idx = 0
+    include_predictions = mode in ['z_and_predictions', 'full'] and decoder is not None
+    include_log_probs = mode == 'full' and decoder is not None
+
+    with torch.no_grad():
+        for batch in loader:
+            # Unpack batch (same as training loop)
+            elem_idx, elem_frac, elem_mask, tokens, tc, magpie, is_sc, labels = [b.to(device) for b in batch]
+
+            # Encode
+            encoder_out = encoder(elem_idx, elem_frac, elem_mask, magpie, tc)
+            z = encoder_out['z']
+
+            # Skip NaN batches
+            if torch.isnan(z).any():
+                sample_idx += z.size(0)
+                continue
+
+            all_z.append(z.cpu())
+            all_tc.append(tc.cpu())
+            all_tc_pred.append(encoder_out['tc_pred'].cpu())
+            all_is_sc.append(is_sc.cpu())
+            all_target_tokens.append(tokens.cpu())
+
+            if include_predictions:
+                attended_input = encoder_out.get('attended_input')
+                all_attended_input.append(attended_input.cpu() if attended_input is not None else None)
+
+                # Generate predictions using decoder
+                if include_log_probs:
+                    gen_tokens, log_probs, _, _ = decoder.sample_for_reinforce(
+                        z=z, encoder_skip=attended_input, temperature=0.0,  # Greedy
+                        max_len=tokens.size(1)
+                    )
+                    all_log_probs.append(log_probs.cpu())
+                else:
+                    gen_tokens = decoder.generate_with_kv_cache(
+                        z=z, encoder_skip=attended_input, temperature=0.0,
+                        max_len=tokens.size(1), return_log_probs=False, return_entropy=False
+                    )[0]
+
+                all_generated_tokens.append(gen_tokens.cpu())
+
+                # Compute exact match
+                # Compare up to END token
+                batch_size = tokens.size(0)
+                exact_match = torch.zeros(batch_size, dtype=torch.long)
+                for i in range(batch_size):
+                    target = tokens[i, 1:]  # Skip START
+                    gen = gen_tokens[i]
+
+                    # Find END positions
+                    target_end = (target == END_IDX).nonzero(as_tuple=True)[0]
+                    target_end = target_end[0].item() if len(target_end) > 0 else len(target)
+                    gen_end = (gen == END_IDX).nonzero(as_tuple=True)[0]
+                    gen_end = gen_end[0].item() if len(gen_end) > 0 else len(gen)
+
+                    # Compare
+                    if target_end == gen_end:
+                        if torch.equal(target[:target_end], gen[:gen_end]):
+                            exact_match[i] = 1
+
+                all_exact_match.append(exact_match)
+
+            sample_idx += z.size(0)
+
+    encoder.train()
+    if decoder is not None:
+        decoder.train()
+
+    # Concatenate all batches
+    z_vectors = torch.cat(all_z, dim=0)
+    tc_values = torch.cat(all_tc, dim=0)
+    tc_pred_values = torch.cat(all_tc_pred, dim=0)
+    is_sc_values = torch.cat(all_is_sc, dim=0)
+    target_tokens = torch.cat(all_target_tokens, dim=0)
+
+    # Build cache dict
+    cache_data = {
+        'z_vectors': z_vectors,
+        'tc_values': tc_values,
+        'tc_pred': tc_pred_values,
+        'is_sc': is_sc_values,
+        'target_tokens': target_tokens,
+        'epoch': epoch,
+        'timestamp': datetime.datetime.now().isoformat(),
+        'latent_dim': z_vectors.size(1),
+        'n_samples': z_vectors.size(0),
+        'mode': mode,
+    }
+
+    if include_predictions:
+        # Pad generated_tokens to same length before concatenating
+        max_gen_len = max(gt.size(1) for gt in all_generated_tokens)
+        padded_gen_tokens = []
+        for gt in all_generated_tokens:
+            if gt.size(1) < max_gen_len:
+                pad = torch.full((gt.size(0), max_gen_len - gt.size(1)), PAD_IDX, dtype=gt.dtype)
+                gt = torch.cat([gt, pad], dim=1)
+            padded_gen_tokens.append(gt)
+        generated_tokens = torch.cat(padded_gen_tokens, dim=0)
+        exact_match = torch.cat(all_exact_match, dim=0)
+        cache_data['generated_tokens'] = generated_tokens
+        cache_data['exact_match'] = exact_match
+        cache_data['exact_match_pct'] = exact_match.float().mean().item() * 100
+
+    if include_log_probs:
+        # Pad log_probs to same length
+        max_len = max(lp.size(1) for lp in all_log_probs)
+        padded_log_probs = []
+        for lp in all_log_probs:
+            if lp.size(1) < max_len:
+                pad = torch.zeros(lp.size(0), max_len - lp.size(1))
+                lp = torch.cat([lp, pad], dim=1)
+            padded_log_probs.append(lp)
+        cache_data['log_probs'] = torch.cat(padded_log_probs, dim=0)
+
+    # Compute basic statistics
+    cache_data['stats'] = {
+        'z_mean': z_vectors.mean(dim=0),
+        'z_std': z_vectors.std(dim=0),
+        'z_min': z_vectors.min(dim=0).values,
+        'z_max': z_vectors.max(dim=0).values,
+        'z_norm_mean': z_vectors.norm(dim=1).mean().item(),
+        'z_norm_std': z_vectors.norm(dim=1).std().item(),
+        'tc_mean': tc_values.mean().item(),
+        'tc_std': tc_values.std().item(),
+        'tc_pred_mae': (tc_pred_values - tc_values).abs().mean().item(),
+        'n_superconductors': is_sc_values.sum().item(),
+        'n_non_sc': (1 - is_sc_values).sum().item(),
+    }
+
+    # Save cache
+    cache_path = Path(cache_path)
+    cache_path.parent.mkdir(exist_ok=True)
+    torch.save(cache_data, cache_path)
+
+    print(f"  Cached {z_vectors.size(0)} samples to {cache_path.name} (mode={mode})")
+    print(f"    Z: {z_vectors.size(1)} dims, norm={z_vectors.norm(dim=1).mean():.2f}±{z_vectors.norm(dim=1).std():.2f}")
+    if include_predictions:
+        print(f"    Exact match: {cache_data['exact_match_pct']:.1f}%")
+    print(f"    Tc MAE: {cache_data['stats']['tc_pred_mae']:.4f}")
+
+    return cache_data
+
+
+def log_training_metrics(epoch, metrics, log_path, true_eval=None):
+    """
+    Append training metrics to a CSV log file for post-training analysis.
+
+    Creates/appends to a CSV with columns:
+        epoch, exact_match, accuracy, loss, tc_loss, magpie_loss, stoich_loss,
+        rl_loss, reward, entropy, entropy_weight, z_norm, tf_ratio, lr,
+        true_exact (every 10 epochs), epoch_time, timestamp
+
+    Args:
+        epoch: Current epoch number
+        metrics: Dict of training metrics from train_epoch()
+        log_path: Path to CSV log file
+        true_eval: Optional dict from evaluate_true_autoregressive()
+    """
+    import csv
+    import datetime
+
+    log_path = Path(log_path)
+    file_exists = log_path.exists()
+
+    # Define columns
+    columns = [
+        'epoch', 'exact_match', 'accuracy', 'loss', 'tc_loss', 'magpie_loss',
+        'stoich_loss', 'rl_loss', 'reward', 'entropy', 'entropy_weight',
+        'z_norm', 'tf_ratio', 'contrastive_loss', 'true_exact', 'epoch_time',
+        'timestamp'
+    ]
+
+    # Extract values
+    row = {
+        'epoch': epoch,
+        'exact_match': metrics.get('exact_match', 0),
+        'accuracy': metrics.get('accuracy', 0),
+        'loss': metrics.get('loss', 0),
+        'tc_loss': metrics.get('tc_loss', 0),
+        'magpie_loss': metrics.get('magpie_loss', 0),
+        'stoich_loss': metrics.get('stoich_loss', 0),
+        'rl_loss': metrics.get('rl_loss', 0),
+        'reward': metrics.get('reward', 0),
+        'entropy': metrics.get('entropy', 0),
+        'entropy_weight': metrics.get('entropy_weight', 0),
+        'z_norm': metrics.get('z_norm', 0),
+        'tf_ratio': metrics.get('tf_ratio', 0),
+        'contrastive_loss': metrics.get('contrastive_loss', 0),
+        'true_exact': true_eval['true_exact_match'] if true_eval else '',
+        'epoch_time': metrics.get('epoch_time', 0),
+        'timestamp': datetime.datetime.now().isoformat(),
+    }
+
+    # Write to CSV
+    with open(log_path, 'a', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=columns)
+        if not file_exists:
+            writer.writeheader()
+        writer.writerow(row)
+
+
 def _strip_compiled_prefix(state_dict):
     """Strip '_orig_mod.' prefix from compiled model state dict keys.
 
@@ -1170,18 +1911,43 @@ def load_checkpoint(encoder, decoder, checkpoint_path, entropy_manager=None,
     enc_state = checkpoint['encoder_state_dict']
     dec_state = checkpoint['decoder_state_dict']
 
+    # V12.13: Detect whether target models are compiled (for rollback into compiled models)
+    target_is_compiled = any(k.startswith('_orig_mod.') for k in encoder.state_dict().keys())
+
     # Check if checkpoint was saved with compiled model
-    # Check for top-level prefix (encoder) or nested prefix (decoder's transformer_decoder)
-    has_compiled_prefix = (
+    checkpoint_is_compiled = (
         any(k.startswith('_orig_mod.') for k in enc_state.keys()) or
         any('._orig_mod.' in k for k in dec_state.keys())
     )
-    if has_compiled_prefix:
+
+    if checkpoint_is_compiled and not target_is_compiled:
+        # Loading compiled checkpoint into uncompiled model (initial resume)
         print("  Detected compiled checkpoint - stripping '_orig_mod.' prefixes", flush=True)
         enc_state = _strip_compiled_prefix(enc_state)
         dec_state = _strip_compiled_prefix(dec_state)
+    elif not checkpoint_is_compiled and target_is_compiled:
+        # Loading uncompiled checkpoint into compiled model (shouldn't happen, but handle it)
+        print("  Adding '_orig_mod.' prefixes for compiled model target", flush=True)
+        enc_state = {'_orig_mod.' + k: v for k, v in enc_state.items()}
+        # Decoder: only transformer_decoder is compiled (nested prefix)
+        dec_new = {}
+        for k, v in dec_state.items():
+            if k.startswith('transformer_decoder.'):
+                dec_new['transformer_decoder._orig_mod.' + k[len('transformer_decoder.'):]] = v
+            else:
+                dec_new[k] = v
+        dec_state = dec_new
+    elif checkpoint_is_compiled and target_is_compiled:
+        # Both compiled — keys should match directly
+        pass
+    # else: both uncompiled — keys match directly
 
-    encoder.load_state_dict(enc_state)
+    # strict=False: deterministic encoder drops fc_logvar, so old checkpoint has extra keys
+    missing, unexpected = encoder.load_state_dict(enc_state, strict=False)
+    if missing:
+        print(f"  [Checkpoint] Missing keys in encoder: {missing}", flush=True)
+    if unexpected:
+        print(f"  [Checkpoint] Unexpected keys in encoder (ignored): {unexpected}", flush=True)
     decoder.load_state_dict(dec_state)
     start_epoch = checkpoint.get('epoch', 0) + 1  # Resume from next epoch
     print(f"  Loaded checkpoint from epoch {checkpoint.get('epoch', 'unknown')}", flush=True)
@@ -1192,9 +1958,14 @@ def load_checkpoint(encoder, decoder, checkpoint_path, entropy_manager=None,
         print(f"  Restored entropy manager state", flush=True)
 
     # V12.10: Load optimizer state if available
+    # Encoder optimizer may fail to restore if parameter count changed (e.g., fc_logvar removed)
     if enc_opt is not None and 'enc_optimizer_state_dict' in checkpoint:
-        enc_opt.load_state_dict(checkpoint['enc_optimizer_state_dict'])
-        print(f"  Restored encoder optimizer state", flush=True)
+        try:
+            enc_opt.load_state_dict(checkpoint['enc_optimizer_state_dict'])
+            print(f"  Restored encoder optimizer state", flush=True)
+        except (ValueError, KeyError) as e:
+            print(f"  [Checkpoint] Encoder optimizer state incompatible (param count changed), "
+                  f"using fresh optimizer: {e}", flush=True)
     if dec_opt is not None and 'dec_optimizer_state_dict' in checkpoint:
         dec_opt.load_state_dict(checkpoint['dec_optimizer_state_dict'])
         print(f"  Restored decoder optimizer state", flush=True)
@@ -1238,12 +2009,14 @@ def load_checkpoint(encoder, decoder, checkpoint_path, entropy_manager=None,
 # ============================================================================
 
 @torch.no_grad()
-def evaluate_true_autoregressive(encoder, decoder, loader, device, max_samples=1000):
+def evaluate_true_autoregressive(encoder, decoder, loader, device, max_samples=1000,
+                                  log_errors=True, epoch=None):
     """
-    Evaluate TRUE autoregressive exact match (no teacher forcing).
+    V12.18: Enhanced evaluation with full Z-space diagnostics and reconstruction metrics.
 
-    This gives the honest metric of how the model performs at inference time,
-    where it must use its own predictions for each token.
+    Evaluates TRUE autoregressive exact match (no teacher forcing) AND captures
+    per-sample Z norms, Tc/Magpie/stoichiometry reconstruction quality to correlate
+    with error patterns.
 
     Args:
         encoder: The encoder model
@@ -1251,10 +2024,14 @@ def evaluate_true_autoregressive(encoder, decoder, loader, device, max_samples=1
         loader: DataLoader with evaluation data
         device: torch device
         max_samples: Maximum samples to evaluate (for speed)
+        log_errors: Whether to log errors to file (default True)
+        epoch: Current epoch number for error log filename
 
     Returns:
-        dict with true_exact_match and sample statistics
+        dict with true_exact_match, sample statistics, and Z diagnostics
     """
+    import numpy as np
+
     encoder.eval()
     decoder.eval()
 
@@ -1262,19 +2039,74 @@ def evaluate_true_autoregressive(encoder, decoder, loader, device, max_samples=1
     total_samples = 0
     n_by_errors = {0: 0, 1: 0, 2: 0, 3: 0, 'more': 0}  # Track error distribution
 
+    # V12.15: Collect error records for analysis
+    error_records = []
+
+    # V12.18: Collect per-sample reconstruction diagnostics
+    all_z_norms = []          # Per-sample Z vector L2 norm
+    all_z_max_dims = []       # Per-sample max absolute Z dimension
+    all_tc_true = []          # Ground truth Tc
+    all_tc_pred = []          # Encoder's Tc prediction
+    all_magpie_mse = []       # Per-sample Magpie reconstruction MSE
+    all_stoich_mse = []       # Per-sample stoichiometry reconstruction MSE
+    all_n_errors = []         # Per-sample token error count (0 = exact match)
+    all_seq_lens = []         # Per-sample sequence length
+    all_is_sc = []            # Per-sample SC flag
+    all_n_elements = []       # Per-sample number of elements (from elem_mask)
+
     for batch in loader:
         if total_samples >= max_samples:
             break
 
-        # Unpack batch (same format as train_epoch)
-        elem_idx, elem_frac, elem_mask, formula_tokens, tc, magpie = [b.to(device) for b in batch]
+        # Unpack batch (V12.12: 8 tensors with contrastive data)
+        batch_tensors = [b.to(device) for b in batch]
+        elem_idx, elem_frac, elem_mask, formula_tokens, tc, magpie = batch_tensors[:6]
+        # Get is_sc flag if available (for error analysis)
+        is_sc = batch_tensors[6] if len(batch_tensors) > 6 else None
 
         batch_size = formula_tokens.size(0)
 
-        # Encode (same order as train_epoch)
+        # Encode (same order as train_epoch) - get ALL encoder outputs
         encoder_out = encoder(elem_idx, elem_frac, elem_mask, magpie, tc)
         z = encoder_out['z']
         encoder_skip = encoder_out['attended_input']
+        tc_pred = encoder_out['tc_pred']
+        magpie_pred = encoder_out['magpie_pred']
+        fraction_pred = encoder_out.get('fraction_pred')
+        element_count_pred = encoder_out.get('element_count_pred')
+
+        # V12.18: Compute per-sample reconstruction metrics
+        z_norms = z.float().norm(dim=1)                       # [B]
+        z_max_dim = z.float().abs().max(dim=1).values         # [B]
+        tc_pred_vals = tc_pred.squeeze().float()               # [B]
+        tc_true_vals = tc.squeeze().float()                    # [B]
+        magpie_mse = (magpie_pred.float() - magpie.float()).pow(2).mean(dim=1)  # [B]
+
+        # Stoichiometry MSE (fraction + element count predictions vs input)
+        stoich_mse_vals = torch.zeros(batch_size, device=device)
+        if fraction_pred is not None:
+            # fraction_pred: [B, max_elems, 1] or similar, elem_frac: [B, max_elems]
+            frac_target = elem_frac.float()
+            frac_pred_squeezed = fraction_pred.squeeze(-1).float() if fraction_pred.dim() == 3 else fraction_pred.float()
+            # Mask by valid elements
+            valid_mask = elem_mask.bool()
+            for si in range(batch_size):
+                vm = valid_mask[si]
+                if vm.any():
+                    stoich_mse_vals[si] = (frac_pred_squeezed[si][vm] - frac_target[si][vm]).pow(2).mean()
+
+        # Number of elements per sample
+        n_elements = elem_mask.bool().sum(dim=1)  # [B]
+
+        all_z_norms.extend(z_norms.cpu().tolist())
+        all_z_max_dims.extend(z_max_dim.cpu().tolist())
+        all_tc_true.extend(tc_true_vals.cpu().tolist())
+        all_tc_pred.extend(tc_pred_vals.cpu().tolist())
+        all_magpie_mse.extend(magpie_mse.cpu().tolist())
+        all_stoich_mse.extend(stoich_mse_vals.cpu().tolist())
+        all_n_elements.extend(n_elements.cpu().tolist())
+        if is_sc is not None:
+            all_is_sc.extend(is_sc.cpu().tolist())
 
         # Generate autoregressively (TRUE inference - no teacher forcing)
         generated_tokens, _, _ = decoder.generate_with_kv_cache(
@@ -1304,6 +2136,10 @@ def evaluate_true_autoregressive(encoder, decoder, loader, device, max_samples=1
         # Track exact matches and error distribution
         for i in range(batch_size):
             n_errors = mismatches_per_seq[i].item()
+            seq_len = int(mask[i].sum().item())
+            all_n_errors.append(n_errors)
+            all_seq_lens.append(seq_len)
+
             if n_errors == 0:
                 total_exact += 1
                 n_by_errors[0] += 1
@@ -1316,29 +2152,237 @@ def evaluate_true_autoregressive(encoder, decoder, loader, device, max_samples=1
             else:
                 n_by_errors['more'] += 1
 
+            # V12.15: Record errors for analysis (with V12.18 Z diagnostics)
+            if log_errors and n_errors > 0:
+                target_formula = indices_to_formula(formula_tokens[i])
+                generated_formula = indices_to_formula(generated_tokens[i])
+
+                # Find specific token mismatches
+                target_seq = targets[i]
+                gen_seq = generated_tokens[i]
+                seq_mask = mask[i]
+                mismatch_positions = []
+                for pos in range(len(seq_mask)):
+                    if seq_mask[pos] and target_seq[pos] != gen_seq[pos]:
+                        target_token = IDX_TO_TOKEN.get(target_seq[pos].item(), '?')
+                        gen_token = IDX_TO_TOKEN.get(gen_seq[pos].item(), '?')
+                        mismatch_positions.append(f"pos{pos}:{target_token}->{gen_token}")
+
+                sample_global_idx = total_samples + i
+                error_records.append({
+                    'sample_idx': sample_global_idx,
+                    'n_errors': int(n_errors),
+                    'target': target_formula,
+                    'generated': generated_formula,
+                    'is_sc': bool(is_sc[i].item()) if is_sc is not None else None,
+                    'mismatches': mismatch_positions,
+                    'seq_len': seq_len,
+                    # V12.18: Per-sample reconstruction diagnostics
+                    'z_norm': round(z_norms[i].item(), 4),
+                    'z_max_dim': round(z_max_dim[i].item(), 4),
+                    'tc_true': round(tc_true_vals[i].item(), 4),
+                    'tc_pred': round(tc_pred_vals[i].item(), 4),
+                    'tc_error': round(abs(tc_pred_vals[i].item() - tc_true_vals[i].item()), 4),
+                    'magpie_mse': round(magpie_mse[i].item(), 6),
+                    'stoich_mse': round(stoich_mse_vals[i].item(), 6),
+                    'n_elements': int(n_elements[i].item()),
+                })
+
         total_samples += batch_size
 
     true_exact_match = total_exact / total_samples if total_samples > 0 else 0
+
+    # V12.18: Compute Z-space diagnostic statistics
+    all_z_norms_np = np.array(all_z_norms[:total_samples])
+    all_n_errors_np = np.array(all_n_errors[:total_samples])
+    all_tc_true_np = np.array(all_tc_true[:total_samples])
+    all_tc_pred_np = np.array(all_tc_pred[:total_samples])
+    all_magpie_mse_np = np.array(all_magpie_mse[:total_samples])
+    all_stoich_mse_np = np.array(all_stoich_mse[:total_samples])
+    all_seq_lens_np = np.array(all_seq_lens[:total_samples])
+    all_z_max_dims_np = np.array(all_z_max_dims[:total_samples])
+    all_n_elements_np = np.array(all_n_elements[:total_samples])
+
+    exact_mask = all_n_errors_np == 0
+    error_mask = all_n_errors_np > 0
+
+    # Correlations (handle edge cases)
+    def safe_corrcoef(a, b):
+        if len(a) < 2 or np.std(a) == 0 or np.std(b) == 0:
+            return 0.0
+        return float(np.corrcoef(a, b)[0, 1])
+
+    z_diagnostics = {
+        # Z-norm statistics: exact vs error samples
+        'z_norm_overall': {'mean': float(all_z_norms_np.mean()), 'std': float(all_z_norms_np.std())},
+        'z_norm_exact': {'mean': float(all_z_norms_np[exact_mask].mean()), 'std': float(all_z_norms_np[exact_mask].std())} if exact_mask.any() else None,
+        'z_norm_errors': {'mean': float(all_z_norms_np[error_mask].mean()), 'std': float(all_z_norms_np[error_mask].std())} if error_mask.any() else None,
+
+        # Z max dimension (outlier detector)
+        'z_max_dim_overall': {'mean': float(all_z_max_dims_np.mean()), 'std': float(all_z_max_dims_np.std())},
+        'z_max_dim_exact': float(all_z_max_dims_np[exact_mask].mean()) if exact_mask.any() else None,
+        'z_max_dim_errors': float(all_z_max_dims_np[error_mask].mean()) if error_mask.any() else None,
+
+        # Tc reconstruction quality
+        'tc_mae_overall': float(np.abs(all_tc_pred_np - all_tc_true_np).mean()),
+        'tc_mae_exact': float(np.abs(all_tc_pred_np[exact_mask] - all_tc_true_np[exact_mask]).mean()) if exact_mask.any() else None,
+        'tc_mae_errors': float(np.abs(all_tc_pred_np[error_mask] - all_tc_true_np[error_mask]).mean()) if error_mask.any() else None,
+        'tc_r2': float(1 - np.sum((all_tc_pred_np - all_tc_true_np)**2) / max(np.sum((all_tc_true_np - all_tc_true_np.mean())**2), 1e-8)),
+
+        # Magpie reconstruction quality
+        'magpie_mse_overall': float(all_magpie_mse_np.mean()),
+        'magpie_mse_exact': float(all_magpie_mse_np[exact_mask].mean()) if exact_mask.any() else None,
+        'magpie_mse_errors': float(all_magpie_mse_np[error_mask].mean()) if error_mask.any() else None,
+
+        # Stoichiometry reconstruction quality
+        'stoich_mse_overall': float(all_stoich_mse_np.mean()),
+        'stoich_mse_exact': float(all_stoich_mse_np[exact_mask].mean()) if exact_mask.any() else None,
+        'stoich_mse_errors': float(all_stoich_mse_np[error_mask].mean()) if error_mask.any() else None,
+
+        # Sequence length vs errors
+        'seq_len_exact': float(all_seq_lens_np[exact_mask].mean()) if exact_mask.any() else None,
+        'seq_len_errors': float(all_seq_lens_np[error_mask].mean()) if error_mask.any() else None,
+
+        # Element count vs errors
+        'n_elements_exact': float(all_n_elements_np[exact_mask].mean()) if exact_mask.any() else None,
+        'n_elements_errors': float(all_n_elements_np[error_mask].mean()) if error_mask.any() else None,
+
+        # Correlations: what predicts errors?
+        'corr_z_norm_vs_errors': safe_corrcoef(all_z_norms_np, all_n_errors_np),
+        'corr_tc_error_vs_formula_errors': safe_corrcoef(np.abs(all_tc_pred_np - all_tc_true_np), all_n_errors_np),
+        'corr_magpie_mse_vs_errors': safe_corrcoef(all_magpie_mse_np, all_n_errors_np),
+        'corr_stoich_mse_vs_errors': safe_corrcoef(all_stoich_mse_np, all_n_errors_np),
+        'corr_seq_len_vs_errors': safe_corrcoef(all_seq_lens_np, all_n_errors_np),
+        'corr_n_elements_vs_errors': safe_corrcoef(all_n_elements_np, all_n_errors_np),
+        'corr_tc_true_vs_errors': safe_corrcoef(all_tc_true_np, all_n_errors_np),
+
+        # Error breakdown by Z-norm quartile
+        'errors_by_z_norm_quartile': {},
+        # Error breakdown by Tc range
+        'errors_by_tc_range': {},
+        # Error breakdown by sequence length bucket
+        'errors_by_seq_len_bucket': {},
+    }
+
+    # Z-norm quartile analysis
+    if len(all_z_norms_np) > 4:
+        quartiles = np.percentile(all_z_norms_np, [25, 50, 75])
+        for qi, (lo, hi, label) in enumerate([
+            (0, quartiles[0], 'Q1_lowest'),
+            (quartiles[0], quartiles[1], 'Q2'),
+            (quartiles[1], quartiles[2], 'Q3'),
+            (quartiles[2], float('inf'), 'Q4_highest'),
+        ]):
+            qmask = (all_z_norms_np >= lo) & (all_z_norms_np < hi) if label != 'Q4_highest' else (all_z_norms_np >= lo)
+            if qmask.any():
+                z_diagnostics['errors_by_z_norm_quartile'][label] = {
+                    'n_samples': int(qmask.sum()),
+                    'exact_pct': float((all_n_errors_np[qmask] == 0).mean() * 100),
+                    'avg_errors': float(all_n_errors_np[qmask].mean()),
+                    'z_norm_range': [float(lo), float(hi) if label != 'Q4_highest' else float(all_z_norms_np.max())],
+                }
+
+    # Tc range analysis
+    tc_ranges = [(0, 10, '0-10K'), (10, 30, '10-30K'), (30, 77, '30-77K'),
+                 (77, 120, '77-120K'), (120, 200, '120-200K'), (200, float('inf'), '>200K')]
+    for lo, hi, label in tc_ranges:
+        tc_mask = (all_tc_true_np >= lo) & (all_tc_true_np < hi)
+        if tc_mask.any():
+            z_diagnostics['errors_by_tc_range'][label] = {
+                'n_samples': int(tc_mask.sum()),
+                'exact_pct': float((all_n_errors_np[tc_mask] == 0).mean() * 100),
+                'avg_errors': float(all_n_errors_np[tc_mask].mean()),
+                'avg_z_norm': float(all_z_norms_np[tc_mask].mean()),
+            }
+
+    # Sequence length bucket analysis
+    seq_buckets = [(1, 10, '1-10'), (11, 20, '11-20'), (21, 30, '21-30'),
+                   (31, 40, '31-40'), (41, 60, '41-60')]
+    for lo, hi, label in seq_buckets:
+        sl_mask = (all_seq_lens_np >= lo) & (all_seq_lens_np <= hi)
+        if sl_mask.any():
+            z_diagnostics['errors_by_seq_len_bucket'][label] = {
+                'n_samples': int(sl_mask.sum()),
+                'exact_pct': float((all_n_errors_np[sl_mask] == 0).mean() * 100),
+                'avg_errors': float(all_n_errors_np[sl_mask].mean()),
+                'avg_z_norm': float(all_z_norms_np[sl_mask].mean()),
+            }
+
+    # V12.18: Print Z diagnostic summary to console
+    zd = z_diagnostics
+    z_exact = zd['z_norm_exact']
+    z_err = zd['z_norm_errors']
+    print(f"  Z-diag: norm exact={z_exact['mean']:.1f}±{z_exact['std']:.1f}" if z_exact else "  Z-diag: no exact samples", end='')
+    print(f" | err={z_err['mean']:.1f}±{z_err['std']:.1f}" if z_err else " | no error samples", end='')
+    print(f" | Tc MAE={zd['tc_mae_overall']:.4f} (exact={zd['tc_mae_exact']:.4f}, err={zd['tc_mae_errors']:.4f})" if zd['tc_mae_exact'] is not None and zd['tc_mae_errors'] is not None else '')
+    print(f"  Correlations: z_norm→err={zd['corr_z_norm_vs_errors']:.3f} | tc_err→err={zd['corr_tc_error_vs_formula_errors']:.3f} | "
+          f"magpie→err={zd['corr_magpie_mse_vs_errors']:.3f} | seq_len→err={zd['corr_seq_len_vs_errors']:.3f} | "
+          f"n_elem→err={zd['corr_n_elements_vs_errors']:.3f}")
+
+    # V12.15: Write error log to file (V12.18: enriched with Z diagnostics)
+    if log_errors:
+        error_log_path = OUTPUT_DIR / f'error_analysis_epoch_{epoch if epoch else "latest"}.json'
+
+        # Sort by number of errors (worst first) then by sequence length
+        error_records.sort(key=lambda x: (-x['n_errors'], -x['seq_len']))
+
+        error_summary = {
+            'epoch': epoch,
+            'total_samples': total_samples,
+            'total_errors': len(error_records),
+            'exact_match_pct': true_exact_match * 100,
+            'error_distribution': {str(k): v for k, v in n_by_errors.items()},
+            'errors_by_type': {
+                'sc_errors': sum(1 for e in error_records if e['is_sc'] is True),
+                'non_sc_errors': sum(1 for e in error_records if e['is_sc'] is False),
+                'unknown_errors': sum(1 for e in error_records if e['is_sc'] is None),
+            },
+            'avg_errors_per_failed': sum(e['n_errors'] for e in error_records) / len(error_records) if error_records else 0,
+            # V12.18: Full Z-space diagnostics
+            'z_diagnostics': z_diagnostics,
+            'error_records': error_records,
+        }
+
+        import json
+        with open(error_log_path, 'w') as f:
+            json.dump(error_summary, f, indent=2)
+
+        print(f"  Error analysis saved: {error_log_path.name} ({len(error_records)} errors)")
 
     return {
         'true_exact_match': true_exact_match,
         'total_samples': total_samples,
         'exact_count': total_exact,
         'error_distribution': n_by_errors,
+        'z_diagnostics': z_diagnostics,
     }
 
 
 def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, device, use_amp,
                 tf_ratio=1.0, tc_weight=10.0, magpie_weight=2.0,
-                focal_loss_fn=None, amp_dtype=torch.float16, accumulation_steps=1):
+                focal_loss_fn=None, amp_dtype=torch.float16, accumulation_steps=1,
+                contrastive_loss_fn=None, contrastive_weight=0.0, non_sc_formula_weight=0.5,
+                selective_backprop=False, selective_backprop_threshold=0.33,
+                enable_timing=True):
     """Train for one epoch with curriculum weights and teacher forcing.
 
     V12.8: Added amp_dtype for configurable mixed precision (bfloat16/float16)
            Added accumulation_steps for gradient accumulation (larger effective batch)
            Added REINFORCE support via CombinedLossWithREINFORCE
+    V12.12: Added contrastive loss for mixed SC/non-SC training
+    V12.12: Added selective backpropagation - skip backward on easy batches
+    V12.15: Added enable_timing for compute/time profiling
     """
+    global _timing_stats
+
     encoder.train()
     decoder.train()
+
+    # V12.15: Initialize timing stats
+    timing = TimingStats() if enable_timing else None
+    _timing_stats = timing
+    if timing:
+        timing.start_epoch()
 
     total_loss = 0
     total_acc = 0
@@ -1349,22 +2393,68 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
     total_reinforce = 0
     total_reward = 0
     total_entropy = 0
+    total_z_norm = 0
+    total_contrastive = 0
+    total_sc_exact = 0
+    total_non_sc_exact = 0
+    total_spec_accept = 0  # V12.9: Speculative decoding acceptance rate
+    total_spec_tokens = 0  # V12.9: Tokens per step with speculation
+    n_spec_batches = 0     # V12.9: Batches with speculative decoding stats
     n_batches = 0
+    n_sc_batches = 0
+    n_non_sc_batches = 0
+    n_skipped = 0  # V12.12: Selective backprop skip counter
+
+    # V12.12: Running average loss for selective backpropagation
+    running_avg_loss = None
+    sb_momentum = 0.95  # EMA momentum for running average
 
     # Zero gradients at start of accumulation
     enc_opt.zero_grad()
     dec_opt.zero_grad()
 
+    # V12.15: Start timing for data loading
+    if timing:
+        timing.start('data_load')
+
     for batch_idx, batch in enumerate(loader):
-        elem_idx, elem_frac, elem_mask, tokens, tc, magpie = [b.to(device) for b in batch]
+        # V12.15: Stop data load timing, start batch processing
+        if timing:
+            timing.stop('data_load')
+
+        # V12.12: Unpack 8 tensors (6 original + is_sc + label)
+        elem_idx, elem_frac, elem_mask, tokens, tc, magpie, is_sc, labels = [b.to(device) for b in batch]
+
+        sc_mask = is_sc.bool()  # True = superconductor
 
         with autocast(device_type='cuda', dtype=amp_dtype, enabled=use_amp):
-            # Encoder forward
+            # V12.15: Time encoder forward
+            if timing:
+                timing.start('encoder_fwd')
+
+            # Encoder forward (all samples — SC and non-SC both get encoded)
             encoder_out = encoder(elem_idx, elem_frac, elem_mask, magpie, tc)
             z = encoder_out['z']
+
+            if timing:
+                timing.stop('encoder_fwd')
+
+            # V12.14: Early NaN detection on latent z — skip batch before decoder forward
+            # Sporadic NaN in z can corrupt optimizer momentum buffers even when total loss
+            # appears finite (NaN doesn't always propagate through all loss components)
+            if torch.isnan(z).any():
+                n_skipped += 1
+                enc_opt.zero_grad()
+                dec_opt.zero_grad()
+                if timing:
+                    timing.start('data_load')  # Resume data load timing
+                continue
+
             tc_pred = encoder_out['tc_pred']
             magpie_pred = encoder_out['magpie_pred']
             attended_input = encoder_out['attended_input']
+            # NOTE: 'kl_loss' is actually L2 reg (mean(z²)) since deterministic encoder.
+            # Key name kept for compatibility — see attention_vae.py forward() comment.
             kl_loss = encoder_out['kl_loss']
 
             # Stoichiometry predictions for loss and conditioning
@@ -1375,59 +2465,210 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
             else:
                 stoich_pred = None
 
-            # Decoder forward with teacher forcing ratio
+            # V12.15: Time decoder forward
+            if timing:
+                timing.start('decoder_fwd')
+
+            # Decoder forward with teacher forcing ratio (all samples)
             formula_logits, _ = decoder(
                 z, tokens, encoder_skip=attended_input,
                 stoich_pred=stoich_pred, teacher_forcing_ratio=tf_ratio
             )
             formula_targets = tokens[:, 1:]
 
-            # V12.8: Use CombinedLossWithREINFORCE
-            loss_dict = loss_fn(
-                formula_logits=formula_logits,
-                formula_targets=formula_targets,
-                tc_pred=tc_pred,
-                tc_true=tc,
-                magpie_pred=magpie_pred,
-                magpie_true=magpie,
-                kl_loss=kl_loss,
-                tc_weight_override=tc_weight,
-                magpie_weight_override=magpie_weight,
-                # V12.4: Stoichiometry loss inputs
-                fraction_pred=fraction_pred,
-                element_fractions=elem_frac,
-                element_mask=elem_mask,
-                element_count_pred=element_count_pred,
-                # V12.8: Autoregressive REINFORCE inputs
-                z=z,
-                encoder_skip=attended_input,
-                stoich_pred_for_reinforce=stoich_pred,
-            )
+            if timing:
+                timing.stop('decoder_fwd')
 
-            loss = loss_dict['total']
+            # V12.12: Contrastive loss on full batch (SC + non-SC)
+            contrastive_loss_val = torch.tensor(0.0, device=device)
+            if contrastive_loss_fn is not None and contrastive_weight > 0:
+                contrastive_loss_val = contrastive_loss_fn(z, labels)
 
-        # V12.8: Scale loss for gradient accumulation
-        scaled_loss = loss / accumulation_steps
+            # V12.15: Time loss computation (includes REINFORCE sampling)
+            if timing:
+                timing.start('loss_compute')
 
-        # Backward with AMP
-        scaler.scale(scaled_loss).backward()
+            # V12.12: Compute main loss differently for SC vs non-SC
+            if sc_mask.all():
+                # Pure SC batch — standard loss (no masking needed)
+                loss_dict = loss_fn(
+                    formula_logits=formula_logits,
+                    formula_targets=formula_targets,
+                    tc_pred=tc_pred,
+                    tc_true=tc,
+                    magpie_pred=magpie_pred,
+                    magpie_true=magpie,
+                    kl_loss=kl_loss,
+                    tc_weight_override=tc_weight,
+                    magpie_weight_override=magpie_weight,
+                    fraction_pred=fraction_pred,
+                    element_fractions=elem_frac,
+                    element_mask=elem_mask,
+                    element_count_pred=element_count_pred,
+                    z=z,
+                    encoder_skip=attended_input,
+                    stoich_pred_for_reinforce=stoich_pred,
+                )
+                loss = loss_dict['total'] + contrastive_weight * contrastive_loss_val
 
-        # Step optimizer every accumulation_steps batches
-        if (batch_idx + 1) % accumulation_steps == 0 or (batch_idx + 1) == len(loader):
-            scaler.unscale_(enc_opt)
-            scaler.unscale_(dec_opt)
+            elif (~sc_mask).all():
+                # Pure non-SC batch — formula loss only (lower weight), no Tc/Magpie/REINFORCE
+                loss_dict = loss_fn(
+                    formula_logits=formula_logits,
+                    formula_targets=formula_targets,
+                    tc_pred=tc_pred,
+                    tc_true=tc,
+                    magpie_pred=magpie_pred,
+                    magpie_true=magpie,
+                    kl_loss=kl_loss,
+                    tc_weight_override=0.0,     # No Tc loss for non-SC
+                    magpie_weight_override=0.0,  # No Magpie loss for non-SC
+                    fraction_pred=fraction_pred,
+                    element_fractions=elem_frac,
+                    element_mask=elem_mask,
+                    element_count_pred=element_count_pred,
+                    z=None,  # No REINFORCE for non-SC
+                    encoder_skip=attended_input,
+                    stoich_pred_for_reinforce=None,
+                )
+                # Scale formula loss by non_sc_formula_weight
+                loss = non_sc_formula_weight * loss_dict['total'] + contrastive_weight * contrastive_loss_val
 
-            # Gradient clipping
-            torch.nn.utils.clip_grad_norm_(encoder.parameters(), 1.0)
-            torch.nn.utils.clip_grad_norm_(decoder.parameters(), 1.0)
+            else:
+                # Mixed batch — compute SC and non-SC losses separately
+                n_sc = sc_mask.sum().item()
+                n_non_sc = (~sc_mask).sum().item()
 
-            scaler.step(enc_opt)
-            scaler.step(dec_opt)
-            scaler.update()
+                # SC portion: full loss
+                sc_loss_dict = loss_fn(
+                    formula_logits=formula_logits[sc_mask],
+                    formula_targets=formula_targets[sc_mask],
+                    tc_pred=tc_pred[sc_mask],
+                    tc_true=tc[sc_mask],
+                    magpie_pred=magpie_pred[sc_mask],
+                    magpie_true=magpie[sc_mask],
+                    kl_loss=kl_loss,  # KL is already a scalar over full batch
+                    tc_weight_override=tc_weight,
+                    magpie_weight_override=magpie_weight,
+                    fraction_pred=fraction_pred[sc_mask] if fraction_pred is not None else None,
+                    element_fractions=elem_frac[sc_mask],
+                    element_mask=elem_mask[sc_mask],
+                    element_count_pred=element_count_pred[sc_mask] if element_count_pred is not None else None,
+                    z=z[sc_mask],
+                    encoder_skip=attended_input[sc_mask],
+                    stoich_pred_for_reinforce=stoich_pred[sc_mask] if stoich_pred is not None else None,
+                )
 
-            # Zero gradients for next accumulation
+                # Non-SC portion: formula-only, lower weight
+                non_sc_loss_dict = loss_fn(
+                    formula_logits=formula_logits[~sc_mask],
+                    formula_targets=formula_targets[~sc_mask],
+                    tc_pred=tc_pred[~sc_mask],
+                    tc_true=tc[~sc_mask],
+                    magpie_pred=magpie_pred[~sc_mask],
+                    magpie_true=magpie[~sc_mask],
+                    kl_loss=torch.tensor(0.0, device=device),
+                    tc_weight_override=0.0,
+                    magpie_weight_override=0.0,
+                    fraction_pred=fraction_pred[~sc_mask] if fraction_pred is not None else None,
+                    element_fractions=elem_frac[~sc_mask],
+                    element_mask=elem_mask[~sc_mask],
+                    element_count_pred=element_count_pred[~sc_mask] if element_count_pred is not None else None,
+                    z=None,  # No REINFORCE for non-SC
+                    encoder_skip=attended_input[~sc_mask],
+                    stoich_pred_for_reinforce=None,
+                )
+
+                # Weighted combination: SC at full weight, non-SC at reduced weight
+                batch_total = n_sc + n_non_sc
+                sc_frac = n_sc / batch_total
+                non_sc_frac = n_non_sc / batch_total
+                loss_dict = sc_loss_dict  # Use SC metrics for logging
+                loss = (sc_frac * sc_loss_dict['total'] +
+                        non_sc_frac * non_sc_formula_weight * non_sc_loss_dict['total'] +
+                        contrastive_weight * contrastive_loss_val)
+
+        # V12.15: Stop loss computation timing
+        if timing:
+            timing.stop('loss_compute')
+
+        # V12.12: Selective backpropagation — skip backward on easy batches
+        current_loss = loss.item()
+
+        # V12.13: NaN guard — skip batch entirely if loss is NaN to prevent corruption
+        if math.isnan(current_loss) or math.isinf(current_loss):
+            n_skipped += 1
             enc_opt.zero_grad()
             dec_opt.zero_grad()
+            if timing:
+                timing.start('data_load')  # Resume data load timing
+            continue
+
+        # Update running average loss (EMA)
+        if running_avg_loss is None:
+            running_avg_loss = current_loss
+        else:
+            running_avg_loss = sb_momentum * running_avg_loss + (1 - sb_momentum) * current_loss
+
+        # Skip backward pass if batch loss is well below running average
+        # (only after we have a stable estimate — skip first 10 batches worth of warmup)
+        skip_backward = (
+            selective_backprop
+            and n_batches >= 10
+            and current_loss < selective_backprop_threshold * running_avg_loss
+        )
+
+        if skip_backward:
+            n_skipped += 1
+        else:
+            # V12.15: Time backward pass
+            if timing:
+                timing.start('backward')
+
+            # V12.8: Scale loss for gradient accumulation
+            scaled_loss = loss / accumulation_steps
+
+            # Backward with AMP
+            scaler.scale(scaled_loss).backward()
+
+            if timing:
+                timing.stop('backward')
+
+            # Step optimizer every accumulation_steps batches
+            if (batch_idx + 1) % accumulation_steps == 0 or (batch_idx + 1) == len(loader):
+                # V12.15: Time optimizer step
+                if timing:
+                    timing.start('optimizer')
+
+                scaler.unscale_(enc_opt)
+                scaler.unscale_(dec_opt)
+
+                # Gradient clipping
+                enc_grad_norm = torch.nn.utils.clip_grad_norm_(encoder.parameters(), 1.0)
+                dec_grad_norm = torch.nn.utils.clip_grad_norm_(decoder.parameters(), 1.0)
+
+                # V12.14: NaN gradient guard — skip optimizer step if gradients are NaN/Inf
+                # This prevents NaN from poisoning Adam momentum buffers (exp_avg, exp_avg_sq)
+                # which causes permanent corruption that persists across checkpoint resumes
+                if math.isnan(enc_grad_norm) or math.isinf(enc_grad_norm):
+                    enc_opt.zero_grad()
+                    n_skipped += 1
+                else:
+                    scaler.step(enc_opt)
+
+                if math.isnan(dec_grad_norm) or math.isinf(dec_grad_norm):
+                    dec_opt.zero_grad()
+                else:
+                    scaler.step(dec_opt)
+
+                scaler.update()
+
+                # Zero gradients for next accumulation
+                enc_opt.zero_grad()
+                dec_opt.zero_grad()
+
+                if timing:
+                    timing.stop('optimizer')
 
         # Accumulate metrics
         total_loss += loss_dict['total'].item()
@@ -1439,9 +2680,55 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
         total_reinforce += loss_dict['reinforce_loss'].item()
         total_reward += loss_dict['mean_reward'].item() if torch.is_tensor(loss_dict['mean_reward']) else loss_dict['mean_reward']
         total_entropy += loss_dict['entropy'].item()
+        total_contrastive += contrastive_loss_val.item() if torch.is_tensor(contrastive_loss_val) else contrastive_loss_val
+        z_norm_val = z.detach().float().norm(dim=1).mean().item()
+        if not math.isnan(z_norm_val):
+            total_z_norm += z_norm_val
+
+        # V12.9: Track speculative decoding stats if available
+        if 'spec_acceptance_rate' in loss_dict:
+            total_spec_accept += loss_dict['spec_acceptance_rate']
+            total_spec_tokens += loss_dict['spec_tokens_per_step']
+            n_spec_batches += 1
+
         n_batches += 1
 
-    return {
+        # V12.12: Track SC vs non-SC accuracy separately
+        if sc_mask.any():
+            sc_preds = formula_logits[sc_mask].argmax(dim=-1)
+            sc_targets = formula_targets[sc_mask]
+            sc_seq_mask = (sc_targets != PAD_IDX)
+            sc_correct = ((sc_preds == sc_targets) | ~sc_seq_mask).all(dim=1)
+            total_sc_exact += sc_correct.float().mean().item()
+            n_sc_batches += 1
+        if (~sc_mask).any():
+            nsc_preds = formula_logits[~sc_mask].argmax(dim=-1)
+            nsc_targets = formula_targets[~sc_mask]
+            nsc_seq_mask = (nsc_targets != PAD_IDX)
+            nsc_correct = ((nsc_preds == nsc_targets) | ~nsc_seq_mask).all(dim=1)
+            total_non_sc_exact += nsc_correct.float().mean().item()
+            n_non_sc_batches += 1
+
+        # V12.15: Resume data load timing for next batch
+        if timing:
+            timing.start('data_load')
+
+    # V12.15: Stop final data_load timing (for last batch's "next" that never comes)
+    if timing:
+        timing.stop('data_load')
+
+    # Guard against zero-batch epochs (all batches NaN-skipped)
+    if n_batches == 0:
+        print(f"  [WARNING] Entire epoch skipped ({n_skipped} NaN/Inf batches)", flush=True)
+        return {
+            'loss': float('nan'), 'accuracy': 0, 'exact_match': 0,
+            'tc_loss': 0, 'magpie_loss': 0, 'stoich_loss': 0,
+            'reinforce_loss': 0, 'mean_reward': 0, 'entropy': 0,
+            'contrastive_loss': 0, 'z_norm': 0,
+            'n_skipped': n_skipped, 'n_total_batches': 0,
+        }
+
+    results = {
         'loss': total_loss / n_batches,
         'accuracy': total_acc / n_batches,
         'exact_match': total_exact / n_batches,
@@ -1451,13 +2738,54 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
         'reinforce_loss': total_reinforce / n_batches,
         'mean_reward': total_reward / n_batches,
         'entropy': total_entropy / n_batches,
+        'contrastive_loss': total_contrastive / n_batches,
+        'z_norm': total_z_norm / n_batches,
+        'n_skipped': n_skipped,  # V12.12: Selective backprop skips
+        'n_total_batches': n_batches,
     }
+
+    # V12.12: Add SC/non-SC breakdown
+    if n_sc_batches > 0:
+        results['sc_exact_match'] = total_sc_exact / n_sc_batches
+    if n_non_sc_batches > 0:
+        results['non_sc_exact_match'] = total_non_sc_exact / n_non_sc_batches
+
+    # V12.9: Add speculative decoding stats
+    if n_spec_batches > 0:
+        results['spec_acceptance_rate'] = total_spec_accept / n_spec_batches
+        results['spec_tokens_per_step'] = total_spec_tokens / n_spec_batches
+
+    # V12.15: Add timing stats
+    if timing:
+        results['timing'] = timing
+        results['epoch_time'] = timing.get_epoch_time()
+        results['timing_breakdown'] = timing.get_breakdown()
+
+    return results
 
 
 def train():
     """Main training function."""
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
+
+    # ========================================================================
+    # Environment-aware DataLoader tuning (overrides TRAIN_CONFIG defaults)
+    # ========================================================================
+    env = detect_environment()
+    TRAIN_CONFIG['num_workers'] = env['num_workers']
+    TRAIN_CONFIG['pin_memory'] = env['pin_memory']
+    TRAIN_CONFIG['persistent_workers'] = env['persistent_workers']
+    TRAIN_CONFIG['prefetch_factor'] = env['prefetch_factor']
+    TRAIN_CONFIG['use_torch_compile'] = env['use_torch_compile']
+
+    # Apply batch_size_multiplier when batch_size is a fixed int (not 'auto')
+    if env['batch_size_multiplier'] != 1.0 and isinstance(TRAIN_CONFIG['batch_size'], int):
+        original_bs = TRAIN_CONFIG['batch_size']
+        TRAIN_CONFIG['batch_size'] = max(1, int(original_bs * env['batch_size_multiplier']))
+        if TRAIN_CONFIG['batch_size'] != original_bs:
+            print(f"[env] Batch size adjusted: {original_bs} -> {TRAIN_CONFIG['batch_size']} "
+                  f"(x{env['batch_size_multiplier']})")
 
     # ========================================================================
     # V12.8: Apply optimizations before model creation
@@ -1504,18 +2832,83 @@ def train():
         use_autoregressive_reinforce=TRAIN_CONFIG.get('use_autoregressive_reinforce', True),
     )
 
+    # V12.9: Build or load draft model for speculative decoding
+    draft_model = None
+    use_speculative = (
+        TRAIN_CONFIG.get('use_speculative_decoding', True) and
+        TRAIN_CONFIG.get('rl_weight', 0.0) > 0 and
+        TRAIN_CONFIG.get('use_autoregressive_reinforce', True)
+    )
+    if use_speculative:
+        draft_model_path = PROJECT_ROOT / TRAIN_CONFIG.get('draft_model_path', 'data/processed/draft_model.pkl')
+        try:
+            # Load training formulas for building draft model
+            import pandas as pd
+            contrastive_path = PROJECT_ROOT / 'data/processed/supercon_fractions_contrastive.csv'
+            data_path = contrastive_path if contrastive_path.exists() else DATA_PATH
+            df = pd.read_csv(data_path)
+            formulas = df['formula'].tolist()
+
+            # Load or build draft model
+            draft_model = load_or_build_draft_model(
+                formulas=formulas,
+                cache_path=draft_model_path,
+                max_len=TRAIN_CONFIG['max_formula_len'],
+            )
+            print(f"Speculative Decoding: Enabled (k={TRAIN_CONFIG.get('speculative_k', 5)} tokens)")
+        except Exception as e:
+            print(f"Speculative Decoding: Failed to load draft model: {e}")
+            print("  Falling back to standard autoregressive sampling")
+            draft_model = None
+
     # V12.8: Wire up decoder for autoregressive REINFORCE sampling
     if TRAIN_CONFIG.get('rl_weight', 0.0) > 0 and TRAIN_CONFIG.get('use_autoregressive_reinforce', True):
-        loss_fn.set_decoder(decoder, max_len=TRAIN_CONFIG['max_formula_len'])
+        loss_fn.set_decoder(decoder, max_len=TRAIN_CONFIG['max_formula_len'], draft_model=draft_model)
+        spec_str = " + speculative" if draft_model is not None else ""
         print(f"REINFORCE: Enabled with rl_weight={TRAIN_CONFIG['rl_weight']}, "
               f"n_samples={TRAIN_CONFIG.get('n_samples_rloo', 2)}, "
-              f"autoregressive=True (KV-cached)")
+              f"autoregressive=True (KV-cached{spec_str})")
     elif TRAIN_CONFIG.get('rl_weight', 0.0) > 0:
         print(f"REINFORCE: Enabled with rl_weight={TRAIN_CONFIG['rl_weight']}, "
               f"n_samples={TRAIN_CONFIG.get('n_samples_rloo', 2)}, "
               f"autoregressive=False (logit sampling)")
     else:
         print("REINFORCE: Disabled (rl_weight=0)")
+
+    # V12.12: Create contrastive loss function
+    contrastive_loss_fn = None
+    if TRAIN_CONFIG.get('contrastive_mode', False):
+        contrastive_loss_fn = SuperconductorContrastiveLoss(
+            temperature=TRAIN_CONFIG.get('contrastive_temperature', 0.07),
+        ).to(device)
+        print(f"Contrastive Loss: Enabled (weight={TRAIN_CONFIG['contrastive_weight']}, "
+              f"temp={TRAIN_CONFIG['contrastive_temperature']}, "
+              f"warmup={TRAIN_CONFIG['contrastive_warmup_epochs']} epochs)")
+
+    # V12.16: Create consistency and theory loss functions
+    consistency_loss_fn = None
+    if TRAIN_CONFIG.get('use_consistency_loss', False):
+        consistency_config = ConsistencyLossConfig(
+            tc_weight=TRAIN_CONFIG.get('consistency_tc_weight', 1.0),
+            magpie_weight=TRAIN_CONFIG.get('consistency_magpie_weight', 0.1),
+        )
+        consistency_loss_fn = CombinedConsistencyLoss(
+            config=consistency_config,
+            use_bidirectional=False,  # Start without bidirectional (simpler)
+        )
+        print(f"Consistency Loss: Enabled (weight={TRAIN_CONFIG['consistency_weight']})")
+
+    theory_loss_fn = None
+    family_classifier = None
+    if TRAIN_CONFIG.get('use_theory_loss', False):
+        theory_config = TheoryLossConfig(
+            theory_weight=TRAIN_CONFIG.get('theory_weight', 0.05),
+            use_soft_constraints=TRAIN_CONFIG.get('theory_use_soft_constraints', True),
+        )
+        theory_loss_fn = TheoryRegularizationLoss(config=theory_config).to(device)
+        family_classifier = RuleBasedFamilyClassifier()
+        print(f"Theory Loss: Enabled (weight={TRAIN_CONFIG['theory_weight']}, "
+              f"soft_constraints={TRAIN_CONFIG.get('theory_use_soft_constraints', True)})")
 
     # V12.9: Initialize entropy manager for REINFORCE (prevents entropy collapse)
     entropy_manager = None
@@ -1647,6 +3040,12 @@ def train():
     print(f"  Flash SDPA: {TRAIN_CONFIG.get('enable_flash_sdp', True)}")
     print(f"  torch.compile: {TRAIN_CONFIG.get('use_torch_compile', False)}")
     print(f"  Gradient checkpointing: {TRAIN_CONFIG.get('use_gradient_checkpointing', False)}")
+    print(f"  Contrastive mode: {TRAIN_CONFIG.get('contrastive_mode', False)}")
+    print(f"  Selective backprop: {TRAIN_CONFIG.get('selective_backprop', False)} "
+          f"(threshold={TRAIN_CONFIG.get('selective_backprop_threshold', 0.33)})")
+    print(f"  Z-caching: {TRAIN_CONFIG.get('cache_z_vectors', False)} "
+          f"(interval={TRAIN_CONFIG.get('z_cache_interval', 0)}, "
+          f"path={TRAIN_CONFIG.get('z_cache_path', 'outputs/latent_cache.pt')})")
     print(f"\nLoss weights (final):")
     print(f"  Formula: {TRAIN_CONFIG['formula_weight']}")
     print(f"  Tc: {TRAIN_CONFIG['tc_weight']}")
@@ -1681,6 +3080,15 @@ def train():
             prev_exact = resume_state['prev_exact']
             best_exact = resume_state['best_exact']
             print(f"  Starting from epoch {start_epoch}")
+
+            # V12.12: Reset drop detector when retraining on new data
+            # When the training data changes (e.g., combined dataset), normalization
+            # stats shift and the model will see an initial performance drop. Without
+            # resetting, the catastrophic drop detector would trigger rollback loops.
+            if TRAIN_CONFIG.get('retrain_new_data', False):
+                print(f"  [RETRAIN MODE] Resetting drop detector (prev_exact was {prev_exact:.3f})")
+                prev_exact = 0.0
+                best_exact = 0.0
         else:
             print(f"\nWarning: Checkpoint not found: {checkpoint_path}")
             print("  Starting from scratch...")
@@ -1704,8 +3112,26 @@ def train():
         )
         # Update references
         _shutdown_state['encoder'] = encoder
-        loss_fn.set_decoder(decoder, max_len=TRAIN_CONFIG['max_formula_len'])
+        # V12.15: Preserve draft_model when updating decoder reference after compile
+        loss_fn.set_decoder(decoder, max_len=TRAIN_CONFIG['max_formula_len'], draft_model=draft_model)
         print("  Encoder and decoder.transformer_decoder compiled")
+
+        # Warmup pass: initialize CUDA graphs with a real batch to prevent NaN on first epoch
+        # reduce-overhead mode uses CUDA graphs which need stable tensor shapes/states
+        # Without warmup, the first epoch after checkpoint load + compile produces all-NaN
+        print("  Running warmup pass to initialize CUDA graphs...", flush=True)
+        encoder.eval()
+        decoder.eval()
+        warmup_batch = next(iter(train_loader))
+        with torch.no_grad(), torch.amp.autocast(device_type='cuda', dtype=amp_dtype):
+            wb = [b.to(device) for b in warmup_batch]
+            elem_idx, elem_frac, elem_mask, tokens, tc, magpie = wb[0], wb[1], wb[2], wb[3], wb[4], wb[5]
+            enc_out = encoder(elem_idx, elem_frac, elem_mask, magpie, tc)
+            _ = decoder(enc_out['z'], tokens, encoder_skip=enc_out['attended_input'])
+        torch.cuda.synchronize()
+        encoder.train()
+        decoder.train()
+        print("  Warmup complete", flush=True)
 
     # V12.11: Rollback loop detection
     rollback_count = 0
@@ -1734,13 +3160,29 @@ def train():
             loss_fn.entropy_weight = new_entropy_weight
             loss_fn.temperature = new_temperature
 
+        # V12.12: Compute contrastive weight with warmup
+        effective_contrastive_weight = 0.0
+        if contrastive_loss_fn is not None:
+            warmup_epochs = TRAIN_CONFIG.get('contrastive_warmup_epochs', 100)
+            warmup_progress = min(1.0, epoch / max(warmup_epochs, 1))
+            effective_contrastive_weight = TRAIN_CONFIG['contrastive_weight'] * warmup_progress
+
         metrics = train_epoch(
             encoder, decoder, train_loader, loss_fn,
             enc_opt, dec_opt, scaler, device, TRAIN_CONFIG['use_amp'],
             tf_ratio=tf_ratio, tc_weight=tc_weight, magpie_weight=magpie_weight,
             focal_loss_fn=focal_loss_fn,
-            amp_dtype=amp_dtype,  # V12.8: Configurable AMP dtype
-            accumulation_steps=TRAIN_CONFIG.get('accumulation_steps', 1),  # V12.8: Grad accumulation
+            amp_dtype=amp_dtype,
+            accumulation_steps=TRAIN_CONFIG.get('accumulation_steps', 1),
+            # V12.12: Contrastive learning
+            contrastive_loss_fn=contrastive_loss_fn,
+            contrastive_weight=effective_contrastive_weight,
+            non_sc_formula_weight=TRAIN_CONFIG.get('non_sc_formula_weight', 0.5),
+            # V12.12: Selective backpropagation
+            selective_backprop=TRAIN_CONFIG.get('selective_backprop', False),
+            selective_backprop_threshold=TRAIN_CONFIG.get('selective_backprop_threshold', 0.33),
+            # V12.15: Timing instrumentation
+            enable_timing=TRAIN_CONFIG.get('enable_timing', True),
         )
 
         # V12.11: Catastrophic drop detection - rollback to best checkpoint and halve LR
@@ -1822,7 +3264,8 @@ def train():
         base_msg = (f"Epoch {epoch:4d} | TF: {tf_ratio:.2f} | Loss: {metrics['loss']:.4f} | "
                     f"Acc: {metrics['accuracy']*100:.1f}% | Exact: {metrics['exact_match']*100:.1f}% | "
                     f"Tc: {metrics['tc_loss']:.4f} | Magpie: {metrics['magpie_loss']:.4f} | "
-                    f"Stoich: {metrics['stoich_loss']:.4f}")
+                    f"Stoich: {metrics['stoich_loss']:.4f} | "
+                    f"zN: {metrics['z_norm']:.1f}")
 
         # V12.8: Add REINFORCE metrics if enabled (includes entropy in reward)
         # V12.9: Also show adaptive entropy weight
@@ -1833,18 +3276,54 @@ def train():
                         f"Ent: {metrics.get('entropy', 0):.2f} | "
                         f"EntW: {ent_w:.3f}")
 
+        # V12.12: Add contrastive metrics if enabled
+        if contrastive_loss_fn is not None:
+            base_msg += f" | Con: {metrics.get('contrastive_loss', 0):.4f} (w={effective_contrastive_weight:.3f})"
+            if 'sc_exact_match' in metrics:
+                base_msg += f" | SC: {metrics['sc_exact_match']*100:.1f}%"
+            if 'non_sc_exact_match' in metrics:
+                base_msg += f" | nSC: {metrics['non_sc_exact_match']*100:.1f}%"
+
+        # V12.12: Show selective backprop stats
+        if metrics.get('n_skipped', 0) > 0 and metrics.get('n_total_batches', 0) > 0:
+            skip_pct = metrics['n_skipped'] / metrics['n_total_batches'] * 100
+            base_msg += f" | Skip: {metrics['n_skipped']}/{metrics['n_total_batches']} ({skip_pct:.0f}%)"
+        elif metrics.get('n_total_batches', 0) == 0:
+            base_msg += f" | Skip: ALL ({metrics.get('n_skipped', 0)} NaN batches)"
+
+        # V12.9: Show speculative decoding stats if enabled
+        if 'spec_acceptance_rate' in metrics:
+            base_msg += f" | Spec: {metrics['spec_acceptance_rate']*100:.0f}% ({metrics['spec_tokens_per_step']:.1f}t/s)"
+
+        # V12.15: Show timing breakdown
+        if 'timing' in metrics and metrics['timing'] is not None:
+            epoch_time = metrics.get('epoch_time', 0)
+            timing_summary = metrics['timing'].format_summary(epoch_time)
+            base_msg += f" | Time: {epoch_time:.1f}s [{timing_summary}]"
+
         print(base_msg, flush=True)
 
-        # V12.8: Evaluate TRUE autoregressive exact match every 10 epochs
-        # This is the honest metric - no teacher forcing, pure model predictions
-        if epoch % 10 == 0:
+        # V12.15: Print detailed timing every 50 epochs
+        if epoch % 50 == 0 and 'timing' in metrics and metrics['timing'] is not None:
+            print(metrics['timing'].format_detailed())
+
+        # V12.18: Evaluate TRUE autoregressive exact match EVERY epoch
+        # with full Z-space diagnostics, Tc/Magpie/stoich reconstruction stats
+        # V12.15: Log errors to file for analysis
+        true_eval = None
+        if epoch % 1 == 0:
             true_eval = evaluate_true_autoregressive(
-                encoder, decoder, train_loader, device, max_samples=2000
+                encoder, decoder, train_loader, device, max_samples=2000,
+                log_errors=True, epoch=epoch
             )
             err_dist = true_eval['error_distribution']
             print(f"  → TRUE Autoregressive: {true_eval['true_exact_match']*100:.1f}% exact "
                   f"({true_eval['exact_count']}/{true_eval['total_samples']}) | "
                   f"Errors: 0={err_dist[0]}, 1={err_dist[1]}, 2={err_dist[2]}, 3={err_dist[3]}, >3={err_dist['more']}", flush=True)
+
+        # V12.17: Log metrics to CSV for post-training analysis
+        training_log_path = OUTPUT_DIR / 'training_log.csv'
+        log_training_metrics(epoch, metrics, training_log_path, true_eval=true_eval)
 
         # Save checkpoints (V12.10: include full training state)
         checkpoint_kwargs = dict(
@@ -1860,11 +3339,40 @@ def train():
             checkpoint_kwargs['best_exact'] = best_exact  # Update with new best
             save_checkpoint(encoder, decoder, epoch, 'best', **checkpoint_kwargs)
 
+            # V12.17: Cache z-vectors on new best checkpoint
+            if TRAIN_CONFIG.get('cache_z_vectors', False):
+                z_cache_path = PROJECT_ROOT / TRAIN_CONFIG.get('z_cache_path', 'outputs/latent_cache.pt')
+                z_cache_mode = TRAIN_CONFIG.get('z_cache_mode', 'z_only')
+                cache_z_vectors(encoder, train_loader, device, epoch, z_cache_path,
+                               decoder=decoder, mode=z_cache_mode)
+
+        # V12.17: Cache z-vectors at configured interval (or every epoch if configured)
+        z_cache_interval = TRAIN_CONFIG.get('z_cache_interval', 0)
+        cache_every_epoch = TRAIN_CONFIG.get('z_cache_every_epoch', False)
+        should_cache_interval = (z_cache_interval > 0 and (epoch + 1) % z_cache_interval == 0)
+
+        if TRAIN_CONFIG.get('cache_z_vectors', False) and (cache_every_epoch or should_cache_interval):
+            z_cache_path = PROJECT_ROOT / TRAIN_CONFIG.get('z_cache_path', 'outputs/latent_cache.pt')
+            z_cache_mode = TRAIN_CONFIG.get('z_cache_mode', 'z_only')
+            # Save with epoch suffix to track evolution
+            epoch_cache_path = z_cache_path.with_stem(f"{z_cache_path.stem}_epoch{epoch:04d}")
+            cache_z_vectors(encoder, train_loader, device, epoch, epoch_cache_path,
+                           decoder=decoder, mode=z_cache_mode)
+
         if (epoch + 1) % TRAIN_CONFIG['checkpoint_interval'] == 0:
             save_checkpoint(encoder, decoder, epoch, **checkpoint_kwargs)
 
     # Final save
     save_checkpoint(encoder, decoder, epoch, 'final', **checkpoint_kwargs)
+
+    # V12.17: Final z-cache
+    if TRAIN_CONFIG.get('cache_z_vectors', False):
+        z_cache_path = PROJECT_ROOT / TRAIN_CONFIG.get('z_cache_path', 'outputs/latent_cache.pt')
+        z_cache_mode = TRAIN_CONFIG.get('z_cache_mode', 'z_only')
+        final_cache_path = z_cache_path.with_stem(f"{z_cache_path.stem}_final")
+        cache_z_vectors(encoder, train_loader, device, epoch, final_cache_path,
+                       decoder=decoder, mode=z_cache_mode)
+
     print(f"\nTraining complete. Best exact match: {best_exact*100:.1f}%")
 
 

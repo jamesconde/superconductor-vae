@@ -13,6 +13,7 @@ from .materials_api import (
     DEFAULT_NON_SUPERCONDUCTORS,
     DEFAULT_MAGNETIC_MATERIALS,
 )
+from .env_config import detect_environment
 
 __all__ = [
     'MaterialsProjectClient',
@@ -20,4 +21,5 @@ __all__ = [
     'fetch_negative_samples',
     'DEFAULT_NON_SUPERCONDUCTORS',
     'DEFAULT_MAGNETIC_MATERIALS',
+    'detect_environment',
 ]
