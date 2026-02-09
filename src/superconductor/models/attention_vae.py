@@ -733,6 +733,20 @@ class FullMaterialsVAE(nn.Module):
             nn.Linear(128, self.max_elements + 1)  # +1 for element count
         )
 
+        # =====================================================================
+        # HIGH-PRESSURE PREDICTION HEAD (V12.19)
+        # =====================================================================
+        # Binary classifier: P(requires_high_pressure | z)
+        # Predicts whether a superconductor requires high pressure to exhibit SC.
+        # ~1% of SC are HP, so use pos_weight in BCEWithLogitsLoss during training.
+        # Architecture: z → hidden → 1 (logit, no sigmoid — BCE handles it)
+        # =====================================================================
+        self.hp_head = nn.Sequential(
+            nn.Linear(latent_dim, 256),
+            nn.ReLU(),
+            nn.Linear(256, 1),
+        )
+
     def reparameterize(self, mean: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
         """Reparameterization trick for VAE, or passthrough in deterministic mode."""
         if logvar is None:
@@ -849,6 +863,9 @@ class FullMaterialsVAE(nn.Module):
         fraction_pred = fraction_output[:, :self.max_elements]  # [batch, max_elements]
         element_count_pred = fraction_output[:, -1]  # [batch]
 
+        # High-pressure prediction (V12.19)
+        hp_pred = self.hp_head(enc_out['z']).squeeze(-1)  # [batch] logits
+
         # Latent regularization: L2 on z (deterministic mode) or KL (VAE mode)
         # IMPORTANT (2026-02-02): 'kl_loss' key is INTENTIONALLY reused for L2 reg.
         # The entire downstream pipeline (CombinedLossWithREINFORCE, train_v12_clean.py,
@@ -885,6 +902,8 @@ class FullMaterialsVAE(nn.Module):
             # Stoichiometry prediction (V12.4)
             'fraction_pred': fraction_pred,
             'element_count_pred': element_count_pred,
+            # High-pressure prediction (V12.19) — logits, apply sigmoid for probability
+            'hp_pred': hp_pred,
         }
 
 
@@ -905,12 +924,14 @@ class FullMaterialsLoss(nn.Module):
         magpie_weight: float = 1.0,
         formula_weight: float = 1.0,
         kl_weight: float = 0.0,  # Keep 0 for jagged latent
+        tc_huber_delta: float = 0.0,  # V12.20: 0 = MSE, >0 = Huber
     ):
         super().__init__()
         self.tc_weight = tc_weight
         self.magpie_weight = magpie_weight
         self.formula_weight = formula_weight
         self.kl_weight = kl_weight
+        self.tc_huber_delta = tc_huber_delta
 
     def forward(
         self,
@@ -922,8 +943,11 @@ class FullMaterialsLoss(nn.Module):
         """
         Compute full materials reconstruction loss.
         """
-        # Tc reconstruction
-        tc_loss = F.mse_loss(outputs['tc_pred'], tc_true)
+        # Tc reconstruction (V12.20: Huber loss for outlier robustness)
+        if self.tc_huber_delta > 0:
+            tc_loss = F.huber_loss(outputs['tc_pred'], tc_true, delta=self.tc_huber_delta)
+        else:
+            tc_loss = F.mse_loss(outputs['tc_pred'], tc_true)
 
         # Magpie reconstruction
         magpie_loss = F.mse_loss(outputs['magpie_pred'], magpie_true)

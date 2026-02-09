@@ -4,6 +4,12 @@ This folder contains technical documentation for the Superconductor Formula VAE 
 
 ## Documents
 
+### Architecture
+
+| Document | Description |
+|----------|-------------|
+| [ARCHITECTURE.md](ARCHITECTURE.md) | Full architecture guide: encoder, decoder, prediction heads, multi-task learning, gradient flow |
+
 ### Training
 
 | Document | Description |

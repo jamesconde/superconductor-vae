@@ -6,7 +6,7 @@
 
 ---
 
-## Implementation Status (2026-02-02)
+## Implementation Status (2026-02-09)
 
 **Status**: Active - overnight training run on local RTX 4060
 
@@ -19,9 +19,35 @@
   - SC samples: full loss (formula + Tc + Magpie + stoich + KL + REINFORCE)
   - Non-SC samples: formula-only loss at 0.5x weight, no Tc/Magpie/REINFORCE
   - Contrastive loss warmup over 100 epochs (weight 0.1)
-  - Per-family extended labels (12 classes: 8 SC families + 4 non-SC categories)
+  - Per-family extended labels (13 classes: 9 SC families + 4 non-SC categories)
   - SC vs non-SC exact match tracking
   - Retrain mode: resets catastrophic drop detector for data changes
+
+### V12.19: Extended Label Scheme (2026-02-09)
+
+Added class 12: **High-pressure (non-hydride)** for non-hydride HP-SC materials.
+
+| Label | Category | Count |
+|-------|----------|-------|
+| 0 | Cuprates | 8,179 |
+| 1 | Iron-based | 2,353 |
+| 2 | Bismuthates | 2,360 |
+| 3 | Borocarbides | 416 |
+| 4 | Elemental Superconductors | 71 |
+| 5 | Hydrogen-rich Superconductors | 45 |
+| 6 | Organic Superconductors | 75 |
+| 7 | Other | 9,952 |
+| 8 | Non-SC: Materials Project | 14,040 |
+| 9 | Non-SC: Magnetic | 4,009 |
+| 10 | Non-SC: Thermoelectric | 3,287 |
+| 11 | Non-SC: Anisotropy | 1,858 |
+| 12 | High-pressure (non-hydride) | ~71 |
+
+**Design**: HP-SC that are NOT hydrogen-rich get reassigned from their parent category
+(e.g., Cuprates, Other, Elemental) to class 12. This clusters all non-hydride HP-SC
+together in latent space. Hydrogen-rich SC stay in class 5 since they already form
+a distinct cluster. The `category_to_label()` function now accepts a
+`requires_high_pressure` parameter for this override.
 
 ### Training Progress (First epochs)
 - Epoch 1289: SC Exact=25.7%, Loss=1.45, Contrastive=4.29

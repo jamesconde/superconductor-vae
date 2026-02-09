@@ -38,6 +38,8 @@ if 'CC' not in os.environ:
 
 import numpy as np
 import pandas as pd
+from scipy.stats import rankdata as _rankdata  # V12.20: quantile transform for skewed Magpie features
+from scipy.special import ndtri as _ndtri       # V12.20: inverse normal CDF (rank → Gaussian)
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -367,6 +369,15 @@ TRAIN_CONFIG = {
     'magpie_weight': 2.0,
     'stoich_weight': 2.0,  # V12.4: Stoichiometry loss weight
     'kl_weight': 0.0001,  # Now L2 regularization weight on z (deterministic encoder)
+    'hp_loss_weight': 0.05,  # V12.19: High-pressure prediction loss weight (BCE)
+
+    # V12.20: Tc loss improvements (log-transform + Huber)
+    'tc_log_transform': True,   # Apply log1p(Tc) before z-score normalization (reduces skew 2.18→-0.17)
+    'tc_huber_delta': 1.0,      # Huber loss delta (clips gradient for outliers; 1.0 = ~1 std dev in normalized space)
+
+    # V12.20: Magpie normalization improvements
+    'magpie_skew_threshold': 3.0,   # Features with |skew| > this get quantile-transformed to Gaussian
+    'magpie_sc_only_norm': True,    # Use SC-only mean/std for z-score (avoids non-SC distribution bias)
 
     # Teacher forcing decay
     'tf_start': 1.0,           # Start with full teacher forcing
@@ -777,6 +788,20 @@ def _try_load_cache(csv_hash: str, max_formula_len: int):
         if meta.get('max_formula_len') != max_formula_len:
             print("  Cache stale: max_formula_len changed")
             return None
+        # V12.20: Invalidate cache if tc_log_transform setting changed
+        tc_log_transform = TRAIN_CONFIG.get('tc_log_transform', False)
+        if meta.get('tc_log_transform', False) != tc_log_transform:
+            print(f"  Cache stale: tc_log_transform changed ({meta.get('tc_log_transform', False)} → {tc_log_transform})")
+            return None
+        # V12.20: Invalidate cache if Magpie normalization settings changed
+        magpie_skew_threshold = TRAIN_CONFIG.get('magpie_skew_threshold', 0.0)
+        if meta.get('magpie_skew_threshold', 0.0) != magpie_skew_threshold:
+            print(f"  Cache stale: magpie_skew_threshold changed ({meta.get('magpie_skew_threshold', 0.0)} → {magpie_skew_threshold})")
+            return None
+        magpie_sc_only = TRAIN_CONFIG.get('magpie_sc_only_norm', False)
+        if meta.get('magpie_sc_only_norm', False) != magpie_sc_only:
+            print(f"  Cache stale: magpie_sc_only_norm changed ({meta.get('magpie_sc_only_norm', False)} → {magpie_sc_only})")
+            return None
 
         # Load tensors
         tensors = {
@@ -787,12 +812,20 @@ def _try_load_cache(csv_hash: str, max_formula_len: int):
             'tc_tensor': torch.load(cache_dir / 'tc_tensor.pt', weights_only=True),
             'magpie_tensor': torch.load(cache_dir / 'magpie_tensor.pt', weights_only=True),
         }
+        # V12.19: Load HP tensor if available
+        hp_cache_path = cache_dir / 'hp_tensor.pt'
+        if hp_cache_path.exists():
+            tensors['hp_tensor'] = torch.load(hp_cache_path, weights_only=True)
 
         norm_stats = {
             'tc_mean': meta['tc_mean'],
             'tc_std': meta['tc_std'],
+            'tc_log_transform': meta.get('tc_log_transform', False),  # V12.20
             'magpie_mean': meta['magpie_mean'],
             'magpie_std': meta['magpie_std'],
+            # V12.20: Magpie transform metadata
+            'magpie_skewed_indices': meta.get('magpie_skewed_indices', []),
+            'magpie_sc_only_norm': meta.get('magpie_sc_only_norm', False),
         }
 
         train_indices = meta['train_indices']
@@ -824,8 +857,13 @@ def _save_cache(tensors: dict, norm_stats: dict, n_magpie_cols: int,
         'train_indices': train_indices,
         'tc_mean': norm_stats['tc_mean'],
         'tc_std': norm_stats['tc_std'],
+        'tc_log_transform': norm_stats.get('tc_log_transform', False),  # V12.20
         'magpie_mean': norm_stats['magpie_mean'],
         'magpie_std': norm_stats['magpie_std'],
+        # V12.20: Magpie transform config for cache invalidation
+        'magpie_skew_threshold': TRAIN_CONFIG.get('magpie_skew_threshold', 0.0),
+        'magpie_sc_only_norm': norm_stats.get('magpie_sc_only_norm', False),
+        'magpie_skewed_indices': norm_stats.get('magpie_skewed_indices', []),
     }
     with open(cache_dir / 'cache_meta.json', 'w') as f:
         json.dump(meta, f)
@@ -888,6 +926,13 @@ def load_and_prepare_data():
             label_tensor = torch.zeros(n, dtype=torch.long)
             tensor_list.extend([is_sc_tensor, label_tensor])
 
+        # V12.19: HP tensor (backward compatible — default 0 if missing)
+        if 'hp_tensor' in tensors:
+            tensor_list.append(tensors['hp_tensor'])
+        else:
+            n = tensors['element_indices'].size(0)
+            tensor_list.append(torch.zeros(n, dtype=torch.float32))
+
         dataset = TensorDataset(*tensor_list)
         train_dataset = Subset(dataset, train_indices)
         is_sc_train = is_sc_tensor[train_indices]
@@ -910,12 +955,23 @@ def load_and_prepare_data():
         else:
             is_sc_values = np.ones(len(df), dtype=np.int64)
 
+        # V12.19: Extract high-pressure labels (default 0 for backward compat)
+        if 'requires_high_pressure' in df.columns:
+            hp_values = df['requires_high_pressure'].values.astype(np.float32)
+            n_hp = int(hp_values.sum())
+            print(f"  High-pressure SC: {n_hp} ({n_hp/max(is_sc_values.sum(),1)*100:.1f}% of SC)")
+        else:
+            hp_values = np.zeros(len(df), dtype=np.float32)
+            print("  No requires_high_pressure column — defaulting to 0")
+
         # V12.12: Contrastive labels from category column
+        # V12.19: Pass HP flag to assign class 12 for non-hydride HP-SC
         use_extended = TRAIN_CONFIG.get('use_extended_labels', True)
         if 'category' in df.columns:
             label_values = np.array([
-                category_to_label(cat, use_extended=use_extended)
-                for cat in df['category'].values
+                category_to_label(cat, use_extended=use_extended,
+                                  requires_high_pressure=int(hp))
+                for cat, hp in zip(df['category'].values, hp_values)
             ], dtype=np.int64)
             n_labels = len(set(label_values))
             print(f"  Contrastive labels: {n_labels} classes (extended={use_extended})")
@@ -923,14 +979,21 @@ def load_and_prepare_data():
             label_values = np.zeros(len(df), dtype=np.int64)
 
         # Normalize Tc (use SC samples only for Tc stats to avoid non-SC Tc=0 skewing)
+        # V12.20: Optional log-transform before z-score (reduces skewness from 2.18 to -0.17)
+        tc_log_transform = TRAIN_CONFIG.get('tc_log_transform', False)
         sc_mask_np = is_sc_values == 1
-        tc_mean = float(tc_values[sc_mask_np].mean()) if sc_mask_np.any() else float(tc_values.mean())
-        tc_std = float(tc_values[sc_mask_np].std()) if sc_mask_np.any() else float(tc_values.std())
-        tc_normalized = (tc_values - tc_mean) / tc_std
-        print(f"Tc (SC-only stats): mean={tc_mean:.2f}K, std={tc_std:.2f}K")
+        if tc_log_transform:
+            tc_for_norm = np.log1p(tc_values)  # log(1 + Tc) — handles Tc=0 safely
+            print(f"Tc log-transform: log1p applied (raw range [{tc_values.min():.1f}, {tc_values.max():.1f}]K → [{tc_for_norm.min():.2f}, {tc_for_norm.max():.2f}])")
+        else:
+            tc_for_norm = tc_values
+        tc_mean = float(tc_for_norm[sc_mask_np].mean()) if sc_mask_np.any() else float(tc_for_norm.mean())
+        tc_std = float(tc_for_norm[sc_mask_np].std()) if sc_mask_np.any() else float(tc_for_norm.std())
+        tc_normalized = (tc_for_norm - tc_mean) / tc_std
+        print(f"Tc (SC-only stats): mean={tc_mean:.2f}, std={tc_std:.2f}" + (" [log1p space]" if tc_log_transform else " [K]"))
 
         # Get Magpie features
-        exclude = ['formula', 'Tc', 'composition', 'category', 'is_superconductor', 'compound possible', 'formula_original']
+        exclude = ['formula', 'Tc', 'composition', 'category', 'is_superconductor', 'compound possible', 'formula_original', 'requires_high_pressure']
         numeric_cols = df.select_dtypes(include=['number']).columns.tolist()
         magpie_cols = [c for c in numeric_cols if c not in exclude]
         n_magpie_cols = len(magpie_cols)
@@ -945,8 +1008,42 @@ def load_and_prepare_data():
             for col_idx in range(magpie_data.shape[1]):
                 magpie_data[nan_mask[:, col_idx], col_idx] = col_means[col_idx]
 
-        magpie_mean = magpie_data.mean(axis=0)
-        magpie_std = magpie_data.std(axis=0) + 1e-8
+        # V12.20: Quantile-transform skewed features before z-score
+        # Zero-inflated features (94-100% zeros) can't be fixed with log/sqrt.
+        # Rank-based Gaussian transform handles any distribution shape.
+        skew_threshold = TRAIN_CONFIG.get('magpie_skew_threshold', 0.0)
+        magpie_skewed_indices = []
+        if skew_threshold > 0:
+            from scipy.stats import skew as _skew_func
+            skewness = np.array([_skew_func(magpie_data[:, i]) for i in range(magpie_data.shape[1])])
+            skewed_mask = np.abs(skewness) > skew_threshold
+            magpie_skewed_indices = np.where(skewed_mask)[0].tolist()
+            if magpie_skewed_indices:
+                print(f"  Quantile-transforming {len(magpie_skewed_indices)} skewed Magpie features (|skew| > {skew_threshold}):")
+                # Fixed RNG for reproducibility — jitter breaks ties in zero-inflated features
+                _jitter_rng = np.random.default_rng(42)
+                for idx in magpie_skewed_indices:
+                    old_skew = skewness[idx]
+                    col_data = magpie_data[:, idx]
+                    # Add tiny jitter to break ties (99%+ zeros share same rank otherwise)
+                    jittered = col_data + _jitter_rng.normal(0, 1e-6, len(col_data)).astype(np.float32)
+                    # Rank → uniform (0,1) → Gaussian via inverse normal CDF
+                    ranks = _rankdata(jittered, method='average')
+                    uniform = (ranks - 0.5) / len(ranks)
+                    magpie_data[:, idx] = _ndtri(uniform).astype(np.float32)
+                    new_skew = _skew_func(magpie_data[:, idx])
+                    print(f"    {magpie_cols[idx]}: skew {old_skew:.1f} → {new_skew:.2f}")
+
+        # V12.20: SC-only normalization (avoids non-SC distribution bias)
+        use_sc_only = TRAIN_CONFIG.get('magpie_sc_only_norm', False)
+        if use_sc_only and sc_mask_np.any():
+            magpie_mean = magpie_data[sc_mask_np].mean(axis=0)
+            magpie_std = magpie_data[sc_mask_np].std(axis=0) + 1e-8
+            print(f"  Magpie z-score: SC-only stats ({sc_mask_np.sum()} samples)")
+        else:
+            magpie_mean = magpie_data.mean(axis=0)
+            magpie_std = magpie_data.std(axis=0) + 1e-8
+            print(f"  Magpie z-score: all-sample stats ({len(magpie_data)} samples)")
         magpie_normalized = (magpie_data - magpie_mean) / magpie_std
 
         # Tokenize formulas
@@ -986,6 +1083,7 @@ def load_and_prepare_data():
         magpie_tensor = torch.tensor(magpie_normalized, dtype=torch.float32)
         is_sc_tensor = torch.tensor(is_sc_values, dtype=torch.long)
         label_tensor = torch.tensor(label_values, dtype=torch.long)
+        hp_tensor = torch.tensor(hp_values, dtype=torch.float32)  # V12.19
 
         # Get train indices (exclude holdout — matched by formula, not position)
         holdout_indices = load_holdout_indices(HOLDOUT_PATH, formulas)
@@ -1001,8 +1099,12 @@ def load_and_prepare_data():
 
         norm_stats = {
             'tc_mean': tc_mean, 'tc_std': tc_std,
+            'tc_log_transform': tc_log_transform,  # V12.20: True = tc_mean/std are in log1p space
             'magpie_mean': magpie_mean.tolist(),
             'magpie_std': magpie_std.tolist(),
+            # V12.20: Magpie transform metadata for inference reproducibility
+            'magpie_skewed_indices': magpie_skewed_indices,  # Which features were quantile-transformed
+            'magpie_sc_only_norm': use_sc_only,
         }
 
         # Save cache for next run
@@ -1016,6 +1118,7 @@ def load_and_prepare_data():
                 'magpie_tensor': magpie_tensor,
                 'is_sc_tensor': is_sc_tensor,
                 'label_tensor': label_tensor,
+                'hp_tensor': hp_tensor,  # V12.19
             },
             norm_stats=norm_stats,
             n_magpie_cols=n_magpie_cols,
@@ -1024,11 +1127,11 @@ def load_and_prepare_data():
             max_formula_len=max_len,
         )
 
-        # Create dataset (8 tensors: 6 original + is_sc + label)
+        # Create dataset (9 tensors: 6 original + is_sc + label + hp)
         dataset = TensorDataset(
             element_indices, element_fractions, element_mask,
             formula_tokens, tc_tensor, magpie_tensor,
-            is_sc_tensor, label_tensor,
+            is_sc_tensor, label_tensor, hp_tensor,
         )
         train_dataset = Subset(dataset, train_indices)
 
@@ -1093,7 +1196,7 @@ def load_and_prepare_data():
         # Reconstruct column names from the data
         try:
             df_cols = pd.read_csv(DATA_PATH, nrows=0)
-            exclude = ['formula', 'Tc', 'composition', 'category', 'is_superconductor', 'compound possible', 'formula_original']
+            exclude = ['formula', 'Tc', 'composition', 'category', 'is_superconductor', 'compound possible', 'formula_original', 'requires_high_pressure']
             numeric_cols = [c for c in df_cols.columns if c not in exclude]
             # Filter to only numeric columns that were actually used
             norm_stats_with_cols['magpie_cols'] = [c for c in numeric_cols
@@ -1166,7 +1269,7 @@ class CombinedLossWithREINFORCE(nn.Module):
 
     Components:
     1. Formula reconstruction (CE + optional REINFORCE with RLOO)
-    2. Tc reconstruction (MSE)
+    2. Tc reconstruction (Huber loss on log-transformed Tc, V12.20)
     3. Magpie reconstruction (MSE)
     4. KL divergence
     5. Stoichiometry MSE (V12.4)
@@ -1190,6 +1293,7 @@ class CombinedLossWithREINFORCE(nn.Module):
         focal_gamma: float = 2.0,
         label_smoothing: float = 0.1,
         use_autoregressive_reinforce: bool = True,
+        tc_huber_delta: float = 0.0,  # V12.20: 0 = MSE (backward compat), >0 = Huber
     ):
         super().__init__()
 
@@ -1202,6 +1306,7 @@ class CombinedLossWithREINFORCE(nn.Module):
         self.entropy_weight = entropy_weight
         self.n_samples_rloo = n_samples_rloo
         self.temperature = temperature
+        self.tc_huber_delta = tc_huber_delta  # V12.20
 
         # V12.8: Autoregressive REINFORCE with KV caching
         self.use_autoregressive_reinforce = use_autoregressive_reinforce
@@ -1498,8 +1603,11 @@ class CombinedLossWithREINFORCE(nn.Module):
             entropy_per_position = -(probs * log_probs).sum(dim=-1)
             entropy = (entropy_per_position * mask.float()).sum(dim=1).mean()
 
-        # 4. Tc Loss
-        tc_loss = F.mse_loss(tc_pred.squeeze(), tc_true.squeeze())
+        # 4. Tc Loss (V12.20: Huber loss clips gradient from outliers)
+        if self.tc_huber_delta > 0:
+            tc_loss = F.huber_loss(tc_pred.squeeze(), tc_true.squeeze(), delta=self.tc_huber_delta)
+        else:
+            tc_loss = F.mse_loss(tc_pred.squeeze(), tc_true.squeeze())
 
         # 5. Magpie Loss
         magpie_loss = F.mse_loss(magpie_pred, magpie_true)
@@ -1681,8 +1789,9 @@ def cache_z_vectors(encoder, loader, device, epoch, cache_path, dataset_info=Non
 
     with torch.no_grad():
         for batch in loader:
-            # Unpack batch (same as training loop)
-            elem_idx, elem_frac, elem_mask, tokens, tc, magpie, is_sc, labels = [b.to(device) for b in batch]
+            # Unpack batch (same as training loop — V12.19: 9 tensors)
+            batch_tensors = [b.to(device) for b in batch]
+            elem_idx, elem_frac, elem_mask, tokens, tc, magpie, is_sc, labels = batch_tensors[:8]
 
             # Encode
             encoder_out = encoder(elem_idx, elem_frac, elem_mask, magpie, tc)
@@ -1846,8 +1955,8 @@ def log_training_metrics(epoch, metrics, log_path, true_eval=None):
     columns = [
         'epoch', 'exact_match', 'accuracy', 'loss', 'tc_loss', 'magpie_loss',
         'stoich_loss', 'rl_loss', 'reward', 'entropy', 'entropy_weight',
-        'z_norm', 'tf_ratio', 'contrastive_loss', 'true_exact', 'epoch_time',
-        'timestamp'
+        'z_norm', 'tf_ratio', 'contrastive_loss', 'hp_loss', 'true_exact',
+        'epoch_time', 'timestamp'
     ]
 
     # Extract values
@@ -1866,6 +1975,7 @@ def log_training_metrics(epoch, metrics, log_path, true_eval=None):
         'z_norm': metrics.get('z_norm', 0),
         'tf_ratio': metrics.get('tf_ratio', 0),
         'contrastive_loss': metrics.get('contrastive_loss', 0),
+        'hp_loss': metrics.get('hp_loss', 0),
         'true_exact': true_eval['true_exact_match'] if true_eval else '',
         'epoch_time': metrics.get('epoch_time', 0),
         'timestamp': datetime.datetime.now().isoformat(),
@@ -2363,7 +2473,7 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
                 focal_loss_fn=None, amp_dtype=torch.float16, accumulation_steps=1,
                 contrastive_loss_fn=None, contrastive_weight=0.0, non_sc_formula_weight=0.5,
                 selective_backprop=False, selective_backprop_threshold=0.33,
-                enable_timing=True):
+                enable_timing=True, hp_loss_weight=0.0):
     """Train for one epoch with curriculum weights and teacher forcing.
 
     V12.8: Added amp_dtype for configurable mixed precision (bfloat16/float16)
@@ -2372,6 +2482,7 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
     V12.12: Added contrastive loss for mixed SC/non-SC training
     V12.12: Added selective backpropagation - skip backward on easy batches
     V12.15: Added enable_timing for compute/time profiling
+    V12.19: Added hp_loss_weight for high-pressure prediction head
     """
     global _timing_stats
 
@@ -2395,6 +2506,7 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
     total_entropy = 0
     total_z_norm = 0
     total_contrastive = 0
+    total_hp_loss = 0  # V12.19
     total_sc_exact = 0
     total_non_sc_exact = 0
     total_spec_accept = 0  # V12.9: Speculative decoding acceptance rate
@@ -2422,8 +2534,10 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
         if timing:
             timing.stop('data_load')
 
-        # V12.12: Unpack 8 tensors (6 original + is_sc + label)
-        elem_idx, elem_frac, elem_mask, tokens, tc, magpie, is_sc, labels = [b.to(device) for b in batch]
+        # V12.19: Unpack 9 tensors (6 original + is_sc + label + hp)
+        batch_tensors = [b.to(device) for b in batch]
+        elem_idx, elem_frac, elem_mask, tokens, tc, magpie, is_sc, labels = batch_tensors[:8]
+        hp_labels = batch_tensors[8] if len(batch_tensors) > 8 else torch.zeros_like(is_sc, dtype=torch.float32)
 
         sc_mask = is_sc.bool()  # True = superconductor
 
@@ -2484,6 +2598,23 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
             if contrastive_loss_fn is not None and contrastive_weight > 0:
                 contrastive_loss_val = contrastive_loss_fn(z, labels)
 
+            # V12.19: High-pressure prediction loss (only on SC samples)
+            hp_loss_val = torch.tensor(0.0, device=device)
+            if hp_loss_weight > 0:
+                hp_pred = encoder_out.get('hp_pred')
+                if hp_pred is not None and sc_mask.any():
+                    # Only compute HP loss on superconductor samples
+                    sc_hp_pred = hp_pred[sc_mask]
+                    sc_hp_labels = hp_labels[sc_mask]
+                    # pos_weight handles class imbalance (~100:1 non-HP to HP among SC)
+                    n_pos = sc_hp_labels.sum().clamp(min=1)
+                    n_neg = (1 - sc_hp_labels).sum().clamp(min=1)
+                    pos_weight = (n_neg / n_pos).clamp(max=50.0)  # Cap at 50x
+                    hp_loss_val = F.binary_cross_entropy_with_logits(
+                        sc_hp_pred, sc_hp_labels,
+                        pos_weight=pos_weight,
+                    )
+
             # V12.15: Time loss computation (includes REINFORCE sampling)
             if timing:
                 timing.start('loss_compute')
@@ -2509,7 +2640,8 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
                     encoder_skip=attended_input,
                     stoich_pred_for_reinforce=stoich_pred,
                 )
-                loss = loss_dict['total'] + contrastive_weight * contrastive_loss_val
+                loss = (loss_dict['total'] + contrastive_weight * contrastive_loss_val
+                        + hp_loss_weight * hp_loss_val)
 
             elif (~sc_mask).all():
                 # Pure non-SC batch — formula loss only (lower weight), no Tc/Magpie/REINFORCE
@@ -2586,7 +2718,8 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
                 loss_dict = sc_loss_dict  # Use SC metrics for logging
                 loss = (sc_frac * sc_loss_dict['total'] +
                         non_sc_frac * non_sc_formula_weight * non_sc_loss_dict['total'] +
-                        contrastive_weight * contrastive_loss_val)
+                        contrastive_weight * contrastive_loss_val +
+                        hp_loss_weight * hp_loss_val)
 
         # V12.15: Stop loss computation timing
         if timing:
@@ -2681,6 +2814,7 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
         total_reward += loss_dict['mean_reward'].item() if torch.is_tensor(loss_dict['mean_reward']) else loss_dict['mean_reward']
         total_entropy += loss_dict['entropy'].item()
         total_contrastive += contrastive_loss_val.item() if torch.is_tensor(contrastive_loss_val) else contrastive_loss_val
+        total_hp_loss += hp_loss_val.item() if torch.is_tensor(hp_loss_val) else hp_loss_val
         z_norm_val = z.detach().float().norm(dim=1).mean().item()
         if not math.isnan(z_norm_val):
             total_z_norm += z_norm_val
@@ -2724,7 +2858,7 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
             'loss': float('nan'), 'accuracy': 0, 'exact_match': 0,
             'tc_loss': 0, 'magpie_loss': 0, 'stoich_loss': 0,
             'reinforce_loss': 0, 'mean_reward': 0, 'entropy': 0,
-            'contrastive_loss': 0, 'z_norm': 0,
+            'contrastive_loss': 0, 'hp_loss': 0, 'z_norm': 0,
             'n_skipped': n_skipped, 'n_total_batches': 0,
         }
 
@@ -2739,6 +2873,7 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
         'mean_reward': total_reward / n_batches,
         'entropy': total_entropy / n_batches,
         'contrastive_loss': total_contrastive / n_batches,
+        'hp_loss': total_hp_loss / n_batches,  # V12.19
         'z_norm': total_z_norm / n_batches,
         'n_skipped': n_skipped,  # V12.12: Selective backprop skips
         'n_total_batches': n_batches,
@@ -2778,6 +2913,11 @@ def train():
     TRAIN_CONFIG['persistent_workers'] = env['persistent_workers']
     TRAIN_CONFIG['prefetch_factor'] = env['prefetch_factor']
     TRAIN_CONFIG['use_torch_compile'] = env['use_torch_compile']
+    # V12.20: Environment can override compile_mode (Colab uses 'default' to avoid
+    # reduce-overhead memory leak; local uses TRAIN_CONFIG default)
+    if env.get('compile_mode') is not None:
+        TRAIN_CONFIG['compile_mode'] = env['compile_mode']
+        print(f"[env] compile_mode overridden: '{env['compile_mode']}'")
 
     # Apply batch_size_multiplier when batch_size is a fixed int (not 'auto')
     if env['batch_size_multiplier'] != 1.0 and isinstance(TRAIN_CONFIG['batch_size'], int):
@@ -2830,6 +2970,7 @@ def train():
         focal_gamma=TRAIN_CONFIG['focal_gamma'],
         label_smoothing=TRAIN_CONFIG['label_smoothing'],
         use_autoregressive_reinforce=TRAIN_CONFIG.get('use_autoregressive_reinforce', True),
+        tc_huber_delta=TRAIN_CONFIG.get('tc_huber_delta', 0.0),  # V12.20
     )
 
     # V12.9: Build or load draft model for speculative decoding
@@ -3048,9 +3189,12 @@ def train():
           f"path={TRAIN_CONFIG.get('z_cache_path', 'outputs/latent_cache.pt')})")
     print(f"\nLoss weights (final):")
     print(f"  Formula: {TRAIN_CONFIG['formula_weight']}")
-    print(f"  Tc: {TRAIN_CONFIG['tc_weight']}")
+    print(f"  Tc: {TRAIN_CONFIG['tc_weight']}" +
+          (f" (Huber δ={TRAIN_CONFIG['tc_huber_delta']})" if TRAIN_CONFIG.get('tc_huber_delta', 0) > 0 else " (MSE)") +
+          (" [log1p]" if TRAIN_CONFIG.get('tc_log_transform', False) else ""))
     print(f"  Magpie: {TRAIN_CONFIG['magpie_weight']}")
     print(f"  Stoich: {TRAIN_CONFIG['stoich_weight']}")
+    print(f"  HP: {TRAIN_CONFIG.get('hp_loss_weight', 0)}")
     print(f"\nCurriculum:")
     print(f"  Phase 1 (0-{TRAIN_CONFIG['curriculum_phase1_end']}): Tc 5→10, Magpie 1→2")
     print(f"  Phase 2 ({TRAIN_CONFIG['curriculum_phase1_end']}+): Full strength")
@@ -3183,6 +3327,8 @@ def train():
             selective_backprop_threshold=TRAIN_CONFIG.get('selective_backprop_threshold', 0.33),
             # V12.15: Timing instrumentation
             enable_timing=TRAIN_CONFIG.get('enable_timing', True),
+            # V12.19: High-pressure prediction
+            hp_loss_weight=TRAIN_CONFIG.get('hp_loss_weight', 0.0),
         )
 
         # V12.11: Catastrophic drop detection - rollback to best checkpoint and halve LR
@@ -3283,6 +3429,10 @@ def train():
                 base_msg += f" | SC: {metrics['sc_exact_match']*100:.1f}%"
             if 'non_sc_exact_match' in metrics:
                 base_msg += f" | nSC: {metrics['non_sc_exact_match']*100:.1f}%"
+
+        # V12.19: Show HP loss if enabled
+        if TRAIN_CONFIG.get('hp_loss_weight', 0) > 0 and metrics.get('hp_loss', 0) > 0:
+            base_msg += f" | HP: {metrics['hp_loss']:.4f}"
 
         # V12.12: Show selective backprop stats
         if metrics.get('n_skipped', 0) > 0 and metrics.get('n_total_batches', 0) > 0:

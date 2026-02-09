@@ -4,6 +4,123 @@ Chronological record of training runs, architecture changes, and optimization de
 
 ---
 
+## V12.20: Normalization Audit + Loss Function Fixes (2026-02-09)
+
+### Problem
+
+Data analysis revealed the raw Tc distribution (skewness=2.18, range 0-1103K) caused severe MSE pathologies:
+
+| Issue | Impact |
+|-------|--------|
+| **Outlier dominance** | Top 1% of samples contribute 93.5% of total Tc MSE |
+| **Heteroscedastic errors** | Error magnitude correlates with Tc (r=0.53) |
+| **Systematic underprediction** | 99.1% of materials above 100K are underpredicted |
+| **Gradient domination** | Single outlier at 1103K has 641K error, dominates gradients |
+
+### Changes
+
+1. **Log-transform of Tc** (`tc_log_transform: True` in TRAIN_CONFIG)
+   - Applied `np.log1p(Tc)` before z-score normalization
+   - Reduces skewness from 2.18 to -0.17 (near-Gaussian)
+   - Compresses dynamic range from 1103 to 7.01 (157x)
+   - Stored in `norm_stats.json` so inference can denormalize correctly: `Tc_K = expm1(z * std + mean)`
+
+2. **Huber loss for Tc** (`tc_huber_delta: 1.0` in TRAIN_CONFIG)
+   - Replaces MSE with Huber loss (δ=1.0 in normalized space)
+   - Quadratic for small errors (|e| < 1 std), linear for large errors
+   - At |error|=10σ: 20x gradient reduction vs MSE
+   - Prevents outlier samples from hijacking encoder gradients
+
+3. **Magpie: Quantile transform for skewed features** (`magpie_skew_threshold: 3.0`)
+   - 18 of 145 Magpie features had extreme skewness (|skew| > 3), mostly zero-inflated (94-100% zeros)
+   - Z-score is meaningless for features like `minimum NfUnfilled` (100% zeros, skew=56)
+   - Applied rank-based Gaussian transform: `rank → uniform(0,1) → Φ⁻¹ → N(0,1)`
+   - Jitter (ε=1e-6, seed=42) breaks ties in zero-inflated features
+   - All 18 features now |skew| < 1.0 (most ≈ 0.00)
+   - Feature indices stored in `norm_stats.json` for inference reproducibility
+
+4. **Magpie: SC-only normalization** (`magpie_sc_only_norm: True`)
+   - Previously used all-sample (SC + non-SC) mean/std — biased by non-SC distribution
+   - Top Magpie features show significant SC/non-SC distributional shift (KS up to 0.36)
+   - Now uses SC-only stats: SC samples centered at z=0, non-SC offset (as expected)
+   - 44/145 features had mean shift > 0.1σ between SC-only and all-sample stats
+
+5. **Cache invalidation**
+   - `tc_log_transform`, `magpie_skew_threshold`, `magpie_sc_only_norm` all stored in cache metadata
+   - Changing any flag auto-invalidates the tensor cache (forces recomputation)
+
+### Backward Compatibility
+
+- `tc_log_transform: False` + `tc_huber_delta: 0.0` + `magpie_skew_threshold: 0.0` + `magpie_sc_only_norm: False` recovers exact V12.19 behavior
+- Existing checkpoints resume normally (normalization changes don't affect model weights — but the Tc/Magpie heads will see shifted inputs, so expect a few epochs of readjustment)
+- `norm_stats.json` includes all transform flags for correct inference
+
+### Files Changed
+
+| File | Change |
+|------|--------|
+| `scripts/train_v12_clean.py` | TRAIN_CONFIG flags, log1p Tc, Huber loss, quantile transform for skewed Magpie, SC-only Magpie stats, cache invalidation |
+| `src/superconductor/models/attention_vae.py` | FullMaterialsLoss updated for consistency (not used in training) |
+
+### Expected Impact
+
+- More uniform gradient signal across Tc range (low-Tc and high-Tc contribute equally)
+- Better prediction of extreme-Tc superconductors (no longer systematically underpredicted)
+- Faster convergence (no wasted gradient budget on irreducible outlier error)
+- Magpie reconstruction: skewed features no longer dominated by zero-class; network can learn the non-zero minority
+- Tc MAE may initially appear different due to log-space normalization — compare in Kelvin after denormalization
+
+---
+
+## V12.19: High-Pressure Superconductor Labeling & Prediction (2026-02-09)
+
+### Summary
+
+Added high-pressure superconductor (HP-SC) identification, labeling, and prediction to the VAE training pipeline.
+
+### Changes
+
+**New file: `scripts/label_high_pressure.py`**
+- Reads NEMAD source CSV pressure column (dropped during original preprocessing)
+- Parses free-text pressure values (GPa, kbar, MPa, ambient markers)
+- Joins with processed dataset by normalized formula
+- Supplements with known HP categories:
+  - Hydrogen-rich SC (45, already labeled category)
+  - Elemental HP-SC (Ca, Li, S, P etc. with anomalously high Tc)
+  - Fullerene HP-SC (Cs3C60 A15 phase, Tc > 33K)
+  - Nickelate HP-SC (La/Nd-Ni-O without Cu, Tc > 30K)
+- Writes `requires_high_pressure` column (0/1) to CSV
+- Generates diagnostic report at `outputs/high_pressure_labeling_report.json`
+- **Result: 116 HP labels (0.5% of SC)**: 45 hydrides, 43 NEMAD-matched, 12 elemental, 5 fullerene, 3 nickelate
+
+**Modified: `src/superconductor/models/attention_vae.py`**
+- Added `hp_head`: z(2048) -> Linear(2048,256) -> ReLU -> Linear(256,1)
+- Returns logits in `hp_pred` key (apply sigmoid for probability)
+- Backward compatible: missing keys init fresh when loading old checkpoints
+
+**Modified: `scripts/train_v12_clean.py`**
+- `TRAIN_CONFIG['hp_loss_weight']`: 0.05 (BCE with pos_weight for class imbalance)
+- `load_and_prepare_data()`: reads `requires_high_pressure`, creates 9th tensor
+- `train_epoch()`: unpacks 9 tensors, computes HP BCE loss on SC samples only
+- `log_training_metrics()`: logs `hp_loss` column to training_log.csv
+- `requires_high_pressure` excluded from Magpie feature columns
+- Cache backward compatible (defaults to 0 if hp_tensor missing)
+
+**Modified: `src/superconductor/losses/contrastive.py`**
+- Added class 12: `'High-pressure (non-hydride)': 12`
+- `category_to_label()` accepts `requires_high_pressure` parameter
+- Non-hydride HP-SC → class 12; hydride HP-SC stays class 5
+- Total: 13 contrastive classes (was 12)
+
+### HP Loss Design
+
+- Binary cross-entropy with logits on SC samples only
+- `pos_weight = n_neg / n_pos` (capped at 50x) for ~100:1 class imbalance
+- Weight: 0.05 (intentionally small — auxiliary prediction, not primary objective)
+- Non-SC samples excluded (trivially not HP)
+
+---
+
 ## Run 6: Training Resumed After NaN Fix (2026-02-03)
 
 **Status**: Running

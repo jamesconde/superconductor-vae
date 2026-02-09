@@ -127,6 +127,7 @@ def detect_environment() -> dict:
         prefetch_factor = 1
         batch_size_multiplier = 1.0
         use_torch_compile = True
+        compile_mode = None  # Use TRAIN_CONFIG default (reduce-overhead works on local)
 
     elif runtime == "colab":
         if gpu["class"] == "large":
@@ -136,7 +137,11 @@ def detect_environment() -> dict:
             persistent_workers = True
             prefetch_factor = 2
             batch_size_multiplier = 2.5
-            use_torch_compile = False
+            # V12.20: torch.compile works on Colab A100 (1.5-2x speedup).
+            # Use 'default' mode — 'reduce-overhead' has memory leak issues
+            # (pytorch/pytorch#116096, #128424).
+            use_torch_compile = True
+            compile_mode = "default"
         elif gpu["class"] in ("medium", "small") and gpu["class"] != "none":
             # T4 / V100 / L4 (14-40GB) or small Colab GPU
             num_workers = min(2, cpus - 1) if cpus > 1 else 0
@@ -144,7 +149,8 @@ def detect_environment() -> dict:
             persistent_workers = True
             prefetch_factor = 2
             batch_size_multiplier = 1.5
-            use_torch_compile = False
+            use_torch_compile = True
+            compile_mode = "default"
         else:
             # Colab CPU runtime
             num_workers = 0
@@ -153,6 +159,7 @@ def detect_environment() -> dict:
             prefetch_factor = None
             batch_size_multiplier = 0.5
             use_torch_compile = False
+            compile_mode = None
 
     elif runtime == "linux":
         if gpu["class"] in ("large", "medium") and ram_gb >= 32:
@@ -163,6 +170,7 @@ def detect_environment() -> dict:
             prefetch_factor = 2
             batch_size_multiplier = 2.5
             use_torch_compile = True
+            compile_mode = None  # Use TRAIN_CONFIG default
         else:
             # Small bare Linux or no GPU
             num_workers = min(2, cpus - 1) if cpus > 1 else 0
@@ -171,6 +179,7 @@ def detect_environment() -> dict:
             prefetch_factor = 1
             batch_size_multiplier = 1.0
             use_torch_compile = True
+            compile_mode = None
 
     else:
         # Conservative fallback (macOS, Windows native, etc.)
@@ -180,6 +189,7 @@ def detect_environment() -> dict:
         prefetch_factor = None
         batch_size_multiplier = 1.0
         use_torch_compile = False
+        compile_mode = None
 
     # prefetch_factor must be None when num_workers == 0
     if num_workers == 0:
@@ -201,6 +211,7 @@ def detect_environment() -> dict:
         "prefetch_factor": prefetch_factor,
         "batch_size_multiplier": batch_size_multiplier,
         "use_torch_compile": use_torch_compile,
+        "compile_mode": compile_mode,  # V12.20: None = use TRAIN_CONFIG, str = override
         "summary": summary,
     }
 

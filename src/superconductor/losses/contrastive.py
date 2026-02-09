@@ -98,11 +98,15 @@ SC_CATEGORY_LABELS = {
     'Hydrogen-rich Superconductors': 5,
     'Organic Superconductors': 6,
     'Other': 7,
-    # Non-superconductor categories (labels 8+)
+    # Non-superconductor categories (labels 8-11)
     'Non-SC: Materials Project': 8,
     'Non-SC: Magnetic': 9,
     'Non-SC: Thermoelectric': 10,
     'Non-SC: Anisotropy': 11,
+    # V12.19: High-pressure non-hydride SC (elemental HP, fullerene, nickelate, etc.)
+    # Hydride HP-SC stay in class 5 (Hydrogen-rich). This class covers OTHER HP-SC
+    # that are currently lumped into "Other" or their parent category.
+    'High-pressure (non-hydride)': 12,
 }
 
 # Binary label: 1=SC, 0=non-SC
@@ -110,18 +114,28 @@ SC_BINARY_LABEL = 1
 NON_SC_BINARY_LABEL = 0
 
 
-def category_to_label(category: str, use_extended: bool = True) -> int:
+def category_to_label(category: str, use_extended: bool = True,
+                      requires_high_pressure: int = 0) -> int:
     """Map a category string to an integer label for contrastive loss.
 
     Args:
         category: Category string from the CSV.
         use_extended: If True, use per-family labels. If False, binary SC/non-SC.
+        requires_high_pressure: 1 if material requires high pressure, 0 otherwise.
+            When 1 and category is NOT 'Hydrogen-rich Superconductors', overrides
+            to class 12 ('High-pressure (non-hydride)').
 
     Returns:
         Integer label.
     """
     if not use_extended:
         return NON_SC_BINARY_LABEL if category.startswith('Non-SC') else SC_BINARY_LABEL
+
+    # V12.19: HP non-hydride override — cluster non-hydride HP-SC together
+    if (requires_high_pressure == 1
+            and category != 'Hydrogen-rich Superconductors'
+            and not category.startswith('Non-SC')):
+        return SC_CATEGORY_LABELS['High-pressure (non-hydride)']
 
     if category in SC_CATEGORY_LABELS:
         return SC_CATEGORY_LABELS[category]
