@@ -319,7 +319,7 @@ MODEL_CONFIG = {
 }
 
 TRAIN_CONFIG = {
-    'num_epochs': 2000,
+    'num_epochs': 4000,
     'learning_rate': 3e-5,      # Reduced for stable fine-tuning (was 1e-4)
     'max_formula_len': 60,
     'checkpoint_interval': 50,
