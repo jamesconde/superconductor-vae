@@ -1,4 +1,4 @@
-# Contrastive Learning Design for Superconductor VAE
+# Contrastive Learning Design for Superconductor Generative Model
 
 **Date**: 2025-01-22
 **Status**: Active - Training Overnight
@@ -67,7 +67,7 @@ a distinct cluster. The `category_to_label()` function now accepts a
 
 ### Current Limitations
 
-The superconductor VAE achieves 82.4% exact match on formula reconstruction, but struggles with:
+The model achieves 82.4% exact match on formula reconstruction, but struggles with:
 
 | Issue | Evidence | Root Cause |
 |-------|----------|------------|
@@ -77,7 +77,7 @@ The superconductor VAE achieves 82.4% exact match on formula reconstruction, but
 
 ### The Core Insight
 
-The VAE has two components with different data needs:
+The model has two components with different data needs:
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
@@ -110,7 +110,7 @@ The VAE has two components with different data needs:
 
 ### 2.1 Why Contrastive Learning?
 
-When mixing SC and non-SC data, we need to prevent the latent space from becoming a generic "materials encoder." Contrastive learning provides:
+When mixing SC and non-SC data, we need to prevent the latent space from becoming a generic materials encoder. Contrastive learning provides:
 
 1. **Separation**: Push SC and non-SC representations apart
 2. **Clustering**: Pull similar SC families together (cuprates, iron-based, etc.)

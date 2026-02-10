@@ -1,11 +1,11 @@
 # Computational Efficiency and Training Benchmarks
 
-**Project**: Superconductor Formula VAE
+**Project**: Multi-Task Superconductor Generator
 **Last Updated**: January 2026
 
 ## Overview
 
-This document details the computational efficiency of training the Superconductor VAE, including hardware requirements, performance benchmarks, and comparisons to published work.
+This document details the computational efficiency of training the Multi-Task Superconductor Generator, including hardware requirements, performance benchmarks, and comparisons to published work.
 
 ## Hardware Configuration
 

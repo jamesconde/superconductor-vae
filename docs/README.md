@@ -1,6 +1,6 @@
-# Superconductor VAE Documentation
+# Multi-Task Superconductor Generator — Documentation
 
-This folder contains technical documentation for the Superconductor Formula VAE project.
+This folder contains technical documentation for the Multi-Task Superconductor Generator project.
 
 ## Documents
 

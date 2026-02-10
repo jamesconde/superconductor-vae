@@ -1,14 +1,20 @@
-# Superconductor VAE Architecture Guide
+# Multi-Task Superconductor Generator — Architecture Guide
 
-**Last updated**: 2026-02-09 (V12.20)
+**Last updated**: 2026-02-10 (V12.20)
 **Code**: `src/superconductor/models/attention_vae.py`, `src/superconductor/models/autoregressive_decoder.py`
 **Training**: `scripts/train_v12_clean.py`
+
+> **Note on naming**: The code uses class names like `FullMaterialsVAE` and `AttentionVAEEncoder`
+> from the project's origins as a Variational Autoencoder. The architecture has since evolved into
+> a **deterministic multi-task superconductor generator** — there is no stochastic sampling or KL divergence.
+> The latent space is shaped by six prediction objectives and contrastive learning, not by a
+> variational prior. Code class names are kept for backward compatibility.
 
 ---
 
 ## Overview
 
-The Superconductor VAE is a multi-task neural network that learns a compressed representation of superconducting materials. Given a material's composition, properties, and critical temperature, it encodes everything into a single 2048-dimensional vector (`z`), then uses that vector to reconstruct the original inputs and predict new properties.
+This is a **multi-task superconductor generator** — a neural network that learns a compressed representation of superconducting materials. Given a material's composition, properties, and critical temperature, it encodes everything into a single 2048-dimensional vector (`z`), then uses that vector to reconstruct the original inputs and predict new properties.
 
 The system is **two networks** trained jointly:
 
@@ -29,7 +35,7 @@ The system is **two networks** trained jointly:
     │  │ Element Encoder  │──┐                                     │
     │  │ (attention-based)│  │                                     │
     │  └─────────────────┘  │  ┌────────┐   ┌─────────────┐       │
-    │                       ├──│ Fusion │───│ VAE Encoder │───► z  │
+    │                       ├──│ Fusion │───│ Latent Enc. │───► z  │
     │  ┌─────────────────┐  │  │ (768→  │   │ (768→512→   │  2048 │
     │  │ Magpie Encoder  │──┘  │  768)  │   │  256→2048)  │  dims │
     │  │ (145→512→256)   │     └────────┘   └─────────────┘       │
@@ -148,9 +154,10 @@ Three parallel branches process different input types, each producing a 256-dim 
 - Linear(768, 768) + LayerNorm + GELU + Dropout
 - Mixes information across branches
 
-**VAE Encoder** (1.05M params)
+**Latent Encoder** (1.05M params) *(code: `AttentionVAEEncoder` with `deterministic=True`)*
 - MLP: 768 → 512 → 256 → 2048
-- Deterministic mode (no reparameterization noise): `z = fc_mean(h)`
+- Deterministic: `z = fc_mean(h)` — no sampling, no reparameterization noise
+- L2 regularization on z (not KL divergence)
 - Produces the final latent vector `z`
 
 ### Prediction Heads (from z)
@@ -200,7 +207,7 @@ Each training step:
 6. **Backward pass**: Gradients flow from all losses through z into shared encoder
 7. **Optimizer step**: One step updates the entire encoder; a separate step updates the formula decoder
 
-### What Makes This Different from a Standard VAE
+### What Makes This Architecture Distinctive
 
 - **Deterministic encoder**: No sampling noise in z. Uses L2 regularization instead of KL divergence.
 - **Multi-task heads**: Six prediction heads shape the latent space simultaneously.

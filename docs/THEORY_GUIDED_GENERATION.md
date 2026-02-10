@@ -4,7 +4,7 @@
 
 ## Overview
 
-This document describes the theory-guided consistency feedback system for the Superconductor VAE. The system incorporates physics-based constraints during training to improve generative capability.
+This document describes the theory-guided consistency feedback system for the Multi-Task Superconductor Generator. The system incorporates physics-based constraints during training to improve generative capability.
 
 ## Components
 

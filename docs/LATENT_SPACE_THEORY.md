@@ -1,6 +1,6 @@
 ﻿# Latent Space as Effective Theory: A Philosophical Argument
 
-**Project**: Superconductor Formula VAE
+**Project**: Multi-Task Superconductor Generator
 **Date**: January 2026
 **Status**: Living document — updated as theoretical understanding evolves
 

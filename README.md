@@ -1,6 +1,11 @@
-# Superconductor Formula VAE
+# Multi-Task Superconductor Generator
 
-A Variational Autoencoder for generating and discovering novel superconductor chemical formulas.
+A multi-task encoder-decoder for learning compressed representations of superconducting materials and generating novel superconductor chemical formulas.
+
+> **Note on naming**: The code uses class names like `FullMaterialsVAE` and `AttentionVAEEncoder`
+> from the project's origins as a Variational Autoencoder. The architecture has since evolved into
+> a deterministic multi-task encoder-decoder — there is no stochastic sampling or KL divergence.
+> Code class names are kept for backward compatibility.
 
 ## Vision
 
@@ -14,7 +19,7 @@ This is a stepping stone toward AI-assisted materials discovery where the model 
 
 ## Overview
 
-This project implements a VAE that learns to encode and decode superconductor chemical formulas along with their critical temperatures (Tc) and material properties:
+This project implements a multi-task encoder-decoder that learns to encode and decode superconductor chemical formulas along with their critical temperatures (Tc) and material properties:
 
 - **Pointer-Generator Decoder**: Autoregressive decoder with copy mechanism for accurate formula reconstruction
 - **Fraction-Aware Tokenization**: Handles complex stoichiometric coefficients (e.g., `Ba2Cu3O6.5`, `Ag(1/500)Al(499/500)`)
@@ -39,7 +44,7 @@ pip install -r requirements.txt
 superconductor-vae/
 ├── src/
 │   └── superconductor/
-│       ├── models/          # VAE architectures (FullMaterialsVAE, decoders)
+│       ├── models/          # Model architectures (FullMaterialsVAE, decoders)
 │       ├── encoders/        # Composition & element encoders
 │       ├── losses/          # REINFORCE, semantic, physics losses
 │       ├── training/        # Mastery sampling, KL annealing
@@ -106,7 +111,7 @@ Traditional ML evaluation uses random splits, but for chemical formulas this is 
 
 ### Our Approach: Generative Evaluation
 
-1. **Train** the VAE on all data EXCEPT the 45 holdout superconductors
+1. **Train** the model on all data EXCEPT the 45 holdout superconductors
 2. **Achieve high reconstruction** (90%+ exact formula match on training data)
 3. **Probe the latent space** by:
    - Interpolating between known superconductors
@@ -138,8 +143,8 @@ This is an active research project. Contributions welcome in:
 
 If you use this code, please cite:
 ```bibtex
-@software{superconductor_vae,
-  title = {Superconductor Formula VAE},
+@software{superconductor_generative,
+  title = {Multi-Task Superconductor Generator},
   author = {James Conde},
   year = {2025},
   url = {https://github.com/jamesconde/superconductor-vae}

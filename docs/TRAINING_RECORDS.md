@@ -1,6 +1,6 @@
 # Training Records
 
-Chronological record of training runs, architecture changes, and optimization decisions for the Superconductor VAE.
+Chronological record of training runs, architecture changes, and optimization decisions for the Multi-Task Superconductor Generator (code class names retain "VAE" for backward compatibility).
 
 ---
 
@@ -76,7 +76,7 @@ Data analysis revealed the raw Tc distribution (skewness=2.18, range 0-1103K) ca
 
 ### Summary
 
-Added high-pressure superconductor (HP-SC) identification, labeling, and prediction to the VAE training pipeline.
+Added high-pressure superconductor (HP-SC) identification, labeling, and prediction to the training pipeline.
 
 ### Changes
 
@@ -242,13 +242,13 @@ Note: Run 6 is slightly slower than Run 4's measured range due to the larger num
 
 ---
 
-## Architectural Change: VAE → Deterministic Latent Space (2026-02-02)
+## Architectural Change: Probabilistic VAE → Deterministic Encoder (2026-02-02)
 
 **Files modified**:
 - `src/superconductor/models/attention_vae.py` — `AttentionVAEEncoder` gains `deterministic=True` mode (skips `fc_logvar`, returns `None` for logvar). `FullMaterialsVAE` uses deterministic mode by default. `reparameterize()` passes through when logvar is None. KL loss replaced with L2 regularization `mean(z²)` under same `kl_loss` key.
 - `scripts/train_v12_clean.py` — Checkpoint loading uses `strict=False` to ignore old `fc_logvar` weights. Encoder optimizer restore wrapped in try/except (param count changed). Added `z_norm` metric tracking per epoch (monitors for z explosion/collapse).
 
-**Rationale**: The VAE's probabilistic sampling (reparameterization trick) adds noise to z that hinders contrastive learning and downstream deterministic tasks. Switching to deterministic coordinates means z = fc_mean(h) directly — same z for same input every time. L2 regularization replaces KL to keep z bounded without the distributional constraint.
+**Rationale**: The original probabilistic sampling (reparameterization trick) adds noise to z that hinders contrastive learning and downstream deterministic tasks. Switching to deterministic coordinates means z = fc_mean(h) directly — same z for same input every time. L2 regularization replaces KL to keep z bounded without the distributional constraint. This change effectively transitioned the architecture from a VAE to the deterministic Multi-Task Superconductor Generator it is today.
 
 **Checkpoint compatibility**: `fc_mean` weights load directly (same parameter name). Old `fc_logvar` weights silently ignored via `strict=False`. Encoder optimizer gets fresh init; decoder checkpoint loads unchanged.
 

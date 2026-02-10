@@ -1,6 +1,6 @@
 # UCSD DSMLP Deployment Guide
 
-This guide explains how to run superconductor VAE training on UCSD's Data Science/Machine Learning Platform (DSMLP).
+This guide explains how to run Multi-Task Superconductor Generator training on UCSD's Data Science/Machine Learning Platform (DSMLP).
 
 ## Quick Start
 

@@ -1827,24 +1827,23 @@ def cache_z_vectors(encoder, loader, device, epoch, cache_path, dataset_info=Non
 
                 all_generated_tokens.append(gen_tokens.cpu())
 
-                # Compute exact match
-                # Compare up to END token
-                batch_size = tokens.size(0)
-                exact_match = torch.zeros(batch_size, dtype=torch.long)
-                for i in range(batch_size):
-                    target = tokens[i, 1:]  # Skip START
-                    gen = gen_tokens[i]
+                # Compute exact match (same method as evaluate_true_autoregressive)
+                targets = tokens[:, 1:]  # Skip START token
+                gen_len = gen_tokens.size(1)
+                tgt_len = targets.size(1)
 
-                    # Find END positions
-                    target_end = (target == END_IDX).nonzero(as_tuple=True)[0]
-                    target_end = target_end[0].item() if len(target_end) > 0 else len(target)
-                    gen_end = (gen == END_IDX).nonzero(as_tuple=True)[0]
-                    gen_end = gen_end[0].item() if len(gen_end) > 0 else len(gen)
+                # Pad or truncate generated tokens to match target length
+                if gen_len < tgt_len:
+                    gen_compare = F.pad(gen_tokens, (0, tgt_len - gen_len), value=PAD_IDX)
+                elif gen_len > tgt_len:
+                    gen_compare = gen_tokens[:, :tgt_len]
+                else:
+                    gen_compare = gen_tokens
 
-                    # Compare
-                    if target_end == gen_end:
-                        if torch.equal(target[:target_end], gen[:gen_end]):
-                            exact_match[i] = 1
+                # Compare only non-PAD positions
+                mask = (targets != PAD_IDX)
+                mismatches_per_seq = ((gen_compare != targets) & mask).sum(dim=1)
+                exact_match = (mismatches_per_seq == 0).long().cpu()
 
                 all_exact_match.append(exact_match)
 
