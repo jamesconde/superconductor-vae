@@ -375,6 +375,9 @@ TRAIN_CONFIG = {
     # V12.20: Tc loss improvements (log-transform + Huber)
     'tc_log_transform': True,   # Apply log1p(Tc) before z-score normalization (reduces skew 2.18→-0.17)
     'tc_huber_delta': 1.0,      # Huber loss delta (clips gradient for outliers; 1.0 = ~1 std dev in normalized space)
+    'tc_kelvin_weighting': True,       # V12.23: Weight Tc loss by true Tc in Kelvin
+    'tc_kelvin_weight_scale': 50.0,    # weight = 1 + tc_K / scale (50 → 3x at 100K, 6x at 250K)
+    'tc_underpred_penalty': 1.5,       # V12.23: Asymmetric loss — underprediction penalized 1.5x
 
     # V12.20: Magpie normalization improvements
     'magpie_skew_threshold': 3.0,   # Features with |skew| > this get quantile-transformed to Gaussian
@@ -1334,6 +1337,12 @@ class CombinedLossWithREINFORCE(nn.Module):
         label_smoothing: float = 0.1,
         use_autoregressive_reinforce: bool = True,
         tc_huber_delta: float = 0.0,  # V12.20: 0 = MSE (backward compat), >0 = Huber
+        tc_kelvin_weighting: bool = False,    # V12.23: Weight Tc loss by true Tc in Kelvin
+        tc_kelvin_weight_scale: float = 50.0, # V12.23: weight = 1 + tc_K / scale
+        tc_underpred_penalty: float = 1.0,    # V12.23: 1.0 = symmetric (backward compat)
+        tc_mean: float = 0.0,                 # V12.23: For denormalizing Tc to Kelvin
+        tc_std: float = 1.0,                  # V12.23: For denormalizing Tc to Kelvin
+        tc_log_transform: bool = False,       # V12.23: Whether Tc is in log1p space
     ):
         super().__init__()
 
@@ -1347,6 +1356,12 @@ class CombinedLossWithREINFORCE(nn.Module):
         self.n_samples_rloo = n_samples_rloo
         self.temperature = temperature
         self.tc_huber_delta = tc_huber_delta  # V12.20
+        self.tc_kelvin_weighting = tc_kelvin_weighting        # V12.23
+        self.tc_kelvin_weight_scale = tc_kelvin_weight_scale  # V12.23
+        self.tc_underpred_penalty = tc_underpred_penalty      # V12.23
+        self.tc_mean = tc_mean                                # V12.23
+        self.tc_std = tc_std                                  # V12.23
+        self.tc_log_transform = tc_log_transform              # V12.23
 
         # V12.8: Autoregressive REINFORCE with KV caching
         self.use_autoregressive_reinforce = use_autoregressive_reinforce
@@ -1643,11 +1658,31 @@ class CombinedLossWithREINFORCE(nn.Module):
             entropy_per_position = -(probs * log_probs).sum(dim=-1)
             entropy = (entropy_per_position * mask.float()).sum(dim=1).mean()
 
-        # 4. Tc Loss (V12.20: Huber loss clips gradient from outliers)
+        # 4. Tc Loss (V12.20: Huber, V12.23: Kelvin-weighted + asymmetric)
+        tc_p = tc_pred.squeeze()
+        tc_t = tc_true.squeeze()
         if self.tc_huber_delta > 0:
-            tc_loss = F.huber_loss(tc_pred.squeeze(), tc_true.squeeze(), delta=self.tc_huber_delta)
+            tc_loss_per_sample = F.huber_loss(tc_p, tc_t, delta=self.tc_huber_delta, reduction='none')
         else:
-            tc_loss = F.mse_loss(tc_pred.squeeze(), tc_true.squeeze())
+            tc_loss_per_sample = F.mse_loss(tc_p, tc_t, reduction='none')
+
+        # V12.23: Asymmetric penalty — underprediction costs more (discovery bias)
+        if self.tc_underpred_penalty != 1.0:
+            underpred_mask = (tc_p < tc_t).float()  # 1 where model underpredicts
+            asymmetry = 1.0 + underpred_mask * (self.tc_underpred_penalty - 1.0)
+            tc_loss_per_sample = tc_loss_per_sample * asymmetry
+
+        # V12.23: Kelvin weighting — counteract log1p gradient compression
+        if self.tc_kelvin_weighting:
+            tc_denorm = tc_t * self.tc_std + self.tc_mean
+            if self.tc_log_transform:
+                tc_kelvin = torch.expm1(tc_denorm).clamp(min=0.0)
+            else:
+                tc_kelvin = tc_denorm.clamp(min=0.0)
+            tc_weights = 1.0 + tc_kelvin / self.tc_kelvin_weight_scale
+            tc_loss = (tc_loss_per_sample * tc_weights).mean()
+        else:
+            tc_loss = tc_loss_per_sample.mean()
 
         # 5. Magpie Loss
         magpie_loss = F.mse_loss(magpie_pred, magpie_true)
@@ -3172,6 +3207,12 @@ def train():
         label_smoothing=TRAIN_CONFIG['label_smoothing'],
         use_autoregressive_reinforce=TRAIN_CONFIG.get('use_autoregressive_reinforce', True),
         tc_huber_delta=TRAIN_CONFIG.get('tc_huber_delta', 0.0),  # V12.20
+        tc_kelvin_weighting=TRAIN_CONFIG.get('tc_kelvin_weighting', False),      # V12.23
+        tc_kelvin_weight_scale=TRAIN_CONFIG.get('tc_kelvin_weight_scale', 50.0), # V12.23
+        tc_underpred_penalty=TRAIN_CONFIG.get('tc_underpred_penalty', 1.0),      # V12.23
+        tc_mean=norm_stats['tc_mean'],                                           # V12.23
+        tc_std=norm_stats['tc_std'],                                             # V12.23
+        tc_log_transform=norm_stats.get('tc_log_transform', False),              # V12.23
     )
 
     # V12.9: Build or load draft model for speculative decoding
@@ -3409,6 +3450,11 @@ def train():
     print(f"  Stoich: {TRAIN_CONFIG['stoich_weight']}")
     print(f"  HP: {TRAIN_CONFIG.get('hp_loss_weight', 0)}")
     print(f"  SC: {TRAIN_CONFIG.get('sc_loss_weight', 0)}")
+    if TRAIN_CONFIG.get('tc_kelvin_weighting', False):
+        print(f"  Tc Kelvin weighting: scale={TRAIN_CONFIG['tc_kelvin_weight_scale']} "
+              f"(3x at {2*TRAIN_CONFIG['tc_kelvin_weight_scale']:.0f}K)")
+    if TRAIN_CONFIG.get('tc_underpred_penalty', 1.0) != 1.0:
+        print(f"  Tc asymmetric: underprediction penalty={TRAIN_CONFIG['tc_underpred_penalty']}x")
     if TRAIN_CONFIG.get('use_theory_loss', False):
         print(f"  Theory: {TRAIN_CONFIG.get('theory_weight', 0)} "
               f"(warmup={TRAIN_CONFIG.get('theory_warmup_epochs', 50)} epochs)")

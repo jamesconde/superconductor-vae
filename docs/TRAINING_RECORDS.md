@@ -4,6 +4,50 @@ Chronological record of training runs, architecture changes, and optimization de
 
 ---
 
+## V12.23: Tc-Weighted Asymmetric Regression Loss (2026-02-10)
+
+### Problem
+
+~79K average Kelvin error for samples with Tc > 100K. Two root causes:
+
+1. **Log1p compression kills high-Tc gradients**: A 10K error at Tc=100K produces only 0.09 loss units in log1p space vs 0.64 at Tc=10K — 7x less gradient signal for the materials we care most about.
+2. **Symmetric loss doesn't match discovery objective**: Underpredicting a cuprate at 130K as 30K is worse than overpredicting — false positives are verifiable, missed high-Tc materials are not.
+
+### Changes
+
+#### 1. Kelvin Weighting (`CombinedLossWithREINFORCE.forward()`)
+
+- Per-sample Tc loss computed with `reduction='none'`
+- True Tc denormalized back to Kelvin (handles both log1p and linear normalization)
+- Weight: `1 + tc_kelvin / scale` where `scale=50` by default
+- At 5K: weight=1.1x (minimal impact on low-Tc accuracy)
+- At 100K: weight=3x (counteracts log1p compression)
+- At 250K: weight=6x (strong signal for highest-Tc materials)
+
+#### 2. Asymmetric Penalty
+
+- Underprediction penalized 1.5x vs overprediction (flat multiplier)
+- Combined with Kelvin weighting: cuprate at 100K underpredicted → `3.0 × 1.5 = 4.5x` loss vs correctly-predicted BCS at 5K
+
+#### 3. Config
+
+```python
+'tc_kelvin_weighting': True,       # Weight Tc loss by true Tc in Kelvin
+'tc_kelvin_weight_scale': 50.0,    # weight = 1 + tc_K / scale
+'tc_underpred_penalty': 1.5,       # Asymmetric: underprediction costs 1.5x
+```
+
+All defaults are backward-compatible (weighting=False, penalty=1.0).
+
+### Expected Behavior
+
+- Tc loss value may increase initially (weighted mean > unweighted)
+- After ~50-100 epochs: Kelvin error for Tc > 100K should drop substantially from 79K
+- Low-Tc accuracy should not degrade (only 1.1x weight at 5K)
+- Model should develop slight positive bias on Tc predictions (intentional discovery preference)
+
+---
+
 ## V12.22: Theory-Guided Consistency Losses (2026-02-10)
 
 ### Overview
