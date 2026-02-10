@@ -3509,8 +3509,10 @@ def train():
         # Get curriculum weights for this epoch
         tc_weight, magpie_weight = get_curriculum_weights(epoch)
 
-        # Get adaptive teacher forcing ratio based on previous epoch's performance
-        tf_ratio = get_teacher_forcing_ratio(prev_exact)
+        # V12.22: TF locked at 1.0 — feeding wrong predictions as context trains on
+        # corrupted input distribution, slowing convergence. Modern LLMs all use TF=1.0.
+        # The 83%→55% teacher-forced vs autoregressive gap is better closed via REINFORCE.
+        tf_ratio = 1.0
 
         # V12.9: Update entropy weight and temperature from entropy manager
         if entropy_manager is not None and TRAIN_CONFIG.get('rl_weight', 0.0) > 0:
