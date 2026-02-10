@@ -2934,6 +2934,20 @@ def train():
         if env['accumulation_steps'] != old_accum:
             print(f"[env] Accumulation steps: {old_accum} -> {env['accumulation_steps']}")
 
+    # Override REINFORCE samples for large-VRAM GPUs (A100: more samples = better gradients)
+    if env.get('n_samples_rloo') is not None:
+        old_ns = TRAIN_CONFIG.get('n_samples_rloo', 2)
+        TRAIN_CONFIG['n_samples_rloo'] = env['n_samples_rloo']
+        if env['n_samples_rloo'] != old_ns:
+            print(f"[env] REINFORCE n_samples: {old_ns} -> {env['n_samples_rloo']}")
+
+    # Override selective backprop for large-VRAM GPUs (A100: all samples get full gradients)
+    if env.get('selective_backprop') is not None:
+        old_sb = TRAIN_CONFIG.get('selective_backprop', True)
+        TRAIN_CONFIG['selective_backprop'] = env['selective_backprop']
+        if env['selective_backprop'] != old_sb:
+            print(f"[env] Selective backprop: {old_sb} -> {env['selective_backprop']}")
+
     # ========================================================================
     # V12.8: Apply optimizations before model creation
     # ========================================================================

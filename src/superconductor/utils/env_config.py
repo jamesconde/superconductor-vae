@@ -131,14 +131,17 @@ def detect_environment() -> dict:
 
     elif runtime == "colab":
         if gpu["class"] == "large":
-            # A100 / H100 (38GB+) — 72% VRAM unused at default batch size.
-            # Measured: batch=157 uses ~11GB on A100-40GB, so batch=512 ≈ 30GB.
+            # A100 / H100 (38GB+)
+            # Measured: batch=504 uses ~19.4GB on A100-40GB (48%).
+            # With n_samples_rloo=4, REINFORCE pass doubles → ~30-32GB (75-80%).
             num_workers = min(8, cpus - 1) if cpus > 1 else 0
             pin_memory = True
             persistent_workers = True
             prefetch_factor = 3
-            batch_size_multiplier = 12.0  # 42 * 12 = 504 → ~30GB on A100-40GB
+            batch_size_multiplier = 12.0  # 42 * 12 = 504
             accumulation_steps = 1        # No accumulation needed with large batch
+            n_samples_rloo = 4            # 2→4: better RLOO baseline, uses ~16GB extra VRAM
+            selective_backprop = False     # All samples get full gradients (no skipping)
             # V12.20: torch.compile works on Colab A100 (1.5-2x speedup).
             # Use 'default' mode — 'reduce-overhead' has memory leak issues
             # (pytorch/pytorch#116096, #128424).
@@ -203,8 +206,10 @@ def detect_environment() -> dict:
         f"RAM: {ram_gb}GB | workers={num_workers}, pin_memory={pin_memory}"
     )
 
-    # accumulation_steps only overridden for A100+ (large batch fits in VRAM)
+    # These are only overridden for A100+ (extra VRAM available)
     _accum = locals().get('accumulation_steps', None)
+    _n_samples = locals().get('n_samples_rloo', None)
+    _sel_bp = locals().get('selective_backprop', None)
 
     config = {
         "environment": runtime,
@@ -215,7 +220,9 @@ def detect_environment() -> dict:
         "persistent_workers": persistent_workers,
         "prefetch_factor": prefetch_factor,
         "batch_size_multiplier": batch_size_multiplier,
-        "accumulation_steps": _accum,  # None = use TRAIN_CONFIG default, int = override
+        "accumulation_steps": _accum,       # None = use TRAIN_CONFIG default, int = override
+        "n_samples_rloo": _n_samples,       # None = use TRAIN_CONFIG default, int = override
+        "selective_backprop": _sel_bp,       # None = use TRAIN_CONFIG default, bool = override
         "use_torch_compile": use_torch_compile,
         "compile_mode": compile_mode,  # V12.20: None = use TRAIN_CONFIG, str = override
         "summary": summary,
