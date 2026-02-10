@@ -3416,8 +3416,8 @@ def train():
     print(f"  Phase 1 (0-{TRAIN_CONFIG['curriculum_phase1_end']}): Tc 5→10, Magpie 1→2")
     print(f"  Phase 2 ({TRAIN_CONFIG['curriculum_phase1_end']}+): Full strength")
     print(f"\nFocal Loss: gamma={TRAIN_CONFIG['focal_gamma']}, smoothing={TRAIN_CONFIG['label_smoothing']}")
-    print(f"\nTeacher Forcing: Adaptive (OPTIMIZED)")
-    print(f"  TF = 1.0 - exact_match (no floor, can reach 0)")
+    print(f"\nTeacher Forcing: Locked at 1.0")
+    print(f"  V12.22: Always use ground-truth context (no scheduled decay)")
     print(f"  V12.6: Uses 2-pass parallel approach instead of 60-pass sequential")
 
     # Resume from checkpoint if specified
