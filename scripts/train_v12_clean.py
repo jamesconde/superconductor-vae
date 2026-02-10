@@ -525,9 +525,10 @@ TRAIN_CONFIG = {
     'consistency_tc_weight': 1.0,          # Weight for Tc consistency
     'consistency_magpie_weight': 0.1,      # Weight for Magpie consistency
 
-    'use_theory_loss': False,              # Enable theory-based regularization (disabled by default)
-    'theory_weight': 0.05,                 # Weight for theory regularization
-    'theory_use_soft_constraints': True,   # Use soft (Huber) vs hard (MSE) constraints
+    'use_theory_loss': True,               # V12.22: Enable theory-based regularization
+    'theory_weight': 0.5,                  # V12.22: Strong signal (was 0.05)
+    'theory_warmup_epochs': 50,            # V12.22: Ramp up over 50 epochs
+    'theory_use_soft_constraints': True,   # V12.22: Soft quadratic penalties (no hard caps)
 
     'use_family_classifier': False,        # Train learned family classifier alongside
     'family_classifier_weight': 0.01,      # Weight for family classification loss
@@ -685,7 +686,8 @@ _shutdown_state = {
     # V12.10: Additional state for proper checkpoint saving
     'enc_opt': None, 'dec_opt': None,
     'enc_scheduler': None, 'dec_scheduler': None,
-    'prev_exact': 0, 'best_exact': 0
+    'prev_exact': 0, 'best_exact': 0,
+    'theory_loss_fn': None,  # V12.22
 }
 
 def signal_handler(signum, frame):
@@ -701,7 +703,8 @@ def signal_handler(signum, frame):
             enc_scheduler=_shutdown_state.get('enc_scheduler'),
             dec_scheduler=_shutdown_state.get('dec_scheduler'),
             prev_exact=_shutdown_state.get('prev_exact', 0),
-            best_exact=_shutdown_state.get('best_exact', 0)
+            best_exact=_shutdown_state.get('best_exact', 0),
+            theory_loss_fn=_shutdown_state.get('theory_loss_fn'),  # V12.22
         )
     sys.exit(0)
 
@@ -818,6 +821,11 @@ def _try_load_cache(csv_hash: str, max_formula_len: int):
         if hp_cache_path.exists():
             tensors['hp_tensor'] = torch.load(hp_cache_path, weights_only=True)
 
+        # V12.22: Load family tensor if available
+        family_cache_path = cache_dir / 'family_tensor.pt'
+        if family_cache_path.exists():
+            tensors['family_tensor'] = torch.load(family_cache_path, weights_only=True)
+
         norm_stats = {
             'tc_mean': meta['tc_mean'],
             'tc_std': meta['tc_std'],
@@ -933,6 +941,14 @@ def load_and_prepare_data():
         else:
             n = tensors['element_indices'].size(0)
             tensor_list.append(torch.zeros(n, dtype=torch.float32))
+
+        # V12.22: Family tensor (backward compatible — default zeros triggers recomputation)
+        if 'family_tensor' in tensors:
+            tensor_list.append(tensors['family_tensor'])
+        else:
+            # Not in cache — will be recomputed below after dataset creation
+            n = tensors['element_indices'].size(0)
+            tensor_list.append(torch.zeros(n, dtype=torch.long))
 
         dataset = TensorDataset(*tensor_list)
         train_dataset = Subset(dataset, train_indices)
@@ -1086,6 +1102,28 @@ def load_and_prepare_data():
         label_tensor = torch.tensor(label_values, dtype=torch.long)
         hp_tensor = torch.tensor(hp_values, dtype=torch.float32)  # V12.19
 
+        # V12.22: Classify SC families for theory-guided loss
+        family_classifier = RuleBasedFamilyClassifier()
+        family_values = np.zeros(len(formulas), dtype=np.int64)
+        for i, formula in enumerate(formulas):
+            if is_sc_values[i] == 1:
+                parsed = parse_fraction_formula(formula)
+                if parsed:
+                    elements = set(parsed.keys())
+                    family_values[i] = family_classifier.classify_from_elements(elements).value
+                else:
+                    family_values[i] = SuperconductorFamily.OTHER_UNKNOWN.value
+            else:
+                family_values[i] = SuperconductorFamily.NOT_SUPERCONDUCTOR.value
+        family_tensor = torch.tensor(family_values, dtype=torch.long)
+        # Print family distribution
+        from collections import Counter as _Counter
+        _fam_counts = _Counter(family_values.tolist())
+        _fam_names = {f.value: f.name for f in SuperconductorFamily}
+        print(f"  Family classification:")
+        for fam_val, count in sorted(_fam_counts.items()):
+            print(f"    {_fam_names.get(fam_val, 'UNKNOWN')}: {count}")
+
         # Get train indices (exclude holdout — matched by formula, not position)
         holdout_indices = load_holdout_indices(HOLDOUT_PATH, formulas)
         all_indices = set(range(len(formulas)))
@@ -1120,6 +1158,7 @@ def load_and_prepare_data():
                 'is_sc_tensor': is_sc_tensor,
                 'label_tensor': label_tensor,
                 'hp_tensor': hp_tensor,  # V12.19
+                'family_tensor': family_tensor,  # V12.22
             },
             norm_stats=norm_stats,
             n_magpie_cols=n_magpie_cols,
@@ -1128,11 +1167,11 @@ def load_and_prepare_data():
             max_formula_len=max_len,
         )
 
-        # Create dataset (9 tensors: 6 original + is_sc + label + hp)
+        # Create dataset (10 tensors: 6 original + is_sc + label + hp + family)
         dataset = TensorDataset(
             element_indices, element_fractions, element_mask,
             formula_tokens, tc_tensor, magpie_tensor,
-            is_sc_tensor, label_tensor, hp_tensor,
+            is_sc_tensor, label_tensor, hp_tensor, family_tensor,
         )
         train_dataset = Subset(dataset, train_indices)
 
@@ -1681,7 +1720,7 @@ CombinedLoss = CombinedLossWithREINFORCE
 
 def save_checkpoint(encoder, decoder, epoch, suffix='', entropy_manager=None,
                     enc_opt=None, dec_opt=None, enc_scheduler=None, dec_scheduler=None,
-                    prev_exact=None, best_exact=None):
+                    prev_exact=None, best_exact=None, theory_loss_fn=None):
     """Save model checkpoint with full training state for proper resumption."""
     OUTPUT_DIR.mkdir(exist_ok=True)
 
@@ -1710,6 +1749,10 @@ def save_checkpoint(encoder, decoder, epoch, suffix='', entropy_manager=None,
         checkpoint_data['scheduler_type'] = type(enc_scheduler).__name__  # V12.11: Track scheduler type
     if dec_scheduler is not None:
         checkpoint_data['dec_scheduler_state_dict'] = dec_scheduler.state_dict()
+
+    # V12.22: Save theory loss function state (learnable BCS/cuprate predictors)
+    if theory_loss_fn is not None:
+        checkpoint_data['theory_loss_fn_state_dict'] = theory_loss_fn.state_dict()
 
     # V12.10: Save training state variables
     if prev_exact is not None:
@@ -1903,14 +1946,16 @@ def cache_z_vectors(encoder, loader, device, epoch, cache_path, dataset_info=Non
 
     # Compute basic statistics
     sc_mask_cache = is_sc_values.bool()
-    tc_mae_all = (tc_pred_values - tc_values).abs().mean().item()
+    # Squeeze tc_values from [N,1] to [N] to avoid broadcast mismatch with tc_pred_values [N]
+    tc_values_flat = tc_values.squeeze(-1)
+    tc_mae_all = (tc_pred_values - tc_values_flat).abs().mean().item()
 
     # V12.21: SC-only Tc MAE (primary metric — non-SC Tc predictions are meaningless)
     tc_mae_sc = 0.0
     tc_mae_non_sc = 0.0
     tc_kelvin_breakdown = {}
     if sc_mask_cache.any():
-        sc_tc_err = (tc_pred_values[sc_mask_cache] - tc_values[sc_mask_cache]).abs()
+        sc_tc_err = (tc_pred_values[sc_mask_cache] - tc_values_flat[sc_mask_cache]).abs()
         tc_mae_sc = sc_tc_err.mean().item()
 
         # Convert to Kelvin for breakdown if norm_stats available
@@ -1919,8 +1964,11 @@ def cache_z_vectors(encoder, loader, device, epoch, cache_path, dataset_info=Non
             tc_s = dataset_info['tc_std']
             tc_log = dataset_info.get('tc_log_transform', False)
             # Denormalize: tc_norm * std + mean -> log1p space (or K)
-            sc_tc_true_denorm = tc_values[sc_mask_cache] * tc_s + tc_m
-            sc_tc_pred_denorm = tc_pred_values[sc_mask_cache] * tc_s + tc_m
+            # Squeeze to 1D — tc_values is [N,1] from TensorDataset, tc_pred_values is [N]
+            sc_tc_true_flat = tc_values[sc_mask_cache].squeeze(-1)
+            sc_tc_pred_flat = tc_pred_values[sc_mask_cache].squeeze(-1)
+            sc_tc_true_denorm = sc_tc_true_flat * tc_s + tc_m
+            sc_tc_pred_denorm = sc_tc_pred_flat * tc_s + tc_m
             if tc_log:
                 # expm1 to convert from log1p space to Kelvin
                 sc_tc_true_K = torch.expm1(sc_tc_true_denorm)
@@ -1942,7 +1990,7 @@ def cache_z_vectors(encoder, loader, device, epoch, cache_path, dataset_info=Non
             tc_kelvin_breakdown['overall_mae_K'] = tc_err_K.mean().item()
 
     if (~sc_mask_cache).any():
-        tc_mae_non_sc = (tc_pred_values[~sc_mask_cache] - tc_values[~sc_mask_cache]).abs().mean().item()
+        tc_mae_non_sc = (tc_pred_values[~sc_mask_cache] - tc_values_flat[~sc_mask_cache]).abs().mean().item()
 
     cache_data['stats'] = {
         'z_mean': z_vectors.mean(dim=0),
@@ -2013,8 +2061,9 @@ def log_training_metrics(epoch, metrics, log_path, true_eval=None):
     columns = [
         'epoch', 'exact_match', 'accuracy', 'loss', 'tc_loss', 'magpie_loss',
         'stoich_loss', 'rl_loss', 'reward', 'entropy', 'entropy_weight',
-        'z_norm', 'tf_ratio', 'contrastive_loss', 'hp_loss', 'sc_loss', 'true_exact',
-        'epoch_time', 'timestamp'
+        'z_norm', 'tf_ratio', 'contrastive_loss', 'hp_loss', 'sc_loss',
+        'theory_loss',  # V12.22
+        'true_exact', 'epoch_time', 'timestamp'
     ]
 
     # Extract values
@@ -2035,6 +2084,7 @@ def log_training_metrics(epoch, metrics, log_path, true_eval=None):
         'contrastive_loss': metrics.get('contrastive_loss', 0),
         'hp_loss': metrics.get('hp_loss', 0),
         'sc_loss': metrics.get('sc_loss', 0),
+        'theory_loss': metrics.get('theory_loss', 0),  # V12.22
         'true_exact': true_eval['true_exact_match'] if true_eval else '',
         'epoch_time': metrics.get('epoch_time', 0),
         'timestamp': datetime.datetime.now().isoformat(),
@@ -2068,7 +2118,8 @@ def _strip_compiled_prefix(state_dict):
 
 
 def load_checkpoint(encoder, decoder, checkpoint_path, entropy_manager=None,
-                    enc_opt=None, dec_opt=None, enc_scheduler=None, dec_scheduler=None):
+                    enc_opt=None, dec_opt=None, enc_scheduler=None, dec_scheduler=None,
+                    theory_loss_fn=None):
     """Load model checkpoint with full training state for proper resumption.
 
     Returns:
@@ -2125,6 +2176,16 @@ def load_checkpoint(encoder, decoder, checkpoint_path, entropy_manager=None,
     if entropy_manager is not None and 'entropy_manager_state' in checkpoint:
         entropy_manager.load_state(checkpoint['entropy_manager_state'])
         print(f"  Restored entropy manager state", flush=True)
+
+    # V12.22: Load theory loss function state if available
+    if theory_loss_fn is not None and 'theory_loss_fn_state_dict' in checkpoint:
+        try:
+            theory_loss_fn.load_state_dict(checkpoint['theory_loss_fn_state_dict'])
+            print(f"  Restored theory loss function state (BCS/cuprate predictors)", flush=True)
+        except (RuntimeError, KeyError) as e:
+            print(f"  [Checkpoint] Theory loss state incompatible, starting fresh: {e}", flush=True)
+    elif theory_loss_fn is not None:
+        print(f"  [Checkpoint] No theory_loss_fn state in checkpoint — starting fresh", flush=True)
 
     # V12.10: Load optimizer state if available
     # Encoder optimizer may fail to restore if parameter count changed (e.g., fc_logvar removed)
@@ -2548,7 +2609,8 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
                 focal_loss_fn=None, amp_dtype=torch.float16, accumulation_steps=1,
                 contrastive_loss_fn=None, contrastive_weight=0.0, non_sc_formula_weight=0.5,
                 selective_backprop=False, selective_backprop_threshold=0.33,
-                enable_timing=True, hp_loss_weight=0.0, sc_loss_weight=0.0):
+                enable_timing=True, hp_loss_weight=0.0, sc_loss_weight=0.0,
+                theory_loss_fn=None, theory_weight=0.0, norm_stats=None):
     """Train for one epoch with curriculum weights and teacher forcing.
 
     V12.8: Added amp_dtype for configurable mixed precision (bfloat16/float16)
@@ -2559,6 +2621,7 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
     V12.15: Added enable_timing for compute/time profiling
     V12.19: Added hp_loss_weight for high-pressure prediction head
     V12.21: Added sc_loss_weight for SC/non-SC classification head
+    V12.22: Added theory_loss_fn, theory_weight, norm_stats for theory-guided consistency
     """
     global _timing_stats
 
@@ -2584,6 +2647,7 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
     total_contrastive = 0
     total_hp_loss = 0  # V12.19
     total_sc_loss = 0  # V12.21
+    total_theory_loss = 0  # V12.22
     total_sc_exact = 0
     total_non_sc_exact = 0
     total_spec_accept = 0  # V12.9: Speculative decoding acceptance rate
@@ -2611,10 +2675,11 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
         if timing:
             timing.stop('data_load')
 
-        # V12.19: Unpack 9 tensors (6 original + is_sc + label + hp)
+        # V12.22: Unpack 10 tensors (6 original + is_sc + label + hp + family)
         batch_tensors = [b.to(device) for b in batch]
         elem_idx, elem_frac, elem_mask, tokens, tc, magpie, is_sc, labels = batch_tensors[:8]
         hp_labels = batch_tensors[8] if len(batch_tensors) > 8 else torch.zeros_like(is_sc, dtype=torch.float32)
+        family_labels = batch_tensors[9] if len(batch_tensors) > 9 else None
 
         sc_mask = is_sc.bool()  # True = superconductor
 
@@ -2702,6 +2767,21 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
                         sc_pred, is_sc.float(),
                     )
 
+            # V12.22: Theory-guided consistency loss (SC samples only)
+            theory_loss_val = torch.tensor(0.0, device=device)
+            if theory_loss_fn is not None and theory_weight > 0 and sc_mask.any():
+                theory_result = theory_loss_fn(
+                    formula_tokens=tokens[sc_mask],
+                    predicted_tc=tc_pred[sc_mask],
+                    magpie_features=magpie[sc_mask],
+                    families=family_labels[sc_mask] if family_labels is not None else None,
+                    element_fractions=elem_frac[sc_mask],
+                    tc_is_normalized=True,
+                    tc_mean=norm_stats['tc_mean'] if norm_stats else 32.0,
+                    tc_std=norm_stats['tc_std'] if norm_stats else 35.0,
+                )
+                theory_loss_val = theory_result['total']
+
             # V12.15: Time loss computation (includes REINFORCE sampling)
             if timing:
                 timing.start('loss_compute')
@@ -2729,7 +2809,8 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
                 )
                 loss = (loss_dict['total'] + contrastive_weight * contrastive_loss_val
                         + hp_loss_weight * hp_loss_val
-                        + sc_loss_weight * sc_loss_val)
+                        + sc_loss_weight * sc_loss_val
+                        + theory_weight * theory_loss_val)  # V12.22
 
             elif (~sc_mask).all():
                 # Pure non-SC batch — formula loss only (lower weight), no Tc/Magpie/REINFORCE
@@ -2753,7 +2834,8 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
                 )
                 # Scale formula loss by non_sc_formula_weight
                 loss = (non_sc_formula_weight * loss_dict['total'] + contrastive_weight * contrastive_loss_val
-                        + sc_loss_weight * sc_loss_val)
+                        + sc_loss_weight * sc_loss_val
+                        + theory_weight * theory_loss_val)  # V12.22
 
             else:
                 # Mixed batch — compute SC and non-SC losses separately
@@ -2809,7 +2891,8 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
                         non_sc_frac * non_sc_formula_weight * non_sc_loss_dict['total'] +
                         contrastive_weight * contrastive_loss_val +
                         hp_loss_weight * hp_loss_val +
-                        sc_loss_weight * sc_loss_val)
+                        sc_loss_weight * sc_loss_val +
+                        theory_weight * theory_loss_val)  # V12.22
 
         # V12.15: Stop loss computation timing
         if timing:
@@ -2866,8 +2949,11 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
                 scaler.unscale_(enc_opt)
                 scaler.unscale_(dec_opt)
 
-                # Gradient clipping
-                enc_grad_norm = torch.nn.utils.clip_grad_norm_(encoder.parameters(), 1.0)
+                # Gradient clipping (V12.22: include theory loss params in encoder clip)
+                _enc_params = list(encoder.parameters())
+                if theory_loss_fn is not None:
+                    _enc_params = _enc_params + list(theory_loss_fn.parameters())
+                enc_grad_norm = torch.nn.utils.clip_grad_norm_(_enc_params, 1.0)
                 dec_grad_norm = torch.nn.utils.clip_grad_norm_(decoder.parameters(), 1.0)
 
                 # V12.14: NaN gradient guard — skip optimizer step if gradients are NaN/Inf
@@ -2906,6 +2992,7 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
         total_contrastive += contrastive_loss_val.item() if torch.is_tensor(contrastive_loss_val) else contrastive_loss_val
         total_hp_loss += hp_loss_val.item() if torch.is_tensor(hp_loss_val) else hp_loss_val
         total_sc_loss += sc_loss_val.item() if torch.is_tensor(sc_loss_val) else sc_loss_val  # V12.21
+        total_theory_loss += theory_loss_val.item() if torch.is_tensor(theory_loss_val) else theory_loss_val  # V12.22
         z_norm_val = z.detach().float().norm(dim=1).mean().item()
         if not math.isnan(z_norm_val):
             total_z_norm += z_norm_val
@@ -2949,8 +3036,8 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
             'loss': float('nan'), 'accuracy': 0, 'exact_match': 0,
             'tc_loss': 0, 'magpie_loss': 0, 'stoich_loss': 0,
             'reinforce_loss': 0, 'mean_reward': 0, 'entropy': 0,
-            'contrastive_loss': 0, 'hp_loss': 0, 'sc_loss': 0, 'z_norm': 0,
-            'n_skipped': n_skipped, 'n_total_batches': 0,
+            'contrastive_loss': 0, 'hp_loss': 0, 'sc_loss': 0, 'theory_loss': 0,
+            'z_norm': 0, 'n_skipped': n_skipped, 'n_total_batches': 0,
         }
 
     results = {
@@ -2966,6 +3053,7 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
         'contrastive_loss': total_contrastive / n_batches,
         'hp_loss': total_hp_loss / n_batches,  # V12.19
         'sc_loss': total_sc_loss / n_batches,  # V12.21
+        'theory_loss': total_theory_loss / n_batches,  # V12.22
         'z_norm': total_z_norm / n_batches,
         'n_skipped': n_skipped,  # V12.12: Selective backprop skips
         'n_total_batches': n_batches,
@@ -3158,11 +3246,15 @@ def train():
         theory_config = TheoryLossConfig(
             theory_weight=TRAIN_CONFIG.get('theory_weight', 0.05),
             use_soft_constraints=TRAIN_CONFIG.get('theory_use_soft_constraints', True),
+            tc_log_transform=TRAIN_CONFIG.get('tc_log_transform', False),  # V12.22
         )
         theory_loss_fn = TheoryRegularizationLoss(config=theory_config).to(device)
         family_classifier = RuleBasedFamilyClassifier()
+        n_theory_params = sum(p.numel() for p in theory_loss_fn.parameters())
         print(f"Theory Loss: Enabled (weight={TRAIN_CONFIG['theory_weight']}, "
-              f"soft_constraints={TRAIN_CONFIG.get('theory_use_soft_constraints', True)})")
+              f"soft_constraints={TRAIN_CONFIG.get('theory_use_soft_constraints', True)}, "
+              f"warmup={TRAIN_CONFIG.get('theory_warmup_epochs', 50)} epochs, "
+              f"params={n_theory_params:,})")
 
     # V12.9: Initialize entropy manager for REINFORCE (prevents entropy collapse)
     entropy_manager = None
@@ -3200,7 +3292,14 @@ def train():
         ignore_index=PAD_IDX
     )
 
-    enc_opt = torch.optim.AdamW(encoder.parameters(), lr=TRAIN_CONFIG['learning_rate'])
+    # V12.22: Include theory loss learnable params (BCS predictors, cuprate predictors)
+    # in encoder optimizer so they receive gradients during training
+    import itertools as _itertools
+    if theory_loss_fn is not None:
+        enc_params = list(_itertools.chain(encoder.parameters(), theory_loss_fn.parameters()))
+    else:
+        enc_params = list(encoder.parameters())
+    enc_opt = torch.optim.AdamW(enc_params, lr=TRAIN_CONFIG['learning_rate'])
     dec_opt = torch.optim.AdamW(decoder.parameters(), lr=TRAIN_CONFIG['learning_rate'])
 
     # V12.8: Learning rate schedulers (configurable)
@@ -3252,6 +3351,7 @@ def train():
     _shutdown_state['dec_opt'] = dec_opt
     _shutdown_state['enc_scheduler'] = enc_scheduler
     _shutdown_state['dec_scheduler'] = dec_scheduler
+    _shutdown_state['theory_loss_fn'] = theory_loss_fn  # V12.22
 
     # V12.8: AMP dtype configuration with auto-detection
     # bfloat16 requires compute capability 8.0+ (Ampere: RTX 30xx, A100, etc.)
@@ -3309,6 +3409,9 @@ def train():
     print(f"  Stoich: {TRAIN_CONFIG['stoich_weight']}")
     print(f"  HP: {TRAIN_CONFIG.get('hp_loss_weight', 0)}")
     print(f"  SC: {TRAIN_CONFIG.get('sc_loss_weight', 0)}")
+    if TRAIN_CONFIG.get('use_theory_loss', False):
+        print(f"  Theory: {TRAIN_CONFIG.get('theory_weight', 0)} "
+              f"(warmup={TRAIN_CONFIG.get('theory_warmup_epochs', 50)} epochs)")
     print(f"\nCurriculum:")
     print(f"  Phase 1 (0-{TRAIN_CONFIG['curriculum_phase1_end']}): Tc 5→10, Magpie 1→2")
     print(f"  Phase 2 ({TRAIN_CONFIG['curriculum_phase1_end']}+): Full strength")
@@ -3332,7 +3435,8 @@ def train():
                 encoder, decoder, checkpoint_path,
                 entropy_manager=entropy_manager,
                 enc_opt=enc_opt, dec_opt=dec_opt,
-                enc_scheduler=enc_scheduler, dec_scheduler=dec_scheduler
+                enc_scheduler=enc_scheduler, dec_scheduler=dec_scheduler,
+                theory_loss_fn=theory_loss_fn,  # V12.22
             )
             start_epoch = resume_state['start_epoch']
             prev_exact = resume_state['prev_exact']
@@ -3425,6 +3529,13 @@ def train():
             warmup_progress = min(1.0, epoch / max(warmup_epochs, 1))
             effective_contrastive_weight = TRAIN_CONFIG['contrastive_weight'] * warmup_progress
 
+        # V12.22: Compute theory weight with warmup (like contrastive warmup)
+        effective_theory_weight = 0.0
+        if theory_loss_fn is not None:
+            theory_warmup = TRAIN_CONFIG.get('theory_warmup_epochs', 50)
+            theory_warmup_prog = min(1.0, epoch / max(theory_warmup, 1))
+            effective_theory_weight = TRAIN_CONFIG['theory_weight'] * theory_warmup_prog
+
         metrics = train_epoch(
             encoder, decoder, train_loader, loss_fn,
             enc_opt, dec_opt, scaler, device, TRAIN_CONFIG['use_amp'],
@@ -3445,6 +3556,10 @@ def train():
             hp_loss_weight=TRAIN_CONFIG.get('hp_loss_weight', 0.0),
             # V12.21: SC/non-SC classification
             sc_loss_weight=TRAIN_CONFIG.get('sc_loss_weight', 0.0),
+            # V12.22: Theory-guided consistency
+            theory_loss_fn=theory_loss_fn,
+            theory_weight=effective_theory_weight,
+            norm_stats=norm_stats,
         )
 
         # V12.11: Catastrophic drop detection - rollback to best checkpoint and halve LR
@@ -3471,7 +3586,8 @@ def train():
                                entropy_manager=entropy_manager,
                                enc_opt=enc_opt, dec_opt=dec_opt,
                                enc_scheduler=enc_scheduler, dec_scheduler=dec_scheduler,
-                               prev_exact=prev_exact, best_exact=best_exact)
+                               prev_exact=prev_exact, best_exact=best_exact,
+                               theory_loss_fn=theory_loss_fn)
                 raise RuntimeError(f"Training stopped: {max_rollbacks} consecutive rollbacks detected. "
                                    f"Check data, model architecture, or hyperparameters.")
 
@@ -3554,6 +3670,10 @@ def train():
         if TRAIN_CONFIG.get('sc_loss_weight', 0) > 0 and metrics.get('sc_loss', 0) > 0:
             base_msg += f" | SCL: {metrics['sc_loss']:.4f}"
 
+        # V12.22: Show theory loss if enabled
+        if theory_loss_fn is not None and metrics.get('theory_loss', 0) > 0:
+            base_msg += f" | Thry: {metrics['theory_loss']:.4f} (w={effective_theory_weight:.3f})"
+
         # V12.12: Show selective backprop stats
         if metrics.get('n_skipped', 0) > 0 and metrics.get('n_total_batches', 0) > 0:
             skip_pct = metrics['n_skipped'] / metrics['n_total_batches'] * 100
@@ -3605,7 +3725,8 @@ def train():
             entropy_manager=entropy_manager,
             enc_opt=enc_opt, dec_opt=dec_opt,
             enc_scheduler=enc_scheduler, dec_scheduler=dec_scheduler,
-            prev_exact=metrics['exact_match'], best_exact=best_exact
+            prev_exact=metrics['exact_match'], best_exact=best_exact,
+            theory_loss_fn=theory_loss_fn,  # V12.22
         )
 
         if metrics['exact_match'] > best_exact:

@@ -5,7 +5,7 @@ These losses incorporate known physical relationships from superconductivity
 theory to regularize the generative model:
 
 - BCS Theory: Tc scaling with Debye temperature, isotope effect
-- Cuprate Theory: Tc-doping dome relationship
+- Cuprate Theory: Tc-doping dome relationship (learnable doping/Tc_max predictors)
 - Iron-based: Multi-band considerations
 - Unknown/Other: No constraints (graceful fallback)
 
@@ -15,6 +15,9 @@ the model generate physically plausible materials.
 
 IMPORTANT: Unknown/Other category applies NO theory constraints. This is
 intentional - we don't want to force incorrect physics on novel materials.
+
+V12.22: Added tc_log_transform support, soft quadratic penalties (no hard caps),
+        learnable cuprate doping/Tc_max predictors from Magpie features.
 
 February 2026
 """
@@ -39,6 +42,9 @@ class TheoryLossConfig:
 
     # Overall weight for theory regularization
     theory_weight: float = 0.05
+
+    # V12.22: Whether Tc was log1p-transformed before normalization
+    tc_log_transform: bool = False
 
     # BCS theory parameters (McMillan formula)
     # Tc = (θ_D/1.45) × exp(-1.04(1+λ)/(λ - μ*(1+0.62λ)))
@@ -66,6 +72,39 @@ class TheoryLossConfig:
     skip_unknown: bool = True
 
 
+def _denormalize_tc(
+    predicted_tc: torch.Tensor,
+    tc_is_normalized: bool,
+    tc_mean: float,
+    tc_std: float,
+    tc_log_transform: bool,
+) -> torch.Tensor:
+    """
+    Denormalize predicted Tc back to Kelvin.
+
+    V12.22: Correctly handles log1p transform (V12.20+).
+    When tc_log_transform=True, the pipeline is:
+        Tc_K → log1p(Tc_K) → (log_tc - mean) / std = normalized
+    So to reverse: expm1(normalized * std + mean) = Tc_K
+
+    Clamps to [0, 500K] as numerical guard (not a physics cap —
+    prevents float overflow in penalty computation).
+    """
+    if tc_is_normalized:
+        tc_unnorm = predicted_tc * tc_std + tc_mean
+        if tc_log_transform:
+            # Undo log1p: Tc_K = expm1(log_tc)
+            tc = torch.expm1(tc_unnorm)
+        else:
+            tc = tc_unnorm
+    else:
+        tc = predicted_tc
+
+    # Numerical guard — prevents overflow in downstream penalty math
+    tc = tc.clamp(min=0.0, max=500.0)
+    return tc
+
+
 class BCSTheoryLoss(nn.Module):
     """
     Regularization based on BCS theory predictions.
@@ -80,6 +119,9 @@ class BCSTheoryLoss(nn.Module):
 
     For typical BCS materials: Tc < 40K (practical upper limit)
     Reference: McMillan, Phys. Rev. 167, 331 (1968)
+
+    V12.22: Soft quadratic penalty replaces hard cap. Model is free to predict
+    Tc > 40K for BCS materials but gets a massive error signal.
 
     We use Magpie features as proxies for θ_D and λ.
     """
@@ -161,11 +203,11 @@ class BCSTheoryLoss(nn.Module):
         Uses McMillan formula to predict expected Tc from Magpie features,
         then penalizes deviations from the predicted Tc.
         """
-        # Denormalize Tc if needed
-        if tc_is_normalized:
-            tc = predicted_tc * tc_std + tc_mean
-        else:
-            tc = predicted_tc
+        # V12.22: Denormalize Tc correctly (handles log-transform)
+        tc = _denormalize_tc(
+            predicted_tc, tc_is_normalized, tc_mean, tc_std,
+            self.config.tc_log_transform,
+        )
 
         # Predict BCS parameters from Magpie features
         # Debye temp: output is in units of 100K, typical range 100-500K
@@ -183,8 +225,12 @@ class BCSTheoryLoss(nn.Module):
         tc_mcmillan_safe = tc_mcmillan.clamp(min=0.1)
         relative_error = (tc_safe - tc_mcmillan_safe).abs() / tc_mcmillan_safe
 
-        # BCS constraint 2: Hard upper limit on Tc (no BCS material > 40K)
-        tc_upper_violation = F.relu(tc - self.config.bcs_max_tc)
+        # V12.22: BCS constraint 2: Soft quadratic penalty (replaces hard cap)
+        # Model is FREE to predict Tc > 40K but gets a massive error signal.
+        # BCS at 100K: softplus(60, beta=0.5)^2 ≈ 3600 (vs old F.relu penalty of 60)
+        deviation = tc - self.config.bcs_max_tc
+        soft_violation = F.softplus(deviation, beta=0.5)
+        tc_upper_penalty = soft_violation ** 2
 
         # Combined loss
         if self.config.use_soft_constraints:
@@ -196,14 +242,14 @@ class BCSTheoryLoss(nn.Module):
         else:
             mcmillan_loss = relative_error.mean()
 
-        loss = mcmillan_loss + tc_upper_violation.mean()
+        loss = mcmillan_loss + tc_upper_penalty.mean()
 
         return {
             'bcs_loss': loss * self.config.theory_weight,
             'theta_d': theta_d.mean(),
             'lambda_ep': lambda_ep.mean(),
             'tc_mcmillan': tc_mcmillan.mean(),
-            'tc_upper_violation': tc_upper_violation.mean(),
+            'tc_upper_violation': tc_upper_penalty.mean(),
         }
 
 
@@ -222,37 +268,49 @@ class CuprateTheoryLoss(nn.Module):
     This parabolic "dome" is a universal feature of cuprate superconductors.
     Reference: Presland et al., Physica C 176 (1991) 95-105
 
-    We extract doping level from element fractions and apply the dome constraint.
+    V12.22: Learnable doping and Tc_max predictors from Magpie features replace
+    the constant stub (0.15). ~22,850 new learnable params.
     """
 
     def __init__(self, config: Optional[TheoryLossConfig] = None):
         super().__init__()
         self.config = config or TheoryLossConfig()
 
-    def extract_doping_level(
-        self,
-        formula_tokens: torch.Tensor,
-        element_fractions: Optional[torch.Tensor] = None,
-        token_to_idx: Optional[Dict[str, int]] = None,
-    ) -> torch.Tensor:
-        """
-        Extract doping level from formula.
+        # V12.22: Learnable doping predictor from Magpie features
+        # Predicts hole doping level p from composition features
+        # Output scaled to [0.05, 0.27] (physical range for cuprates)
+        self.doping_predictor = nn.Sequential(
+            nn.Linear(145, 64),
+            nn.ReLU(),
+            nn.Linear(64, 32),
+            nn.ReLU(),
+            nn.Linear(32, 1),
+            nn.Sigmoid(),  # Output [0, 1], scaled below
+        )
 
-        For La2-xSrxCuO4: doping = Sr fraction
-        For YBa2Cu3O7-δ: doping related to O stoichiometry
+        # V12.22: Learnable Tc_max predictor from Magpie features
+        # Predicts family-specific maximum Tc (varies by cuprate sub-family)
+        # Output scaled to [30, 165K] (LSCO ~40K, Hg-cuprate ~165K)
+        self.tc_max_predictor = nn.Sequential(
+            nn.Linear(145, 64),
+            nn.ReLU(),
+            nn.Linear(64, 32),
+            nn.ReLU(),
+            nn.Linear(32, 1),
+            nn.Softplus(),  # Positive output, scaled below
+        )
 
-        This is a simplified extraction - real doping is more complex.
-        """
-        # Placeholder: return a learnable estimate
-        # In practice, this should parse the formula and extract dopant fraction
-        batch_size = formula_tokens.size(0)
-        device = formula_tokens.device
+        self._init_weights()
 
-        # Return uniform doping estimate (to be improved)
-        # TODO: Implement proper doping extraction from fraction format
-        return torch.full((batch_size,), 0.15, device=device)
+    def _init_weights(self):
+        """Initialize with physics-inspired weights."""
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_normal_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
 
-    def dome_function(self, doping: torch.Tensor) -> torch.Tensor:
+    def dome_function(self, doping: torch.Tensor, tc_max: torch.Tensor) -> torch.Tensor:
         """
         Compute expected Tc from doping using Presland formula.
 
@@ -263,13 +321,13 @@ class CuprateTheoryLoss(nn.Module):
 
         Args:
             doping: Hole doping level p (typically 0.05-0.27)
+            tc_max: Maximum Tc for the material [batch] or scalar
 
         Returns:
             Expected Tc in Kelvin, clamped to [0, Tc_max]
         """
         p_opt = self.config.cuprate_optimal_doping  # 0.16
         coeff = self.config.cuprate_dome_coefficient  # 82.6
-        tc_max = self.config.cuprate_max_tc
 
         # Presland formula: Tc/Tc_max = 1 - 82.6(p - 0.16)²
         deviation = doping - p_opt
@@ -286,29 +344,48 @@ class CuprateTheoryLoss(nn.Module):
         tc_is_normalized: bool = True,
         tc_mean: float = 32.0,
         tc_std: float = 35.0,
+        magpie_features: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         """
         Compute cuprate theory regularization loss.
 
+        V12.22: Accepts magpie_features to feed learnable doping/Tc_max predictors.
+        Falls back to constants if magpie_features not provided.
+
         Args:
             formula_tokens: [batch, seq_len] token indices
             predicted_tc: Predicted Tc
-            element_fractions: Optional element fractions for doping extraction
+            element_fractions: Optional element fractions
+            magpie_features: [batch, 145] Magpie features for learnable predictors
 
         Returns:
-            Dict with 'cuprate_loss', 'doping_level', 'expected_tc'
+            Dict with 'cuprate_loss', 'doping_level', 'tc_max_predicted', 'expected_tc'
         """
-        # Denormalize Tc
-        if tc_is_normalized:
-            tc = predicted_tc * tc_std + tc_mean
-        else:
-            tc = predicted_tc
+        # V12.22: Denormalize Tc correctly (handles log-transform)
+        tc = _denormalize_tc(
+            predicted_tc, tc_is_normalized, tc_mean, tc_std,
+            self.config.tc_log_transform,
+        )
 
-        # Extract doping level
-        doping = self.extract_doping_level(formula_tokens, element_fractions)
+        batch_size = formula_tokens.size(0)
+        device = formula_tokens.device
+
+        # V12.22: Use learnable predictors if Magpie features available
+        if magpie_features is not None:
+            # Doping: sigmoid output [0,1] → scaled to [0.05, 0.27]
+            doping_raw = self.doping_predictor(magpie_features).squeeze(-1)
+            doping = doping_raw * 0.22 + 0.05  # [0.05, 0.27]
+
+            # Tc_max: softplus output → scaled to [30, 165K]
+            tc_max_raw = self.tc_max_predictor(magpie_features).squeeze(-1)
+            tc_max = tc_max_raw.clamp(max=3.0) * 45.0 + 30.0  # clamp softplus, scale to [30, 165]
+        else:
+            # Fallback to constants (backward compat)
+            doping = torch.full((batch_size,), 0.15, device=device)
+            tc_max = torch.full((batch_size,), self.config.cuprate_max_tc, device=device)
 
         # Compute expected Tc from dome
-        expected_tc = self.dome_function(doping)
+        expected_tc = self.dome_function(doping, tc_max)
 
         # Loss: penalize deviation from dome
         if self.config.use_soft_constraints:
@@ -319,6 +396,7 @@ class CuprateTheoryLoss(nn.Module):
         return {
             'cuprate_loss': loss * self.config.theory_weight,
             'doping_level': doping.mean(),
+            'tc_max_predicted': tc_max.mean(),
             'expected_tc': expected_tc.mean(),
         }
 
@@ -331,6 +409,8 @@ class IronBasedTheoryLoss(nn.Module):
     1. Multi-band superconductivity
     2. Tc depends on pnictogen/chalcogen height
     3. Tc typically < 60K
+
+    V12.22: Soft quadratic penalty replaces hard cap.
     """
 
     def __init__(self, config: Optional[TheoryLossConfig] = None):
@@ -348,21 +428,24 @@ class IronBasedTheoryLoss(nn.Module):
         """
         Compute iron-based theory regularization loss.
 
-        Currently implements simple Tc upper bound.
+        Currently implements soft Tc upper bound.
         TODO: Add pnictogen height relationship.
         """
-        # Denormalize Tc
-        if tc_is_normalized:
-            tc = predicted_tc * tc_std + tc_mean
-        else:
-            tc = predicted_tc
+        # V12.22: Denormalize Tc correctly (handles log-transform)
+        tc = _denormalize_tc(
+            predicted_tc, tc_is_normalized, tc_mean, tc_std,
+            self.config.tc_log_transform,
+        )
 
-        # Iron-based Tc upper limit
-        tc_violation = F.relu(tc - self.config.iron_max_tc)
+        # V12.22: Soft quadratic penalty (replaces hard cap F.relu)
+        # Iron-based at 100K: softplus(40, beta=0.5)^2 ≈ 1600
+        deviation = tc - self.config.iron_max_tc
+        soft_violation = F.softplus(deviation, beta=0.5)
+        tc_upper_penalty = soft_violation ** 2
 
         return {
-            'iron_based_loss': tc_violation.mean() * self.config.theory_weight,
-            'tc_upper_violation': tc_violation.mean(),
+            'iron_based_loss': tc_upper_penalty.mean() * self.config.theory_weight,
+            'tc_upper_violation': tc_upper_penalty.mean(),
         }
 
 
@@ -414,6 +497,8 @@ class TheoryRegularizationLoss(nn.Module):
 
     Automatically selects the appropriate theory-based loss based on
     the superconductor family classification.
+
+    V12.22: Passes magpie_features to cuprate loss for learnable predictors.
 
     Usage:
         theory_loss = TheoryRegularizationLoss(config)
@@ -544,11 +629,13 @@ class TheoryRegularizationLoss(nn.Module):
             total_loss = total_loss + bcs_result['bcs_loss'] * bcs_mask.sum()
 
         if cuprate_mask.any():
+            # V12.22: Pass magpie_features for learnable doping/Tc_max predictors
             cuprate_result = self.cuprate_loss(
                 formula_tokens[cuprate_mask],
                 predicted_tc[cuprate_mask],
                 element_fractions[cuprate_mask] if element_fractions is not None else None,
                 tc_is_normalized, tc_mean, tc_std,
+                magpie_features=magpie_features[cuprate_mask],
             )
             family_losses['cuprate'] = cuprate_result['cuprate_loss']
             total_loss = total_loss + cuprate_result['cuprate_loss'] * cuprate_mask.sum()

@@ -4,6 +4,88 @@ Chronological record of training runs, architecture changes, and optimization de
 
 ---
 
+## V12.22: Theory-Guided Consistency Losses (2026-02-10)
+
+### Overview
+
+Enables physics-based theory losses (BCS McMillan formula, cuprate Presland dome, iron-based constraints) that were fully implemented in `theory_losses.py` and `family_classifier.py` but completely disconnected from training (`use_theory_loss: False`, `theory_loss_fn` never passed to `train_epoch()`).
+
+**Philosophy**: No hard Tc caps. If the model predicts something "impossible," we see it. Instead, massively increase the error signal via soft quadratic penalties. Let the network learn Debye temperature and electron-phonon coupling predictors from Magpie features.
+
+### Changes
+
+#### 1. Theory Loss Physics Fixes (`theory_losses.py`)
+
+- **Fixed Tc denormalization for log-transform** (V12.20 broke theory losses silently):
+  - Old: `tc = predicted_tc * tc_std + tc_mean` (wrong when `tc_log_transform=True`)
+  - New: `tc = expm1(predicted_tc * tc_std + tc_mean)` via shared `_denormalize_tc()` helper
+  - Clamp to [0, 500K] as numerical guard (not a physics cap)
+
+- **Replaced hard caps with soft quadratic penalties**:
+  - BCS: `F.relu(tc - 40)` → `F.softplus(tc - 40, beta=0.5) ** 2`
+  - Iron-based: `F.relu(tc - 60)` → `F.softplus(tc - 60, beta=0.5) ** 2`
+  - BCS material at 100K: penalty ~3600 (vs old 60). Signal is massive but model is free to predict it.
+
+- **Added learnable cuprate doping/Tc_max predictors** (~22,850 new params):
+  - `doping_predictor`: Magpie(145) → 64 → 32 → 1 → Sigmoid, scaled to [0.05, 0.27]
+  - `tc_max_predictor`: Magpie(145) → 64 → 32 → 1 → Softplus, scaled to [30, 165K]
+  - Replaces constant stub `extract_doping_level()` (always returned 0.15)
+  - Presland dome constrains: Tc = Tc_max * [1 - 82.6(p - 0.16)^2]
+
+- **Added `tc_log_transform` to `TheoryLossConfig`**
+
+#### 2. Pre-computed Family Labels (`train_v12_clean.py`)
+
+- Each formula classified during data loading using `RuleBasedFamilyClassifier.classify_from_elements()`
+- SC samples → one of 14 `SuperconductorFamily` values; non-SC → `NOT_SUPERCONDUCTOR (0)`
+- Stored as 10th tensor in `TensorDataset` (backward compatible — defaults to zeros if missing in cache)
+- Family distribution printed during loading
+
+#### 3. Training Loop Integration (`train_v12_clean.py`)
+
+- `train_epoch()` accepts `theory_loss_fn`, `theory_weight`, `norm_stats` params
+- Theory loss computed on SC samples only, added to loss in all three branches (pure SC, pure non-SC, mixed)
+- Theory loss parameters (BCS predictors ~22K + cuprate predictors ~22K = ~45K total) added to encoder optimizer
+- Gradient clipping includes theory loss parameters
+- **Theory warmup**: `theory_warmup_epochs: 50` — ramps weight from 0 → `theory_weight` over 50 epochs (like contrastive warmup)
+
+#### 4. Checkpoint Compatibility
+
+- `theory_loss_fn_state_dict` saved in checkpoint (BCS/cuprate predictor weights)
+- Restored on load if key exists; prints message if missing (old checkpoint)
+- Encoder optimizer state won't match with old checkpoint → uses fresh optimizer (acceptable, existing handler)
+
+#### 5. Config
+
+```python
+'use_theory_loss': True,
+'theory_weight': 0.5,              # Strong signal (was 0.05)
+'theory_warmup_epochs': 50,        # Ramp up over 50 epochs
+'theory_use_soft_constraints': True,
+```
+
+#### 6. Metrics
+
+- `theory_loss` added to epoch metrics, CSV logging, and epoch print line
+- Format: `Thry: 0.1234 (w=0.250)` showing current effective weight
+
+### Expected Behavior
+
+- Theory loss appears in epoch output after warmup begins
+- Per-family breakdown: ~40% BCS, ~30% cuprate, ~10% iron, ~20% unknown
+- BCS predictors (Debye temp, lambda) converge to physically plausible ranges after ~100 epochs:
+  - Debye temp: 100-500K
+  - Lambda (electron-phonon coupling): 0.2-1.0
+- Cuprate doping predictor should not collapse to constant 0.16
+
+### Backward Compatibility
+
+- `use_theory_loss: False` recovers exact V12.21 behavior
+- Old checkpoints without `theory_loss_fn_state_dict` → theory predictors start fresh
+- Old caches without `family_tensor` → defaults to zeros (triggers recomputation on next fresh preprocessing)
+
+---
+
 ## V12.21: SC Classification Head + Diagnostic Fixes (2026-02-09)
 
 ### SC/non-SC Classification Head (Cross-Head Consistency)
