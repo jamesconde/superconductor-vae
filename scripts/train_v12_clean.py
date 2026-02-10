@@ -2927,6 +2927,13 @@ def train():
             print(f"[env] Batch size adjusted: {original_bs} -> {TRAIN_CONFIG['batch_size']} "
                   f"(x{env['batch_size_multiplier']})")
 
+    # Override accumulation_steps for large-VRAM GPUs (A100: single-step with big batch)
+    if env.get('accumulation_steps') is not None:
+        old_accum = TRAIN_CONFIG.get('accumulation_steps', 2)
+        TRAIN_CONFIG['accumulation_steps'] = env['accumulation_steps']
+        if env['accumulation_steps'] != old_accum:
+            print(f"[env] Accumulation steps: {old_accum} -> {env['accumulation_steps']}")
+
     # ========================================================================
     # V12.8: Apply optimizations before model creation
     # ========================================================================

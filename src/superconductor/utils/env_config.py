@@ -131,12 +131,14 @@ def detect_environment() -> dict:
 
     elif runtime == "colab":
         if gpu["class"] == "large":
-            # A100 / H100 (40GB+)
-            num_workers = min(4, cpus - 1) if cpus > 1 else 0
+            # A100 / H100 (38GB+) — 72% VRAM unused at default batch size.
+            # Measured: batch=157 uses ~11GB on A100-40GB, so batch=512 ≈ 30GB.
+            num_workers = min(8, cpus - 1) if cpus > 1 else 0
             pin_memory = True
             persistent_workers = True
-            prefetch_factor = 2
-            batch_size_multiplier = 2.5
+            prefetch_factor = 3
+            batch_size_multiplier = 12.0  # 42 * 12 = 504 → ~30GB on A100-40GB
+            accumulation_steps = 1        # No accumulation needed with large batch
             # V12.20: torch.compile works on Colab A100 (1.5-2x speedup).
             # Use 'default' mode — 'reduce-overhead' has memory leak issues
             # (pytorch/pytorch#116096, #128424).
@@ -201,6 +203,9 @@ def detect_environment() -> dict:
         f"RAM: {ram_gb}GB | workers={num_workers}, pin_memory={pin_memory}"
     )
 
+    # accumulation_steps only overridden for A100+ (large batch fits in VRAM)
+    _accum = locals().get('accumulation_steps', None)
+
     config = {
         "environment": runtime,
         "gpu": gpu,
@@ -210,6 +215,7 @@ def detect_environment() -> dict:
         "persistent_workers": persistent_workers,
         "prefetch_factor": prefetch_factor,
         "batch_size_multiplier": batch_size_multiplier,
+        "accumulation_steps": _accum,  # None = use TRAIN_CONFIG default, int = override
         "use_torch_compile": use_torch_compile,
         "compile_mode": compile_mode,  # V12.20: None = use TRAIN_CONFIG, str = override
         "summary": summary,
