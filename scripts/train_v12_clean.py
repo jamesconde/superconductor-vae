@@ -370,6 +370,7 @@ TRAIN_CONFIG = {
     'stoich_weight': 2.0,  # V12.4: Stoichiometry loss weight
     'kl_weight': 0.0001,  # Now L2 regularization weight on z (deterministic encoder)
     'hp_loss_weight': 0.05,  # V12.19: High-pressure prediction loss weight (BCE)
+    'sc_loss_weight': 0.5,   # V12.21: SC/non-SC classification loss weight (BCE, all samples)
 
     # V12.20: Tc loss improvements (log-transform + Huber)
     'tc_log_transform': True,   # Apply log1p(Tc) before z-score normalization (reduces skew 2.18→-0.17)
@@ -1901,6 +1902,48 @@ def cache_z_vectors(encoder, loader, device, epoch, cache_path, dataset_info=Non
         cache_data['log_probs'] = torch.cat(padded_log_probs, dim=0)
 
     # Compute basic statistics
+    sc_mask_cache = is_sc_values.bool()
+    tc_mae_all = (tc_pred_values - tc_values).abs().mean().item()
+
+    # V12.21: SC-only Tc MAE (primary metric — non-SC Tc predictions are meaningless)
+    tc_mae_sc = 0.0
+    tc_mae_non_sc = 0.0
+    tc_kelvin_breakdown = {}
+    if sc_mask_cache.any():
+        sc_tc_err = (tc_pred_values[sc_mask_cache] - tc_values[sc_mask_cache]).abs()
+        tc_mae_sc = sc_tc_err.mean().item()
+
+        # Convert to Kelvin for breakdown if norm_stats available
+        if dataset_info and 'tc_mean' in dataset_info:
+            tc_m = dataset_info['tc_mean']
+            tc_s = dataset_info['tc_std']
+            tc_log = dataset_info.get('tc_log_transform', False)
+            # Denormalize: tc_norm * std + mean -> log1p space (or K)
+            sc_tc_true_denorm = tc_values[sc_mask_cache] * tc_s + tc_m
+            sc_tc_pred_denorm = tc_pred_values[sc_mask_cache] * tc_s + tc_m
+            if tc_log:
+                # expm1 to convert from log1p space to Kelvin
+                sc_tc_true_K = torch.expm1(sc_tc_true_denorm)
+                sc_tc_pred_K = torch.expm1(sc_tc_pred_denorm)
+            else:
+                sc_tc_true_K = sc_tc_true_denorm
+                sc_tc_pred_K = sc_tc_pred_denorm
+            tc_err_K = (sc_tc_pred_K - sc_tc_true_K).abs()
+
+            # Breakdown by Tc range in Kelvin
+            ranges = [(0, 10, '0-10K'), (10, 50, '10-50K'), (50, 100, '50-100K'), (100, float('inf'), '100K+')]
+            for lo, hi, label in ranges:
+                range_mask = (sc_tc_true_K >= lo) & (sc_tc_true_K < hi)
+                if range_mask.any():
+                    tc_kelvin_breakdown[label] = {
+                        'mae_K': tc_err_K[range_mask].mean().item(),
+                        'count': range_mask.sum().item(),
+                    }
+            tc_kelvin_breakdown['overall_mae_K'] = tc_err_K.mean().item()
+
+    if (~sc_mask_cache).any():
+        tc_mae_non_sc = (tc_pred_values[~sc_mask_cache] - tc_values[~sc_mask_cache]).abs().mean().item()
+
     cache_data['stats'] = {
         'z_mean': z_vectors.mean(dim=0),
         'z_std': z_vectors.std(dim=0),
@@ -1910,7 +1953,10 @@ def cache_z_vectors(encoder, loader, device, epoch, cache_path, dataset_info=Non
         'z_norm_std': z_vectors.norm(dim=1).std().item(),
         'tc_mean': tc_values.mean().item(),
         'tc_std': tc_values.std().item(),
-        'tc_pred_mae': (tc_pred_values - tc_values).abs().mean().item(),
+        'tc_pred_mae': tc_mae_all,          # Legacy: all-sample MAE (inflated by non-SC)
+        'tc_pred_mae_sc': tc_mae_sc,        # V12.21: SC-only MAE (primary metric)
+        'tc_pred_mae_non_sc': tc_mae_non_sc,  # V12.21: Non-SC MAE (expect high - untrained)
+        'tc_kelvin_breakdown': tc_kelvin_breakdown,  # V12.21: MAE by Tc range in Kelvin
         'n_superconductors': is_sc_values.sum().item(),
         'n_non_sc': (1 - is_sc_values).sum().item(),
     }
@@ -1924,7 +1970,20 @@ def cache_z_vectors(encoder, loader, device, epoch, cache_path, dataset_info=Non
     print(f"    Z: {z_vectors.size(1)} dims, norm={z_vectors.norm(dim=1).mean():.2f}±{z_vectors.norm(dim=1).std():.2f}")
     if include_predictions:
         print(f"    Exact match: {cache_data['exact_match_pct']:.1f}%")
-    print(f"    Tc MAE: {cache_data['stats']['tc_pred_mae']:.4f}")
+    # V12.21: Show SC-only Tc MAE as primary metric
+    tc_stats = cache_data['stats']
+    print(f"    Tc MAE (SC-only): {tc_stats['tc_pred_mae_sc']:.4f} | "
+          f"(all: {tc_stats['tc_pred_mae']:.4f}, non-SC: {tc_stats['tc_pred_mae_non_sc']:.4f})")
+    if tc_stats.get('tc_kelvin_breakdown'):
+        kb = tc_stats['tc_kelvin_breakdown']
+        parts = []
+        for label in ['0-10K', '10-50K', '50-100K', '100K+']:
+            if label in kb:
+                parts.append(f"{label}: {kb[label]['mae_K']:.1f}K (n={kb[label]['count']})")
+        if parts:
+            print(f"    Tc Kelvin: {' | '.join(parts)}")
+        if 'overall_mae_K' in kb:
+            print(f"    Tc overall MAE: {kb['overall_mae_K']:.1f}K")
 
     return cache_data
 
@@ -1954,7 +2013,7 @@ def log_training_metrics(epoch, metrics, log_path, true_eval=None):
     columns = [
         'epoch', 'exact_match', 'accuracy', 'loss', 'tc_loss', 'magpie_loss',
         'stoich_loss', 'rl_loss', 'reward', 'entropy', 'entropy_weight',
-        'z_norm', 'tf_ratio', 'contrastive_loss', 'hp_loss', 'true_exact',
+        'z_norm', 'tf_ratio', 'contrastive_loss', 'hp_loss', 'sc_loss', 'true_exact',
         'epoch_time', 'timestamp'
     ]
 
@@ -1967,14 +2026,15 @@ def log_training_metrics(epoch, metrics, log_path, true_eval=None):
         'tc_loss': metrics.get('tc_loss', 0),
         'magpie_loss': metrics.get('magpie_loss', 0),
         'stoich_loss': metrics.get('stoich_loss', 0),
-        'rl_loss': metrics.get('rl_loss', 0),
-        'reward': metrics.get('reward', 0),
+        'rl_loss': metrics.get('reinforce_loss', 0),  # V12.21: Fix key mismatch (was 'rl_loss')
+        'reward': metrics.get('mean_reward', 0),     # V12.21: Fix key mismatch (was 'reward')
         'entropy': metrics.get('entropy', 0),
-        'entropy_weight': metrics.get('entropy_weight', 0),
+        'entropy_weight': metrics.get('entropy_weight', 0),  # Set by train() if entropy_manager exists
         'z_norm': metrics.get('z_norm', 0),
         'tf_ratio': metrics.get('tf_ratio', 0),
         'contrastive_loss': metrics.get('contrastive_loss', 0),
         'hp_loss': metrics.get('hp_loss', 0),
+        'sc_loss': metrics.get('sc_loss', 0),
         'true_exact': true_eval['true_exact_match'] if true_eval else '',
         'epoch_time': metrics.get('epoch_time', 0),
         'timestamp': datetime.datetime.now().isoformat(),
@@ -2356,6 +2416,10 @@ def evaluate_true_autoregressive(encoder, decoder, loader, device, max_samples=1
         'n_elements_exact': float(all_n_elements_np[exact_mask].mean()) if exact_mask.any() else None,
         'n_elements_errors': float(all_n_elements_np[error_mask].mean()) if error_mask.any() else None,
 
+        # V12.21: SC-only Tc MAE (primary metric — non-SC Tc is meaningless)
+        'tc_mae_sc_only': None,
+        'tc_mae_non_sc': None,
+
         # Correlations: what predicts errors?
         'corr_z_norm_vs_errors': safe_corrcoef(all_z_norms_np, all_n_errors_np),
         'corr_tc_error_vs_formula_errors': safe_corrcoef(np.abs(all_tc_pred_np - all_tc_true_np), all_n_errors_np),
@@ -2372,6 +2436,17 @@ def evaluate_true_autoregressive(encoder, decoder, loader, device, max_samples=1
         # Error breakdown by sequence length bucket
         'errors_by_seq_len_bucket': {},
     }
+
+    # V12.21: SC-only Tc MAE
+    if all_is_sc:
+        all_is_sc_np = np.array(all_is_sc[:total_samples])
+        sc_eval_mask = all_is_sc_np > 0
+        if sc_eval_mask.any():
+            z_diagnostics['tc_mae_sc_only'] = float(np.abs(
+                all_tc_pred_np[sc_eval_mask] - all_tc_true_np[sc_eval_mask]).mean())
+        if (~sc_eval_mask).any():
+            z_diagnostics['tc_mae_non_sc'] = float(np.abs(
+                all_tc_pred_np[~sc_eval_mask] - all_tc_true_np[~sc_eval_mask]).mean())
 
     # Z-norm quartile analysis
     if len(all_z_norms_np) > 4:
@@ -2423,7 +2498,8 @@ def evaluate_true_autoregressive(encoder, decoder, loader, device, max_samples=1
     z_err = zd['z_norm_errors']
     print(f"  Z-diag: norm exact={z_exact['mean']:.1f}±{z_exact['std']:.1f}" if z_exact else "  Z-diag: no exact samples", end='')
     print(f" | err={z_err['mean']:.1f}±{z_err['std']:.1f}" if z_err else " | no error samples", end='')
-    print(f" | Tc MAE={zd['tc_mae_overall']:.4f} (exact={zd['tc_mae_exact']:.4f}, err={zd['tc_mae_errors']:.4f})" if zd['tc_mae_exact'] is not None and zd['tc_mae_errors'] is not None else '')
+    tc_sc_str = f", SC={zd['tc_mae_sc_only']:.4f}" if zd.get('tc_mae_sc_only') is not None else ""
+    print(f" | Tc MAE={zd['tc_mae_overall']:.4f}{tc_sc_str} (exact={zd['tc_mae_exact']:.4f}, err={zd['tc_mae_errors']:.4f})" if zd['tc_mae_exact'] is not None and zd['tc_mae_errors'] is not None else '')
     print(f"  Correlations: z_norm→err={zd['corr_z_norm_vs_errors']:.3f} | tc_err→err={zd['corr_tc_error_vs_formula_errors']:.3f} | "
           f"magpie→err={zd['corr_magpie_mse_vs_errors']:.3f} | seq_len→err={zd['corr_seq_len_vs_errors']:.3f} | "
           f"n_elem→err={zd['corr_n_elements_vs_errors']:.3f}")
@@ -2472,7 +2548,7 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
                 focal_loss_fn=None, amp_dtype=torch.float16, accumulation_steps=1,
                 contrastive_loss_fn=None, contrastive_weight=0.0, non_sc_formula_weight=0.5,
                 selective_backprop=False, selective_backprop_threshold=0.33,
-                enable_timing=True, hp_loss_weight=0.0):
+                enable_timing=True, hp_loss_weight=0.0, sc_loss_weight=0.0):
     """Train for one epoch with curriculum weights and teacher forcing.
 
     V12.8: Added amp_dtype for configurable mixed precision (bfloat16/float16)
@@ -2482,6 +2558,7 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
     V12.12: Added selective backpropagation - skip backward on easy batches
     V12.15: Added enable_timing for compute/time profiling
     V12.19: Added hp_loss_weight for high-pressure prediction head
+    V12.21: Added sc_loss_weight for SC/non-SC classification head
     """
     global _timing_stats
 
@@ -2506,6 +2583,7 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
     total_z_norm = 0
     total_contrastive = 0
     total_hp_loss = 0  # V12.19
+    total_sc_loss = 0  # V12.21
     total_sc_exact = 0
     total_non_sc_exact = 0
     total_spec_accept = 0  # V12.9: Speculative decoding acceptance rate
@@ -2614,6 +2692,16 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
                         pos_weight=pos_weight,
                     )
 
+            # V12.21: SC/non-SC classification loss (on ALL samples)
+            # Cross-head consistency: sc_head receives z + other head predictions
+            sc_loss_val = torch.tensor(0.0, device=device)
+            if sc_loss_weight > 0:
+                sc_pred = encoder_out.get('sc_pred')
+                if sc_pred is not None:
+                    sc_loss_val = F.binary_cross_entropy_with_logits(
+                        sc_pred, is_sc.float(),
+                    )
+
             # V12.15: Time loss computation (includes REINFORCE sampling)
             if timing:
                 timing.start('loss_compute')
@@ -2640,7 +2728,8 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
                     stoich_pred_for_reinforce=stoich_pred,
                 )
                 loss = (loss_dict['total'] + contrastive_weight * contrastive_loss_val
-                        + hp_loss_weight * hp_loss_val)
+                        + hp_loss_weight * hp_loss_val
+                        + sc_loss_weight * sc_loss_val)
 
             elif (~sc_mask).all():
                 # Pure non-SC batch — formula loss only (lower weight), no Tc/Magpie/REINFORCE
@@ -2663,7 +2752,8 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
                     stoich_pred_for_reinforce=None,
                 )
                 # Scale formula loss by non_sc_formula_weight
-                loss = non_sc_formula_weight * loss_dict['total'] + contrastive_weight * contrastive_loss_val
+                loss = (non_sc_formula_weight * loss_dict['total'] + contrastive_weight * contrastive_loss_val
+                        + sc_loss_weight * sc_loss_val)
 
             else:
                 # Mixed batch — compute SC and non-SC losses separately
@@ -2718,7 +2808,8 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
                 loss = (sc_frac * sc_loss_dict['total'] +
                         non_sc_frac * non_sc_formula_weight * non_sc_loss_dict['total'] +
                         contrastive_weight * contrastive_loss_val +
-                        hp_loss_weight * hp_loss_val)
+                        hp_loss_weight * hp_loss_val +
+                        sc_loss_weight * sc_loss_val)
 
         # V12.15: Stop loss computation timing
         if timing:
@@ -2814,6 +2905,7 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
         total_entropy += loss_dict['entropy'].item()
         total_contrastive += contrastive_loss_val.item() if torch.is_tensor(contrastive_loss_val) else contrastive_loss_val
         total_hp_loss += hp_loss_val.item() if torch.is_tensor(hp_loss_val) else hp_loss_val
+        total_sc_loss += sc_loss_val.item() if torch.is_tensor(sc_loss_val) else sc_loss_val  # V12.21
         z_norm_val = z.detach().float().norm(dim=1).mean().item()
         if not math.isnan(z_norm_val):
             total_z_norm += z_norm_val
@@ -2857,7 +2949,7 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
             'loss': float('nan'), 'accuracy': 0, 'exact_match': 0,
             'tc_loss': 0, 'magpie_loss': 0, 'stoich_loss': 0,
             'reinforce_loss': 0, 'mean_reward': 0, 'entropy': 0,
-            'contrastive_loss': 0, 'hp_loss': 0, 'z_norm': 0,
+            'contrastive_loss': 0, 'hp_loss': 0, 'sc_loss': 0, 'z_norm': 0,
             'n_skipped': n_skipped, 'n_total_batches': 0,
         }
 
@@ -2873,6 +2965,7 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
         'entropy': total_entropy / n_batches,
         'contrastive_loss': total_contrastive / n_batches,
         'hp_loss': total_hp_loss / n_batches,  # V12.19
+        'sc_loss': total_sc_loss / n_batches,  # V12.21
         'z_norm': total_z_norm / n_batches,
         'n_skipped': n_skipped,  # V12.12: Selective backprop skips
         'n_total_batches': n_batches,
@@ -3215,6 +3308,7 @@ def train():
     print(f"  Magpie: {TRAIN_CONFIG['magpie_weight']}")
     print(f"  Stoich: {TRAIN_CONFIG['stoich_weight']}")
     print(f"  HP: {TRAIN_CONFIG.get('hp_loss_weight', 0)}")
+    print(f"  SC: {TRAIN_CONFIG.get('sc_loss_weight', 0)}")
     print(f"\nCurriculum:")
     print(f"  Phase 1 (0-{TRAIN_CONFIG['curriculum_phase1_end']}): Tc 5→10, Magpie 1→2")
     print(f"  Phase 2 ({TRAIN_CONFIG['curriculum_phase1_end']}+): Full strength")
@@ -3349,6 +3443,8 @@ def train():
             enable_timing=TRAIN_CONFIG.get('enable_timing', True),
             # V12.19: High-pressure prediction
             hp_loss_weight=TRAIN_CONFIG.get('hp_loss_weight', 0.0),
+            # V12.21: SC/non-SC classification
+            sc_loss_weight=TRAIN_CONFIG.get('sc_loss_weight', 0.0),
         )
 
         # V12.11: Catastrophic drop detection - rollback to best checkpoint and halve LR
@@ -3454,6 +3550,10 @@ def train():
         if TRAIN_CONFIG.get('hp_loss_weight', 0) > 0 and metrics.get('hp_loss', 0) > 0:
             base_msg += f" | HP: {metrics['hp_loss']:.4f}"
 
+        # V12.21: Show SC classification loss if enabled
+        if TRAIN_CONFIG.get('sc_loss_weight', 0) > 0 and metrics.get('sc_loss', 0) > 0:
+            base_msg += f" | SCL: {metrics['sc_loss']:.4f}"
+
         # V12.12: Show selective backprop stats
         if metrics.get('n_skipped', 0) > 0 and metrics.get('n_total_batches', 0) > 0:
             skip_pct = metrics['n_skipped'] / metrics['n_total_batches'] * 100
@@ -3491,6 +3591,11 @@ def train():
                   f"({true_eval['exact_count']}/{true_eval['total_samples']}) | "
                   f"Errors: 0={err_dist[0]}, 1={err_dist[1]}, 2={err_dist[2]}, 3={err_dist[3]}, >3={err_dist['more']}", flush=True)
 
+        # V12.21: Add entropy_weight and tf_ratio to metrics for CSV logging
+        if entropy_manager is not None:
+            metrics['entropy_weight'] = loss_fn.entropy_weight
+        metrics['tf_ratio'] = tf_ratio
+
         # V12.17: Log metrics to CSV for post-training analysis
         training_log_path = OUTPUT_DIR / 'training_log.csv'
         log_training_metrics(epoch, metrics, training_log_path, true_eval=true_eval)
@@ -3514,7 +3619,7 @@ def train():
                 z_cache_path = PROJECT_ROOT / TRAIN_CONFIG.get('z_cache_path', 'outputs/latent_cache.pt')
                 z_cache_mode = TRAIN_CONFIG.get('z_cache_mode', 'z_only')
                 cache_z_vectors(encoder, train_loader, device, epoch, z_cache_path,
-                               decoder=decoder, mode=z_cache_mode)
+                               dataset_info=norm_stats, decoder=decoder, mode=z_cache_mode)
 
         # V12.17: Cache z-vectors at configured interval (or every epoch if configured)
         z_cache_interval = TRAIN_CONFIG.get('z_cache_interval', 0)
@@ -3527,7 +3632,7 @@ def train():
             # Save with epoch suffix to track evolution
             epoch_cache_path = z_cache_path.with_stem(f"{z_cache_path.stem}_epoch{epoch:04d}")
             cache_z_vectors(encoder, train_loader, device, epoch, epoch_cache_path,
-                           decoder=decoder, mode=z_cache_mode)
+                           dataset_info=norm_stats, decoder=decoder, mode=z_cache_mode)
 
         if (epoch + 1) % TRAIN_CONFIG['checkpoint_interval'] == 0:
             save_checkpoint(encoder, decoder, epoch, **checkpoint_kwargs)
@@ -3541,7 +3646,7 @@ def train():
         z_cache_mode = TRAIN_CONFIG.get('z_cache_mode', 'z_only')
         final_cache_path = z_cache_path.with_stem(f"{z_cache_path.stem}_final")
         cache_z_vectors(encoder, train_loader, device, epoch, final_cache_path,
-                       decoder=decoder, mode=z_cache_mode)
+                       dataset_info=norm_stats, decoder=decoder, mode=z_cache_mode)
 
     print(f"\nTraining complete. Best exact match: {best_exact*100:.1f}%")
 

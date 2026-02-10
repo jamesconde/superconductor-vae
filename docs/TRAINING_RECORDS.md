@@ -4,6 +4,32 @@ Chronological record of training runs, architecture changes, and optimization de
 
 ---
 
+## V12.21: SC Classification Head + Diagnostic Fixes (2026-02-09)
+
+### SC/non-SC Classification Head (Cross-Head Consistency)
+
+The model previously had no explicit SC/non-SC classifier. The contrastive loss shapes latent geometry but doesn't predict SC status. The competence head existed but was untrained (no loss function).
+
+**New SC head** added to `FullMaterialsVAE`:
+- 3-layer MLP: `Linear(2209, 512) → GELU → LayerNorm → Dropout → Linear(512, 128) → GELU → Linear(128, 1)`
+- **Cross-head consistency input** (2209 dims): z(2048) + tc_pred(1) + magpie_pred(145) + hp_pred(1) + fraction_pred(12) + element_count_pred(1) + competence(1)
+- Trained on ALL samples (SC + non-SC) with BCE loss, weight `sc_loss_weight: 0.5`
+- Learns patterns like "high Tc prediction + SC-like Magpie profile → superconductor"
+
+### Cache Tc MAE Fix
+
+Cache `tc_pred_mae` was inflated because it averaged over non-SC samples (where Tc head is untrained, producing ~2.6 normalized error each). Fixed to report:
+- **SC-only MAE** (primary metric)
+- Non-SC MAE (for monitoring)
+- **Kelvin breakdown** by Tc range: 0-10K, 10-50K, 50-100K, 100K+ (requires norm_stats)
+- Same SC-only breakdown added to `evaluate_true_autoregressive()` z-diagnostics
+
+### CSV Logging Key Mismatch Fix
+
+The `log_training_metrics()` function was looking for `'rl_loss'` and `'reward'` in the metrics dict, but `train_epoch()` returns `'reinforce_loss'` and `'mean_reward'`. This caused RL loss and reward to always be written as 0 in `training_log.csv`. Also added `entropy_weight` and `tf_ratio` to CSV output.
+
+---
+
 ## V12.20: Normalization Audit + Loss Function Fixes (2026-02-09)
 
 ### Problem

@@ -210,7 +210,7 @@ Each training step:
 ### What Makes This Architecture Distinctive
 
 - **Deterministic encoder**: No sampling noise in z. Uses L2 regularization instead of KL divergence.
-- **Multi-task heads**: Six prediction heads shape the latent space simultaneously.
+- **Multi-task heads**: Seven prediction heads shape the latent space simultaneously (Tc, Magpie, fractions, element count, HP, competence, SC classification).
 - **Contrastive learning**: 13-class SupCon loss clusters materials by type in latent space.
 - **REINFORCE**: Formula decoder gets reward signal from formula-level correctness, not just token-level cross-entropy.
 - **Asymmetric SC/non-SC training**: Superconductors get full loss (all heads). Non-superconductors get formula loss only at 0.5x weight (they have no meaningful Tc or HP to predict).
@@ -229,6 +229,7 @@ z = encoder_out['z']  # [1, 2048]
 # Use any prediction head
 tc_predicted = encoder_out['tc_pred']           # Critical temperature
 hp_probability = torch.sigmoid(encoder_out['hp_pred'])  # P(high-pressure)
+sc_probability = torch.sigmoid(encoder_out['sc_pred'])  # P(superconductor) — cross-head consistency
 confidence = encoder_out['competence']          # Model confidence
 
 # Generate formula

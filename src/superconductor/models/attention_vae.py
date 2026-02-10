@@ -747,6 +747,31 @@ class FullMaterialsVAE(nn.Module):
             nn.Linear(256, 1),
         )
 
+        # =====================================================================
+        # SC/NON-SC CLASSIFICATION HEAD (V12.21 — Cross-Head Consistency)
+        # =====================================================================
+        # Binary classifier: P(is_superconductor | z, head_predictions)
+        # Unlike other heads that read only z, this head receives z CONCATENATED
+        # with the predictions of ALL other heads. This creates a cross-head
+        # consistency check: the SC classifier learns patterns like "high Tc +
+        # certain Magpie features → likely SC" and "Tc ≈ 0 + non-SC Magpie → not SC".
+        # Gradients flow through the concatenated predictions back into the other
+        # heads, so the SC loss also improves the other heads' accuracy.
+        #
+        # Input: z(2048) + tc_pred(1) + magpie_pred(145) + hp_pred(1)
+        #        + fraction_pred(12) + element_count_pred(1) + competence(1) = 2209
+        # =====================================================================
+        sc_input_dim = latent_dim + 1 + magpie_dim + 1 + self.max_elements + 1 + 1  # 2209
+        self.sc_head = nn.Sequential(
+            nn.Linear(sc_input_dim, 512),
+            nn.GELU(),
+            nn.LayerNorm(512),
+            nn.Dropout(dropout),
+            nn.Linear(512, 128),
+            nn.GELU(),
+            nn.Linear(128, 1),  # logits — apply sigmoid for probability
+        )
+
     def reparameterize(self, mean: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
         """Reparameterization trick for VAE, or passthrough in deterministic mode."""
         if logvar is None:
@@ -866,6 +891,20 @@ class FullMaterialsVAE(nn.Module):
         # High-pressure prediction (V12.19)
         hp_pred = self.hp_head(enc_out['z']).squeeze(-1)  # [batch] logits
 
+        # SC/non-SC classification with cross-head consistency (V12.21)
+        # Feed z + all other head predictions so the classifier learns
+        # cross-head consistency patterns (e.g., high Tc + SC Magpie → SC)
+        sc_input = torch.cat([
+            enc_out['z'],                          # 2048
+            dec_out['tc_pred'].unsqueeze(-1),       # 1
+            dec_out['magpie_pred'],                 # 145
+            hp_pred.unsqueeze(-1),                  # 1
+            fraction_pred,                          # 12
+            element_count_pred.unsqueeze(-1),       # 1
+            competence.unsqueeze(-1),               # 1
+        ], dim=-1)  # Total: 2209
+        sc_pred = self.sc_head(sc_input).squeeze(-1)  # [batch] logits
+
         # Latent regularization: L2 on z (deterministic mode) or KL (VAE mode)
         # IMPORTANT (2026-02-02): 'kl_loss' key is INTENTIONALLY reused for L2 reg.
         # The entire downstream pipeline (CombinedLossWithREINFORCE, train_v12_clean.py,
@@ -904,6 +943,9 @@ class FullMaterialsVAE(nn.Module):
             'element_count_pred': element_count_pred,
             # High-pressure prediction (V12.19) — logits, apply sigmoid for probability
             'hp_pred': hp_pred,
+            # SC/non-SC classification (V12.21) — logits, apply sigmoid for probability
+            # Cross-head consistency: uses z + all other head predictions as input
+            'sc_pred': sc_pred,
         }
 
 
