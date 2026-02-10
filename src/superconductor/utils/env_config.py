@@ -65,7 +65,7 @@ def _classify_gpu() -> dict:
         props = torch.cuda.get_device_properties(0)
         vram_gb = props.total_memory / (1024 ** 3)
         name = props.name
-        if vram_gb >= 40:
+        if vram_gb >= 38:  # A100-40GB reports 39.6GB usable
             gpu_class = "large"
         elif vram_gb >= 14:
             gpu_class = "medium"
