@@ -50,6 +50,14 @@ These provide large, static gradient fields that dilute the reconstruction gradi
 
 Config-only changes. All infrastructure (contrastive, theory, REINFORCE) remains intact for future re-enablement.
 
+### V12.27+ Roadmap: Theory as Post-Mastery Regularizer
+
+See **[docs/THEORY_LOSS_ROADMAP.md](THEORY_LOSS_ROADMAP.md)** for the full design document. Key insights:
+
+1. **Phased curriculum:** Theory losses should be applied AFTER data mastery (Phase 2), not during active learning. At weight 0.01-0.02, they refine without disrupting.
+2. **Self-consistency as unsupervised learning:** Generated candidates can be checked against physics constraints without labels — a form of self-supervised training that scales with model capability.
+3. **Theory validation via model accuracy:** Applying a theory as a loss function tests it against 46K materials simultaneously. Theories that improve accuracy are validated; theories that destroy it are falsified. The model becomes a theory-testing instrument.
+
 ### Expected Loss Composition (projected)
 
 | Component | Old Weighted | New Weighted | % of New Total |
