@@ -3308,14 +3308,19 @@ def train():
             theory_weight=TRAIN_CONFIG.get('theory_weight', 0.05),
             use_soft_constraints=TRAIN_CONFIG.get('theory_use_soft_constraints', True),
             tc_log_transform=TRAIN_CONFIG.get('tc_log_transform', False),  # V12.22
+            # V12.25: Magpie denormalization stats for physics formulas
+            magpie_mean=norm_stats.get('magpie_mean'),  # List[float] from .tolist()
+            magpie_std=norm_stats.get('magpie_std'),     # List[float] from .tolist()
         )
         theory_loss_fn = TheoryRegularizationLoss(config=theory_config).to(device)
         family_classifier = RuleBasedFamilyClassifier()
         n_theory_params = sum(p.numel() for p in theory_loss_fn.parameters())
-        print(f"Theory Loss: Enabled (weight={TRAIN_CONFIG['theory_weight']}, "
+        print(f"Theory Loss: V12.25 Allen-Dynes + family priors "
+              f"(weight={TRAIN_CONFIG['theory_weight']}, "
               f"soft_constraints={TRAIN_CONFIG.get('theory_use_soft_constraints', True)}, "
               f"warmup={TRAIN_CONFIG.get('theory_warmup_epochs', 50)} epochs, "
-              f"params={n_theory_params:,})")
+              f"params={n_theory_params:,}, "
+              f"magpie_stats={'yes' if norm_stats.get('magpie_mean') else 'no'})")
 
     # V12.9: Initialize entropy manager for REINFORCE (prevents entropy collapse)
     entropy_manager = None

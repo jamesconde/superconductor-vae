@@ -4,6 +4,153 @@ Chronological record of training runs, architecture changes, and optimization de
 
 ---
 
+## V12.25: Theory Loss Overhaul — Allen-Dynes, Family Priors, VEC Constraints (2026-02-10)
+
+### Problem
+
+The theory loss (`theory_losses.py`) had major gaps:
+
+1. **BCS used McMillan (1968)** — only ~20-30% accurate for strong-coupling materials. Allen-Dynes (1975) adds f1, f2 correction factors that significantly improve accuracy for lambda > 0.5 materials like MgB2.
+2. **Heavy Fermion got ZERO loss** — mapped to `UnknownTheoryLoss` which returns 0. These materials have well-known Tc constraints (typically 0.1-2K, max ~18K for PuCoGa5).
+3. **Organic got ZERO loss** — same as heavy fermion. BEDT-TTF salts: Tc < 13K; alkali-doped fullerenes: up to ~40K.
+4. **Iron-based was trivial** — only a soft cap at 60K, no physics beyond that. No VEC or sub-family constraints.
+5. **No universal Matthias VEC prior** for BCS — Tc peaks at VEC~5 and VEC~7 for conventional superconductors.
+
+### Changes
+
+#### 1. Allen-Dynes Replaces McMillan for BCS (`BCSTheoryLoss`)
+
+Replaced `mcmillan_tc()` with `allen_dynes_tc()`:
+
+```
+Tc = (omega_log / 1.2) * exp(-1.04(1+lambda)/(lambda - mu*(1+0.62*lambda))) * f1 * f2
+```
+
+Where:
+- `omega_log = theta_D * 0.827` (approximate for monatomic/simple polyatomic solids)
+- `f1 = [1 + (lambda/Lambda1)^(3/2)]^(1/3)`, Lambda1 = 2.46(1 + 3.8*mu*)
+- `f2 = 1 + (lambda^2 * (0.5 - mu*)) / (lambda^2 + Lambda2^2)`, Lambda2 = 1.82(1 + 6.3*mu*)
+- Reference: Allen & Dynes, Phys. Rev. B 12, 905 (1975)
+
+The f1, f2 factors approach 1.0 for weak coupling (lambda < 0.3), recovering McMillan. For strong coupling (lambda > 0.5), they provide significant corrections — critical for MgB2-type materials.
+
+#### 2. Lindemann Debye Temperature Anchor (`BCSTheoryLoss`)
+
+Physics-informed regularizer on the neural net theta_D predictor:
+
+```
+theta_D_est = 41.63 * sqrt(T_m / (M * V^(2/3)))
+```
+
+Where T_m = melting temp, M = mean atomic weight, V = mean volume per atom (denormalized from Magpie features).
+
+- Weight: 0.1 (within the already-small 0.05 theory weight)
+- Uses Huber loss with delta=100K (very forgiving)
+- Requires magpie_mean/magpie_std in TheoryLossConfig (passed from norm_stats)
+- Denormalized values are approximate for quantile-transformed features — acceptable for a soft anchor
+
+#### 3. Matthias VEC Prior (`BCSTheoryLoss`)
+
+Tc should be higher near VEC=4.7 and 6.7 (Matthias rule for transition metals):
+
+```
+envelope = 40 * (exp(-0.5*((VEC-4.7)/1.0)^2) + exp(-0.5*((VEC-6.7)/1.0)^2))
+penalty = softplus(tc - envelope - 5.0, beta=0.5)^2 * 0.01
+```
+
+- Very gentle (0.01 weight) — a prior, not a constraint
+- Materials at unusual VEC (like MgB2 at VEC=3.5) will survive this push-back
+
+#### 4. HeavyFermionTheoryLoss (New Class)
+
+Replaces `UnknownTheoryLoss` for heavy fermion materials:
+
+- **Log-normal prior**: Huber loss in log-space, centered at 1K (log(1)=0), delta=2.0
+  - ~7x tolerance around 1K center before strong penalty
+  - PuCoGa5 at 18K gets moderate prior penalty but stays below cap
+- **Soft cap at 20K**: `softplus(tc - 20, beta=0.5)^2`
+- No learnable parameters (pure physics prior)
+
+#### 5. OrganicTheoryLoss (New Class)
+
+Replaces `UnknownTheoryLoss` for organic superconductors:
+
+- **Soft cap at 15K**: Covers most BEDT-TTF salts (Tc < 13K)
+- `softplus(tc - 15, beta=0.5)^2`
+- No learnable parameters (pure physics prior)
+
+#### 6. IronBasedTheoryLoss VEC Constraint
+
+Added VEC constraint centered at 6.0 (Fe2+ in tetrahedral coordination):
+
+```
+vec_deviation = |VEC - 6.0|
+vec_penalty = softplus(vec_deviation - 1.0, beta=1.0)^2 * 0.1
+```
+
+- Flat within +/-1 of VEC=6.0 (no penalty for VEC 5.0-7.0)
+- Gentle (0.1 weight within theory weight)
+
+#### 7. TheoryRegularizationLoss Wiring
+
+- `HEAVY_FERMION` -> `HeavyFermionTheoryLoss` (was `UnknownTheoryLoss`)
+- `ORGANIC` -> `OrganicTheoryLoss` (was `UnknownTheoryLoss`)
+- Added `heavy_fermion_mask` and `organic_mask` batch processing
+- Return dict includes `heavy_fermion_loss`, `organic_loss`, `heavy_fermion_count`, `organic_count`
+
+#### 8. TheoryLossConfig New Fields
+
+```python
+magpie_mean: Optional[List[float]]     # [145] mean per feature (from norm_stats)
+magpie_std: Optional[List[float]]      # [145] std per feature
+idx_mean_atomic_weight: int = 15       # Magpie feature index
+idx_mean_melting_t: int = 21
+idx_mean_nvalence: int = 75            # VEC proxy
+idx_mean_gsvolume: int = 111
+heavy_fermion_tc_center: float = 1.0   # Log-normal center (K)
+heavy_fermion_tc_max: float = 20.0     # Soft cap (K)
+organic_tc_max: float = 15.0           # BEDT-TTF cap (K)
+organic_fullerene_tc_max: float = 45.0 # Fullerene cap (K)
+```
+
+#### 9. train_v12_clean.py
+
+- Passes `magpie_mean` and `magpie_std` from `norm_stats` to `TheoryLossConfig`
+- Updated print summary to mention V12.25
+
+### Design Decisions
+
+1. **Allen-Dynes over McMillan**: ~10 lines more math, significantly more accurate for strong-coupling. The omega_log ~ 0.827 * theta_D approximation is standard.
+2. **Lindemann as anchor, not replacement**: Neural net theta_D predictor stays — Lindemann just pulls it toward physical values.
+3. **Matthias VEC very gentle (0.01)**: Known correlation, not a hard rule.
+4. **Heavy fermion log-normal**: Huber in log-space with delta=2.0 gives ~7x tolerance.
+5. **No new learnable parameters for HF/Organic**: Pure physics priors — checkpoint backward-compatible.
+6. **All constraints are soft regularizers**: Theory weight is 0.05 (V12.24). These push back on predictions; if predictions survive, they're discovery candidates.
+
+### Backward Compatibility
+
+- All new TheoryLossConfig fields have defaults reproducing old behavior
+- Existing checkpoints resume cleanly (no new learnable params for HF/Organic)
+- `magpie_mean=None` / `magpie_std=None` disables Lindemann, Matthias, and iron VEC (graceful fallback)
+
+### Files Changed
+
+| File | Change |
+|------|--------|
+| `src/superconductor/losses/theory_losses.py` | Allen-Dynes, Lindemann, Matthias VEC, HeavyFermionTheoryLoss, OrganicTheoryLoss, iron VEC, config fields |
+| `scripts/train_v12_clean.py` | Pass magpie norm stats to TheoryLossConfig, updated print summary |
+| `docs/TRAINING_RECORDS.md` | This entry |
+
+### Expected Behavior
+
+- Theory loss should increase initially (more families now contribute non-zero loss)
+- BCS loss slightly different order of magnitude (Allen-Dynes vs McMillan)
+- Heavy fermion and organic counts should appear in theory loss breakdown (previously counted as "unknown")
+- Tc MAE should not regress (theory weight is only 0.05)
+- `n_theory_params` unchanged (no new learnable params for HF/Organic)
+
+---
+
 ## V12.24: Relative Tc Error + Loss Budget Rebalance (2026-02-10)
 
 ### Problem
