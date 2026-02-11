@@ -4,6 +4,70 @@ Chronological record of training runs, architecture changes, and optimization de
 
 ---
 
+## V12.26: Disable Contrastive & Theory Losses — Unblock Plateau (2026-02-11)
+
+### Problem
+
+Training plateaued at ~87% exact match (TF) / ~58% true autoregressive for 500+ epochs (epoch 1776-2345). Loss composition analysis revealed:
+
+| Component | Weighted Loss | % of Total |
+|-----------|--------------|------------|
+| Reconstruction | ~0.104 | 33% |
+| Theory (w=0.05) | 0.070 | 22% |
+| Magpie | 0.068 | 22% |
+| Contrastive (w=0.01) | 0.051 | 16% |
+| Tc/Stoich/Other | 0.023 | 7% |
+
+**Contrastive + Theory = 38% of total loss** but both completely flat:
+- Contrastive: stuck at ~5.06 for hundreds of epochs
+- Theory: stuck at ~1.43 for hundreds of epochs
+
+These provide large, static gradient fields that dilute the reconstruction gradient — the only signal that actually improves formula generation. The entropy system confirmed the plateau: `[Entropy] Boost ended: FAILURE - plateau persists (history: 8 interventions, 1/8 successful)`.
+
+### Changes
+
+**Disable plateaued losses:**
+- `contrastive_weight`: 0.01 → **0.0** (disabled — plateaued at 5.06, 16% of gradient budget)
+- `theory_weight`: 0.05 → **0.0** (disabled — plateaued at 1.43, 22% of gradient budget)
+
+**Strengthen Tc accuracy for generation quality:**
+- `tc_weight`: 10.0 → **20.0** (2x global increase)
+- `tc_kelvin_weight_scale`: 50.0 → **20.0** (high-Tc focus: 100K material gets 6x weight vs old 3x)
+- Net effect on 150K material: 10×4=40 → 20×8.5=**170** (4.25x more gradient)
+- Rationale: 100K+ materials have 6.5K MAE — unacceptable for a generative model. If z doesn't accurately encode what enables high-Tc, generation from that region produces unreliable candidates.
+
+**Strengthen high-pressure prediction:**
+- `hp_loss_weight`: 0.05 → **0.5** (10x — HP is critical for high-Tc families like H₃S at 203K, LaH₁₀ at 250K+)
+
+**Revive REINFORCE (dead RL gradient):**
+- `rl_temperature`: 0.8 → **1.5** (at entropy=0.09 and temp=0.8, all RLOO samples were identical → advantages≈0 → RL loss≈0; higher temp forces diverse samples)
+- Reset entropy intervention history on resume (old 1/8 success rate is invalid under new temperature regime)
+
+Config-only changes. The contrastive and theory infrastructure remains intact for future re-enablement.
+
+### Expected Loss Composition (projected)
+
+| Component | Old Weighted | New Weighted | % of New Total |
+|-----------|-------------|-------------|----------------|
+| Reconstruction | 0.101 | 0.101 | 42% |
+| Tc (w=20, scale=20) | 0.016 | ~0.040 | 17% |
+| Magpie | 0.068 | 0.068 | 28% |
+| HP (w=0.5) | 0.005 | ~0.052 | 8% |
+| Stoich | 0.004 | 0.004 | 2% |
+| Contrastive | 0.051 | 0.0 | 0% |
+| Theory | 0.070 | 0.0 | 0% |
+| **Total** | **0.315** | **~0.240** | |
+
+### Key Design Rationale
+
+The model's purpose is **generation of novel superconductor candidates**. Training error in Tc and HP prediction compounds during generation — a model that's blurry on what enables high-Tc will produce unreliable candidates from the high-Tc region of latent space. The Kelvin weighting change (scale 50→20) specifically concentrates gradient on the 947 samples above 100K where MAE is worst (6.5K), while barely affecting the 16K+ low-Tc samples already at 0.1K MAE.
+
+### Note
+
+The contrastive and theory losses served their purpose during earlier training (structure learning, physics regularization). At this stage the model has internalized those patterns and the losses became dead weight. They can be re-enabled at reduced weights for fine-tuning if needed.
+
+---
+
 ## V12.25: Theory Loss Overhaul — Allen-Dynes, Family Priors, VEC Constraints (2026-02-10)
 
 ### Problem

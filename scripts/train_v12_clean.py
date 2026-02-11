@@ -365,18 +365,18 @@ TRAIN_CONFIG = {
 
     # Loss weights (final values - curriculum ramps up to these)
     'formula_weight': 1.0,
-    'tc_weight': 10.0,
+    'tc_weight': 20.0,                # V12.26: 10→20, focus gradient on Tc accuracy for generation
     'magpie_weight': 2.0,
     'stoich_weight': 2.0,  # V12.4: Stoichiometry loss weight
     'kl_weight': 0.0001,  # Now L2 regularization weight on z (deterministic encoder)
-    'hp_loss_weight': 0.05,  # V12.19: High-pressure prediction loss weight (BCE)
+    'hp_loss_weight': 0.5,   # V12.26: 0.05→0.5, HP is critical for high-Tc (H3S, LaH10) — model must master this
     'sc_loss_weight': 0.5,   # V12.21: SC/non-SC classification loss weight (BCE, all samples)
 
     # V12.20: Tc loss improvements (log-transform + Huber)
     'tc_log_transform': True,   # Apply log1p(Tc) before z-score normalization (reduces skew 2.18→-0.17)
     'tc_huber_delta': 1.0,      # Huber loss delta (clips gradient for outliers; 1.0 = ~1 std dev in normalized space)
     'tc_kelvin_weighting': True,       # V12.23: Weight Tc loss by true Tc in Kelvin
-    'tc_kelvin_weight_scale': 50.0,    # weight = 1 + tc_K / scale (50 → 3x at 100K, 6x at 250K)
+    'tc_kelvin_weight_scale': 20.0,    # V12.26: 50→20, aggressive high-Tc focus (6x at 100K, 11x at 200K)
     'tc_underpred_penalty': 1.5,       # V12.23: Asymmetric loss — underprediction penalized 1.5x
     'tc_relative_weight': 0.5,         # V12.24: Blend weight for relative error (0=pure Huber, 1=pure relative)
 
@@ -410,7 +410,7 @@ TRAIN_CONFIG = {
     'rl_weight': 1.5,            # REINFORCE weight (0=disabled, 1.0-2.5=typical) V12.12: Enabled for fine-tuning
     'ce_weight': 1.0,            # Cross-entropy weight (keep at 1.0)
     'n_samples_rloo': 2,         # Number of samples for RLOO baseline (2-4)
-    'rl_temperature': 0.8,       # Sampling temperature for REINFORCE
+    'rl_temperature': 1.5,       # V12.26: 0.8→1.5, break identical-sample deadlock (entropy=0.09 made RLOO advantages≈0)
     'entropy_weight': 0.2,       # Entropy bonus in REINFORCE reward (encourages exploration)
     'use_autoregressive_reinforce': True,  # Use KV-cached autoregressive sampling (recommended)
 
@@ -503,7 +503,7 @@ TRAIN_CONFIG = {
     # 3. Cluster SC families together
     # =========================================================================
     'contrastive_mode': True,          # Enable contrastive training with non-SC data
-    'contrastive_weight': 0.01,        # V12.24: Reduced from 0.1 (was ~24% of gradient, now ~3%)
+    'contrastive_weight': 0.0,         # V12.26: Disabled — plateaued at 5.06, consuming 16% of gradient budget
     'contrastive_warmup_epochs': 100,  # Warm up contrastive loss over N epochs
     'contrastive_temperature': 0.07,   # SupCon temperature (0.07 = standard)
     'non_sc_formula_weight': 0.5,      # Formula loss weight for non-SC samples (lower)
@@ -530,7 +530,7 @@ TRAIN_CONFIG = {
     'consistency_magpie_weight': 0.1,      # Weight for Magpie consistency
 
     'use_theory_loss': True,               # V12.22: Enable theory-based regularization
-    'theory_weight': 0.05,                 # V12.24: Reduced from 0.5 (redundant with Tc loss during training)
+    'theory_weight': 0.0,                  # V12.26: Disabled — plateaued at 1.43, consuming 22% of gradient budget
     'theory_warmup_epochs': 50,            # V12.22: Ramp up over 50 epochs
     'theory_use_soft_constraints': True,   # V12.22: Soft quadratic penalties (no hard caps)
 
@@ -2229,7 +2229,17 @@ def load_checkpoint(encoder, decoder, checkpoint_path, entropy_manager=None,
     # V12.9: Load entropy manager state if available
     if entropy_manager is not None and 'entropy_manager_state' in checkpoint:
         entropy_manager.load_state(checkpoint['entropy_manager_state'])
-        print(f"  Restored entropy manager state", flush=True)
+        # V12.26: Reset intervention history — old history is invalid after rl_temperature change
+        if hasattr(entropy_manager, 'causal_scheduler'):
+            old_count = len(entropy_manager.causal_scheduler.interventions)
+            if old_count > 0:
+                entropy_manager.causal_scheduler.interventions = []
+                entropy_manager.causal_scheduler.state = 'MONITORING'
+                print(f"  Restored entropy manager state (reset {old_count} stale interventions — rl_temperature changed)")
+            else:
+                print(f"  Restored entropy manager state", flush=True)
+        else:
+            print(f"  Restored entropy manager state", flush=True)
 
     # V12.22: Load theory loss function state if available
     if theory_loss_fn is not None and 'theory_loss_fn_state_dict' in checkpoint:
