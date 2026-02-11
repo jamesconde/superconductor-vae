@@ -4,6 +4,78 @@ Chronological record of training runs, architecture changes, and optimization de
 
 ---
 
+## V12.24: Relative Tc Error + Loss Budget Rebalance (2026-02-10)
+
+### Problem
+
+After V12.23: Kelvin errors improving (100K+ dropped from 79K to 38.4K), but two issues remain:
+
+1. **Low-Tc relative errors are huge**: 1.6K error at Tc=2K is 80% relative error — terrible for discovery, but the loss function doesn't notice because `|3.6 - 2.0| = 1.6K` is small in absolute terms.
+
+2. **Gradient budget is badly allocated**:
+   - Contrastive loss (SupCon): raw=5.0 × w=0.1 = **0.50** (~24% of total gradient) — but SupCon's theoretical minimum is ~log(batch_size) ≈ 5.5, so it's near-converged and just adding noise
+   - Theory loss: raw=0.20 × w=0.5 = **0.10** (~5%) — mathematically redundant with Tc loss during training (both penalize wrong Tc predictions, but Tc loss has ground truth; theory loss double-counts the same error with different math)
+   - Tc loss: raw=0.08 × w=10 = **0.83** (~40%) — the primary objective gets less than half the gradient
+
+### Changes
+
+#### 1. Relative Error Loss Component (`CombinedLossWithREINFORCE.forward()`)
+
+Blends Huber loss (good for absolute error) with relative error in Kelvin space:
+
+```python
+relative_err = |pred_K - true_K| / max(true_K, 1.0)
+tc_loss_per_sample = (1 - alpha) * huber + alpha * relative_err
+```
+
+- At Tc=2K with 1.6K error: relative = 0.80 (vs Huber ~0.08) — **10x stronger signal**
+- At Tc=100K with 38K error: relative = 0.38 — still strong
+- `tc_relative_weight=0.5` → 50/50 blend of Huber and relative
+- Both the asymmetric penalty (V12.23) and Kelvin weighting apply on top
+
+#### 2. Contrastive Weight: 0.1 → 0.01
+
+SupCon loss is a latent geometry shaping objective ("cherry on top"), not a workhorse. At w=0.1 it consumed ~24% of gradient. At w=0.01 it's ~3% — enough to maintain SC/non-SC separation without dominating gradient updates.
+
+#### 3. Theory Weight: 0.5 → 0.05
+
+Theory loss is mathematically redundant with Tc loss during training: if a BCS material has true Tc=15K and the model predicts 40K, BOTH the Tc Huber loss AND the BCS theory penalty fire. The Tc loss already has the correct answer — the theory penalty just double-counts the error with weaker math (it uses the McMillan formula approximation rather than ground truth).
+
+Theory loss remains valuable for:
+- Keeping the learnable BCS/cuprate predictors alive (Debye temp, doping) for later use during generation
+- Mild physics-grounding on edge cases where family classification is uncertain
+
+At w=0.05 it provides ~0.01 gradient contribution — maintenance level.
+
+#### 4. Config
+
+```python
+'tc_relative_weight': 0.5,         # 50% relative + 50% Huber blend
+'contrastive_weight': 0.01,        # Down from 0.1 (geometry shaping, not primary)
+'theory_weight': 0.05,             # Down from 0.5 (redundant with Tc loss during training)
+```
+
+### New Loss Budget (Estimated)
+
+| Component | Before V12.24 | After V12.24 | Change |
+|-----------|--------------|-------------|--------|
+| Tc | 0.83 (40%) | ~1.2 (70%) | **Primary objective now dominant** |
+| Contrastive | 0.50 (24%) | 0.05 (3%) | Maintenance level |
+| Magpie | 0.16 (8%) | 0.16 (9%) | Unchanged |
+| Theory | 0.10 (5%) | 0.01 (1%) | Maintenance level |
+| Formula | 0.10 (5%) | 0.10 (6%) | Unchanged |
+| Other | 0.03 (1%) | 0.03 (2%) | Unchanged |
+
+### Expected Behavior
+
+- Tc loss value will increase initially (relative error component is larger in magnitude than Huber)
+- Low-Tc relative errors (0-10K range) should improve — 80% error at 2K now gets strong signal
+- High-Tc absolute errors should continue improving (V12.23 Kelvin weighting still active)
+- Formula accuracy should not degrade (formula loss unchanged, more gradient budget available)
+- Contrastive loss raw value may drift upward slightly (less gradient suppressing it) — this is fine; the geometry is already well-shaped after 2000+ epochs
+
+---
+
 ## V12.23: Tc-Weighted Asymmetric Regression Loss (2026-02-10)
 
 ### Problem

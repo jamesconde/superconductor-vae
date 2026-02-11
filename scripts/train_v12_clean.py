@@ -378,6 +378,7 @@ TRAIN_CONFIG = {
     'tc_kelvin_weighting': True,       # V12.23: Weight Tc loss by true Tc in Kelvin
     'tc_kelvin_weight_scale': 50.0,    # weight = 1 + tc_K / scale (50 → 3x at 100K, 6x at 250K)
     'tc_underpred_penalty': 1.5,       # V12.23: Asymmetric loss — underprediction penalized 1.5x
+    'tc_relative_weight': 0.5,         # V12.24: Blend weight for relative error (0=pure Huber, 1=pure relative)
 
     # V12.20: Magpie normalization improvements
     'magpie_skew_threshold': 3.0,   # Features with |skew| > this get quantile-transformed to Gaussian
@@ -502,7 +503,7 @@ TRAIN_CONFIG = {
     # 3. Cluster SC families together
     # =========================================================================
     'contrastive_mode': True,          # Enable contrastive training with non-SC data
-    'contrastive_weight': 0.1,         # Weight for contrastive loss
+    'contrastive_weight': 0.01,        # V12.24: Reduced from 0.1 (was ~24% of gradient, now ~3%)
     'contrastive_warmup_epochs': 100,  # Warm up contrastive loss over N epochs
     'contrastive_temperature': 0.07,   # SupCon temperature (0.07 = standard)
     'non_sc_formula_weight': 0.5,      # Formula loss weight for non-SC samples (lower)
@@ -529,7 +530,7 @@ TRAIN_CONFIG = {
     'consistency_magpie_weight': 0.1,      # Weight for Magpie consistency
 
     'use_theory_loss': True,               # V12.22: Enable theory-based regularization
-    'theory_weight': 0.5,                  # V12.22: Strong signal (was 0.05)
+    'theory_weight': 0.05,                 # V12.24: Reduced from 0.5 (redundant with Tc loss during training)
     'theory_warmup_epochs': 50,            # V12.22: Ramp up over 50 epochs
     'theory_use_soft_constraints': True,   # V12.22: Soft quadratic penalties (no hard caps)
 
@@ -1340,6 +1341,7 @@ class CombinedLossWithREINFORCE(nn.Module):
         tc_kelvin_weighting: bool = False,    # V12.23: Weight Tc loss by true Tc in Kelvin
         tc_kelvin_weight_scale: float = 50.0, # V12.23: weight = 1 + tc_K / scale
         tc_underpred_penalty: float = 1.0,    # V12.23: 1.0 = symmetric (backward compat)
+        tc_relative_weight: float = 0.0,      # V12.24: 0 = pure Huber (backward compat), >0 blends in relative error
         tc_mean: float = 0.0,                 # V12.23: For denormalizing Tc to Kelvin
         tc_std: float = 1.0,                  # V12.23: For denormalizing Tc to Kelvin
         tc_log_transform: bool = False,       # V12.23: Whether Tc is in log1p space
@@ -1359,6 +1361,7 @@ class CombinedLossWithREINFORCE(nn.Module):
         self.tc_kelvin_weighting = tc_kelvin_weighting        # V12.23
         self.tc_kelvin_weight_scale = tc_kelvin_weight_scale  # V12.23
         self.tc_underpred_penalty = tc_underpred_penalty      # V12.23
+        self.tc_relative_weight = tc_relative_weight          # V12.24
         self.tc_mean = tc_mean                                # V12.23
         self.tc_std = tc_std                                  # V12.23
         self.tc_log_transform = tc_log_transform              # V12.23
@@ -1658,7 +1661,7 @@ class CombinedLossWithREINFORCE(nn.Module):
             entropy_per_position = -(probs * log_probs).sum(dim=-1)
             entropy = (entropy_per_position * mask.float()).sum(dim=1).mean()
 
-        # 4. Tc Loss (V12.20: Huber, V12.23: Kelvin-weighted + asymmetric)
+        # 4. Tc Loss (V12.20: Huber, V12.23: Kelvin-weighted + asymmetric, V12.24: relative error)
         tc_p = tc_pred.squeeze()
         tc_t = tc_true.squeeze()
         if self.tc_huber_delta > 0:
@@ -1672,14 +1675,30 @@ class CombinedLossWithREINFORCE(nn.Module):
             asymmetry = 1.0 + underpred_mask * (self.tc_underpred_penalty - 1.0)
             tc_loss_per_sample = tc_loss_per_sample * asymmetry
 
+        # V12.23/V12.24: Denormalize to Kelvin (shared by Kelvin weighting + relative error)
+        tc_denorm_t = tc_t * self.tc_std + self.tc_mean
+        if self.tc_log_transform:
+            tc_kelvin_true = torch.expm1(tc_denorm_t).clamp(min=0.0)
+        else:
+            tc_kelvin_true = tc_denorm_t.clamp(min=0.0)
+
+        # V12.24: Relative error in Kelvin space — treats 1.6K error at 2K (80%)
+        # the same as 80K error at 100K (80%). Uniform percentage accuracy objective.
+        if self.tc_relative_weight > 0:
+            tc_denorm_p = tc_p * self.tc_std + self.tc_mean
+            if self.tc_log_transform:
+                tc_kelvin_pred = torch.expm1(tc_denorm_p).clamp(min=0.0)
+            else:
+                tc_kelvin_pred = tc_denorm_p.clamp(min=0.0)
+            # Relative error: |pred - true| / max(true, 1K) — clamp prevents div-by-zero
+            tc_relative_err = torch.abs(tc_kelvin_pred - tc_kelvin_true) / tc_kelvin_true.clamp(min=1.0)
+            # Blend: (1-alpha) * Huber + alpha * relative
+            tc_loss_per_sample = ((1.0 - self.tc_relative_weight) * tc_loss_per_sample
+                                  + self.tc_relative_weight * tc_relative_err)
+
         # V12.23: Kelvin weighting — counteract log1p gradient compression
         if self.tc_kelvin_weighting:
-            tc_denorm = tc_t * self.tc_std + self.tc_mean
-            if self.tc_log_transform:
-                tc_kelvin = torch.expm1(tc_denorm).clamp(min=0.0)
-            else:
-                tc_kelvin = tc_denorm.clamp(min=0.0)
-            tc_weights = 1.0 + tc_kelvin / self.tc_kelvin_weight_scale
+            tc_weights = 1.0 + tc_kelvin_true / self.tc_kelvin_weight_scale
             tc_loss = (tc_loss_per_sample * tc_weights).mean()
         else:
             tc_loss = tc_loss_per_sample.mean()
@@ -3210,6 +3229,7 @@ def train():
         tc_kelvin_weighting=TRAIN_CONFIG.get('tc_kelvin_weighting', False),      # V12.23
         tc_kelvin_weight_scale=TRAIN_CONFIG.get('tc_kelvin_weight_scale', 50.0), # V12.23
         tc_underpred_penalty=TRAIN_CONFIG.get('tc_underpred_penalty', 1.0),      # V12.23
+        tc_relative_weight=TRAIN_CONFIG.get('tc_relative_weight', 0.0),        # V12.24
         tc_mean=norm_stats['tc_mean'],                                           # V12.23
         tc_std=norm_stats['tc_std'],                                             # V12.23
         tc_log_transform=norm_stats.get('tc_log_transform', False),              # V12.23
@@ -3455,6 +3475,10 @@ def train():
               f"(3x at {2*TRAIN_CONFIG['tc_kelvin_weight_scale']:.0f}K)")
     if TRAIN_CONFIG.get('tc_underpred_penalty', 1.0) != 1.0:
         print(f"  Tc asymmetric: underprediction penalty={TRAIN_CONFIG['tc_underpred_penalty']}x")
+    if TRAIN_CONFIG.get('tc_relative_weight', 0.0) > 0:
+        print(f"  Tc relative error: blend={TRAIN_CONFIG['tc_relative_weight']} "
+              f"({TRAIN_CONFIG['tc_relative_weight']*100:.0f}% relative + "
+              f"{(1-TRAIN_CONFIG['tc_relative_weight'])*100:.0f}% Huber)")
     if TRAIN_CONFIG.get('use_theory_loss', False):
         print(f"  Theory: {TRAIN_CONFIG.get('theory_weight', 0)} "
               f"(warmup={TRAIN_CONFIG.get('theory_warmup_epochs', 50)} epochs)")
