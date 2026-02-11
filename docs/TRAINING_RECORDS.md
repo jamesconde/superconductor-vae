@@ -39,11 +39,16 @@ These provide large, static gradient fields that dilute the reconstruction gradi
 **Strengthen high-pressure prediction:**
 - `hp_loss_weight`: 0.05 → **0.5** (10x — HP is critical for high-Tc families like H₃S at 203K, LaH₁₀ at 250K+)
 
-**Revive REINFORCE (dead RL gradient):**
-- `rl_temperature`: 0.8 → **1.5** (at entropy=0.09 and temp=0.8, all RLOO samples were identical → advantages≈0 → RL loss≈0; higher temp forces diverse samples)
-- Reset entropy intervention history on resume (old 1/8 success rate is invalid under new temperature regime)
+**Disable REINFORCE (zero gradient for 500+ epochs):**
+- `rl_weight`: 1.5 → **0.0** (disabled)
+- RLOO advantages were ≈0 for 500+ epochs — both samples always nearly identical, so no RL gradient ever flowed
+- The reward metric (0→60) tracked exact match improvement but was a *consequence* of CE training, not a cause
+- REINFORCE sampling consumed **84% of epoch time** (~100s out of 119s) — pure overhead
+- Disabling drops epoch time from ~119s to ~19s (**6x speedup**, ~180 epochs/hour)
+- Earlier attempt to revive RL via `rl_temperature` 0.8→1.5 produced diverse but low-quality samples (reward went negative) with advantages still ≈0
+- Reset entropy intervention history on resume (stale from prior RL regime)
 
-Config-only changes. The contrastive and theory infrastructure remains intact for future re-enablement.
+Config-only changes. All infrastructure (contrastive, theory, REINFORCE) remains intact for future re-enablement.
 
 ### Expected Loss Composition (projected)
 

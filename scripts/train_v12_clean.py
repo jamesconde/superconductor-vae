@@ -407,7 +407,7 @@ TRAIN_CONFIG = {
     #   - Then enable rl_weight=1.0-2.5 for fine-tuning
     #   - Higher n_samples_rloo = lower variance but slower
     # =========================================================================
-    'rl_weight': 1.5,            # REINFORCE weight (0=disabled, 1.0-2.5=typical) V12.12: Enabled for fine-tuning
+    'rl_weight': 0.0,            # V12.26: Disabled — RL loss was 0.0000 for 500+ epochs (RLOO advantages≈0), consuming 84% of epoch time. Saves ~100s/epoch (119s→19s)
     'ce_weight': 1.0,            # Cross-entropy weight (keep at 1.0)
     'n_samples_rloo': 2,         # Number of samples for RLOO baseline (2-4)
     'rl_temperature': 1.5,       # V12.26: 0.8→1.5, break identical-sample deadlock (entropy=0.09 made RLOO advantages≈0)
