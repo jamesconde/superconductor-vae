@@ -307,7 +307,7 @@ def get_timing_stats() -> Optional[TimingStats]:
 MODEL_CONFIG = {
     'latent_dim': 2048,
     'fusion_dim': 256,
-    'magpie_dim': 145,
+    'magpie_dim': 145,  # V12.28: Will be 151 after physics features added (dynamically detected from CSV)
     'encoder_hidden': [512, 256],
     'decoder_hidden': [256, 512],
     'd_model': 512,
@@ -380,6 +380,12 @@ TRAIN_CONFIG = {
     'tc_underpred_penalty': 1.5,       # V12.23: Asymmetric loss — underprediction penalized 1.5x
     'tc_relative_weight': 0.5,         # V12.24: Blend weight for relative error (0=pure Huber, 1=pure relative)
 
+    # V12.28: Tc prediction improvements
+    'tc_class_weight': 2.0,     # Tc bucket classification loss weight
+    'tc_class_bins': [0, 10, 50, 100],  # Bin edges in Kelvin (creates 5 classes: 0, 0-10, 10-50, 50-100, 100+)
+    'tc_bin_weights': {0: 1.0, 10: 1.5, 50: 2.0, 100: 2.5, 150: 3.0},  # Per-bin Tc loss multipliers
+    'mc_dropout_samples': 10,   # MC Dropout forward passes at eval time
+
     # V12.20: Magpie normalization improvements
     'magpie_skew_threshold': 3.0,   # Features with |skew| > this get quantile-transformed to Gaussian
     'magpie_sc_only_norm': True,    # Use SC-only mean/std for z-score (avoids non-SC distribution bias)
@@ -407,12 +413,13 @@ TRAIN_CONFIG = {
     #   - Then enable rl_weight=1.0-2.5 for fine-tuning
     #   - Higher n_samples_rloo = lower variance but slower
     # =========================================================================
-    'rl_weight': 0.0,            # V12.26: Disabled — RL loss was 0.0000 for 500+ epochs (RLOO advantages≈0), consuming 84% of epoch time. Saves ~100s/epoch (119s→19s)
+    'rl_weight': 2.5,            # Re-enabled: RLOO averaging bug fixed + SCST added
     'ce_weight': 1.0,            # Cross-entropy weight (keep at 1.0)
-    'n_samples_rloo': 2,         # Number of samples for RLOO baseline (2-4)
-    'rl_temperature': 1.5,       # V12.26: 0.8→1.5, break identical-sample deadlock (entropy=0.09 made RLOO advantages≈0)
+    'n_samples_rloo': 4,         # Number of samples for RLOO baseline (A100: 4)
+    'rl_temperature': 0.5,       # Sampling temperature for RL
     'entropy_weight': 0.2,       # Entropy bonus in REINFORCE reward (encourages exploration)
-    'use_autoregressive_reinforce': True,  # Use KV-cached autoregressive sampling (recommended)
+    'use_autoregressive_reinforce': True,  # Use KV-cached autoregressive sampling
+    'rl_method': 'scst',         # 'scst' (Self-Critical, Rennie 2017) or 'rloo' (Ahmadian 2024)
 
     # =========================================================================
     # V12.9: Speculative Decoding Settings
@@ -1337,6 +1344,7 @@ class CombinedLossWithREINFORCE(nn.Module):
         focal_gamma: float = 2.0,
         label_smoothing: float = 0.1,
         use_autoregressive_reinforce: bool = True,
+        rl_method: str = 'scst',  # 'scst' or 'rloo'
         tc_huber_delta: float = 0.0,  # V12.20: 0 = MSE (backward compat), >0 = Huber
         tc_kelvin_weighting: bool = False,    # V12.23: Weight Tc loss by true Tc in Kelvin
         tc_kelvin_weight_scale: float = 50.0, # V12.23: weight = 1 + tc_K / scale
@@ -1345,6 +1353,10 @@ class CombinedLossWithREINFORCE(nn.Module):
         tc_mean: float = 0.0,                 # V12.23: For denormalizing Tc to Kelvin
         tc_std: float = 1.0,                  # V12.23: For denormalizing Tc to Kelvin
         tc_log_transform: bool = False,       # V12.23: Whether Tc is in log1p space
+        # V12.28: Tc prediction improvements
+        tc_bin_weights: dict = None,          # V12.28: Per-bin Tc loss multipliers {threshold: weight}
+        tc_class_weight: float = 0.0,         # V12.28: Tc bucket classification loss weight
+        tc_class_bins: list = None,           # V12.28: Bin edges in Kelvin [0, 10, 50, 100]
     ):
         super().__init__()
 
@@ -1365,9 +1377,13 @@ class CombinedLossWithREINFORCE(nn.Module):
         self.tc_mean = tc_mean                                # V12.23
         self.tc_std = tc_std                                  # V12.23
         self.tc_log_transform = tc_log_transform              # V12.23
+        self.tc_bin_weights = tc_bin_weights or {}             # V12.28
+        self.tc_class_weight = tc_class_weight                # V12.28
+        self.tc_class_bins = tc_class_bins or [0, 10, 50, 100]  # V12.28
 
-        # V12.8: Autoregressive REINFORCE with KV caching
+        # Autoregressive REINFORCE / SCST
         self.use_autoregressive_reinforce = use_autoregressive_reinforce
+        self.rl_method = rl_method  # 'scst' or 'rloo'
         self._decoder = None
         self._max_len = 60
 
@@ -1507,18 +1523,20 @@ class CombinedLossWithREINFORCE(nn.Module):
         # RLOO baseline computation
         total_reward = rewards_stack.sum(dim=0)
 
-        advantages_list = []
+        # BUG FIX: Each RLOO sample contributes its own independent gradient.
+        # Previously averaged advantages across samples — since sum of RLOO
+        # advantages = 0 for any K, this guaranteed zero gradient. Fix: multiply
+        # each sample's advantage with its own log_probs, then sum.
+        reinforce_loss = torch.zeros(1, device=rewards_stack.device)
         for i in range(n_samples):
             baseline_i = (total_reward - rewards_stack[i]) / (n_samples - 1)
             advantage_i = rewards_stack[i] - baseline_i
-            advantages_list.append(advantage_i)
+            reinforce_loss = reinforce_loss + -(advantage_i * log_probs_stack[i]).mean()
 
-        advantages = torch.stack(advantages_list, dim=0).mean(dim=0)
-        mean_log_probs = log_probs_stack.mean(dim=0)
         mean_rewards = rewards_stack.mean(dim=0)
         mean_entropy = entropy_stack.mean()  # Scalar for logging
 
-        return advantages, mean_log_probs, mean_rewards, mean_entropy
+        return reinforce_loss, mean_rewards, mean_entropy
 
     def sample_from_logits(self, logits: torch.Tensor, temperature: float):
         """Sample tokens from logits (fallback when not using autoregressive)."""
@@ -1573,18 +1591,132 @@ class CombinedLossWithREINFORCE(nn.Module):
         entropy_stack = torch.stack(all_entropies, dim=0)
         total_reward = rewards_stack.sum(dim=0)
 
-        advantages_list = []
+        # BUG FIX: Same as compute_rloo_autoregressive — each sample's advantage
+        # multiplied with its own log_probs, then sum.
+        reinforce_loss = torch.zeros(1, device=rewards_stack.device)
         for i in range(n_samples):
             baseline_i = (total_reward - rewards_stack[i]) / (n_samples - 1)
             advantage_i = rewards_stack[i] - baseline_i
-            advantages_list.append(advantage_i)
+            reinforce_loss = reinforce_loss + -(advantage_i * log_probs_stack[i]).mean()
 
-        advantages = torch.stack(advantages_list, dim=0).mean(dim=0)
-        mean_log_probs = log_probs_stack.mean(dim=0)
         mean_rewards = rewards_stack.mean(dim=0)
         mean_entropy = entropy_stack.mean()
 
-        return advantages, mean_log_probs, mean_rewards, mean_entropy
+        return reinforce_loss, mean_rewards, mean_entropy
+
+    def compute_scst(
+        self,
+        z: torch.Tensor,
+        targets: torch.Tensor,
+        encoder_skip: torch.Tensor = None,
+        stoich_pred: torch.Tensor = None,
+    ):
+        """
+        Self-Critical Sequence Training (Rennie et al. 2017).
+
+        Uses greedy decode reward as baseline instead of RLOO leave-one-out.
+        Advantage = reward(sampled) - reward(greedy). If the sample beats
+        greedy, reinforce it; if greedy beats sample, push away from sample.
+
+        Benefits over RLOO:
+        - Baseline aligns with test-time behavior (greedy decode)
+        - Only 2 forward passes (1 greedy + 1 sample) vs K for RLOO
+        - No advantage-cancellation issues
+        - Lower variance baseline (greedy is deterministic)
+
+        Returns:
+            reinforce_loss: Scalar SCST loss
+            mean_rewards: Mean sampled rewards [batch] (for logging)
+            mean_entropy: Mean entropy scalar (for logging)
+        """
+        if self._decoder is None:
+            raise RuntimeError("Decoder not set. Call set_decoder() first.")
+
+        # Precompute memory once — shared by both greedy and sample passes
+        cached_memory = self._decoder.precompute_memory(z, encoder_skip, stoich_pred)
+
+        # 1. Greedy decode (deterministic baseline) — no gradients needed
+        with torch.no_grad():
+            greedy_tokens, _, _ = self._decoder.generate_with_kv_cache(
+                z=z,
+                encoder_skip=encoder_skip,
+                stoich_pred=stoich_pred,
+                temperature=0.0,  # argmax
+                max_len=self._max_len,
+                return_log_probs=False,
+                cached_memory=cached_memory,
+            )
+
+            # Pad/truncate greedy tokens to match target length for reward computation
+            if greedy_tokens.size(1) < targets.size(1):
+                pad_len = targets.size(1) - greedy_tokens.size(1)
+                greedy_tokens = F.pad(greedy_tokens, (0, pad_len), value=PAD_IDX)
+            elif greedy_tokens.size(1) > targets.size(1):
+                greedy_tokens = greedy_tokens[:, :targets.size(1)]
+
+            # Greedy mask (valid until END token)
+            greedy_is_end = (greedy_tokens == END_IDX)
+            greedy_end_pos = torch.argmax(greedy_is_end.int(), dim=1)
+            greedy_has_end = greedy_is_end.any(dim=1)
+            greedy_end_pos = torch.where(
+                greedy_has_end, greedy_end_pos,
+                torch.tensor(greedy_tokens.size(1), device=z.device)
+            )
+            positions = torch.arange(greedy_tokens.size(1), device=z.device).unsqueeze(0)
+            greedy_mask = (positions <= greedy_end_pos.unsqueeze(1)).float()
+
+            # Compute greedy reward (baseline)
+            greedy_rewards = compute_reward_gpu_native(
+                greedy_tokens, targets, greedy_mask,
+                config=self.gpu_reward_config,
+                pad_idx=PAD_IDX, end_idx=END_IDX
+            )
+
+        # 2. Sample decode — need log_probs for gradient
+        sampled_tokens, log_probs, entropy, sample_mask = self._decoder.sample_for_reinforce(
+            z=z,
+            encoder_skip=encoder_skip,
+            stoich_pred=stoich_pred,
+            temperature=self.temperature,
+            max_len=self._max_len,
+            cached_memory=cached_memory,
+        )
+
+        # Pad/truncate sampled tokens to match target length
+        if sampled_tokens.size(1) < targets.size(1):
+            pad_len = targets.size(1) - sampled_tokens.size(1)
+            sampled_tokens = F.pad(sampled_tokens, (0, pad_len), value=PAD_IDX)
+            log_probs = F.pad(log_probs, (0, pad_len), value=0.0)
+            entropy = F.pad(entropy, (0, pad_len), value=0.0)
+            sample_mask = F.pad(sample_mask, (0, pad_len), value=0.0)
+        elif sampled_tokens.size(1) > targets.size(1):
+            sampled_tokens = sampled_tokens[:, :targets.size(1)]
+            log_probs = log_probs[:, :targets.size(1)]
+            entropy = entropy[:, :targets.size(1)]
+            sample_mask = sample_mask[:, :targets.size(1)]
+
+        # Compute sample reward
+        with torch.no_grad():
+            sample_rewards = compute_reward_gpu_native(
+                sampled_tokens, targets, sample_mask,
+                config=self.gpu_reward_config,
+                pad_idx=PAD_IDX, end_idx=END_IDX
+            )
+
+        # 3. SCST advantage: how much better is the sample than greedy?
+        advantages = sample_rewards - greedy_rewards
+
+        # 4. Sequence log prob (sum over valid positions)
+        seq_log_prob = (log_probs * sample_mask).sum(dim=1)
+
+        # 5. REINFORCE loss: push toward samples that beat greedy,
+        #    push away from samples worse than greedy
+        reinforce_loss = -(advantages * seq_log_prob).mean()
+
+        # Entropy for logging
+        mean_entropy = (entropy * sample_mask).sum(dim=1).mean() / sample_mask.sum(dim=1).clamp(min=1).mean()
+
+        return reinforce_loss, sample_rewards, mean_entropy
 
     def forward(
         self,
@@ -1606,6 +1738,8 @@ class CombinedLossWithREINFORCE(nn.Module):
         z: torch.Tensor = None,
         encoder_skip: torch.Tensor = None,
         stoich_pred_for_reinforce: torch.Tensor = None,
+        # V12.28: Tc classification
+        tc_class_logits: torch.Tensor = None,
     ) -> Dict[str, torch.Tensor]:
         """Compute combined loss with optional REINFORCE."""
 
@@ -1629,23 +1763,29 @@ class CombinedLossWithREINFORCE(nn.Module):
             formula_ce_loss = (ce_loss_per_token * mask.float()).sum(dim=1).mean()
 
         # 2. REINFORCE Loss (skip if rl_weight=0)
-        # V12.8: Entropy bonus is now part of the reward signal, not direct loss subtraction
         rl_entropy = torch.tensor(0.0, device=formula_logits.device)
         if self.rl_weight > 0:
             if self.use_autoregressive_reinforce and z is not None and self._decoder is not None:
-                # V12.8: True autoregressive sampling with KV cache
-                advantages, mean_log_probs, mean_rewards, rl_entropy = self.compute_rloo_autoregressive(
-                    z=z,
-                    targets=formula_targets,
-                    encoder_skip=encoder_skip,
-                    stoich_pred=stoich_pred_for_reinforce,
-                )
+                # SCST or RLOO with true autoregressive sampling
+                if self.rl_method == 'scst':
+                    reinforce_loss, mean_rewards, rl_entropy = self.compute_scst(
+                        z=z,
+                        targets=formula_targets,
+                        encoder_skip=encoder_skip,
+                        stoich_pred=stoich_pred_for_reinforce,
+                    )
+                else:
+                    reinforce_loss, mean_rewards, rl_entropy = self.compute_rloo_autoregressive(
+                        z=z,
+                        targets=formula_targets,
+                        encoder_skip=encoder_skip,
+                        stoich_pred=stoich_pred_for_reinforce,
+                    )
             else:
                 # Fallback: sample from teacher-forced logits
-                advantages, mean_log_probs, mean_rewards, rl_entropy = self.compute_rloo_from_logits(
+                reinforce_loss, mean_rewards, rl_entropy = self.compute_rloo_from_logits(
                     formula_logits, formula_targets, mask
                 )
-            reinforce_loss = -(advantages * mean_log_probs).mean()
         else:
             reinforce_loss = torch.tensor(0.0, device=formula_logits.device)
             mean_rewards = torch.tensor(0.0, device=formula_logits.device)
@@ -1696,12 +1836,37 @@ class CombinedLossWithREINFORCE(nn.Module):
             tc_loss_per_sample = ((1.0 - self.tc_relative_weight) * tc_loss_per_sample
                                   + self.tc_relative_weight * tc_relative_err)
 
+        # V12.28: Binned Tc loss weighting — extra focus on high-Tc bins
+        if self.tc_bin_weights:
+            bin_w = torch.ones_like(tc_kelvin_true)
+            for threshold, weight in sorted(self.tc_bin_weights.items(), key=lambda x: x[0], reverse=True):
+                bin_w = torch.where(
+                    tc_kelvin_true >= threshold,
+                    torch.tensor(float(weight), device=bin_w.device, dtype=bin_w.dtype),
+                    bin_w
+                )
+            tc_loss_per_sample = tc_loss_per_sample * bin_w
+
         # V12.23: Kelvin weighting — counteract log1p gradient compression
         if self.tc_kelvin_weighting:
             tc_weights = 1.0 + tc_kelvin_true / self.tc_kelvin_weight_scale
             tc_loss = (tc_loss_per_sample * tc_weights).mean()
         else:
             tc_loss = tc_loss_per_sample.mean()
+
+        # V12.28: Tc bucket classification loss (auxiliary signal)
+        tc_class_loss = torch.tensor(0.0, device=formula_logits.device)
+        if tc_class_logits is not None and self.tc_class_weight > 0:
+            # Convert true Tc (Kelvin) to bucket labels
+            # Buckets: 0=non-SC(Tc=0), 1=low(0-10K), 2=medium(10-50K), 3=high(50-100K), 4=very-high(100K+)
+            tc_bins = torch.zeros_like(tc_kelvin_true, dtype=torch.long)
+            for i, edge in enumerate(self.tc_class_bins):
+                tc_bins = torch.where(
+                    tc_kelvin_true > edge,
+                    torch.tensor(i + 1, device=tc_bins.device, dtype=torch.long),
+                    tc_bins
+                )
+            tc_class_loss = F.cross_entropy(tc_class_logits, tc_bins)
 
         # 5. Magpie Loss
         magpie_loss = F.mse_loss(magpie_pred, magpie_true)
@@ -1731,7 +1896,8 @@ class CombinedLossWithREINFORCE(nn.Module):
             magpie_w * magpie_loss +
             self.kl_weight * kl_loss +
             self.stoich_weight * stoich_loss +
-            0.5 * element_count_loss
+            0.5 * element_count_loss +
+            self.tc_class_weight * tc_class_loss  # V12.28: Tc bucket classification
             # Entropy bonus removed - now in REINFORCE reward signal
         )
 
@@ -1750,6 +1916,7 @@ class CombinedLossWithREINFORCE(nn.Module):
             'magpie_loss': magpie_loss,
             'stoich_loss': stoich_loss,
             'kl_loss': kl_loss,
+            'tc_class_loss': tc_class_loss,  # V12.28
             'entropy': entropy,
             'mean_reward': mean_rewards.mean() if torch.is_tensor(mean_rewards) else mean_rewards,
             'token_accuracy': token_accuracy,
@@ -2216,12 +2383,32 @@ def load_checkpoint(encoder, decoder, checkpoint_path, entropy_manager=None,
         pass
     # else: both uncompiled — keys match directly
 
+    # V12.28: Shape-mismatch filtering for robust checkpoint loading
+    # When architecture changes (e.g., magpie_dim 145→151, sc_head input dim change),
+    # mismatched layers are cleanly re-initialized while all unchanged weights load normally.
+    model_state = encoder.state_dict()
+    has_old_tc_head = any(k.startswith('tc_head.') for k in enc_state.keys())
+    for key in list(enc_state.keys()):
+        if key in model_state and enc_state[key].shape != model_state[key].shape:
+            print(f"  [Checkpoint] Shape mismatch for {key}: "
+                  f"checkpoint {enc_state[key].shape} vs model {model_state[key].shape}, re-initializing",
+                  flush=True)
+            del enc_state[key]
+
     # strict=False: deterministic encoder drops fc_logvar, so old checkpoint has extra keys
     missing, unexpected = encoder.load_state_dict(enc_state, strict=False)
     if missing:
         print(f"  [Checkpoint] Missing keys in encoder: {missing}", flush=True)
     if unexpected:
         print(f"  [Checkpoint] Unexpected keys in encoder (ignored): {unexpected}", flush=True)
+
+    # V12.28: Net2Net weight transfer for old tc_head → new tc_proj/tc_res_block/tc_out
+    if has_old_tc_head and hasattr(encoder, 'upgrade_tc_head_from_checkpoint'):
+        # Get the original (possibly compiled) encoder for method access
+        actual_encoder = encoder._orig_mod if hasattr(encoder, '_orig_mod') else encoder
+        actual_encoder.upgrade_tc_head_from_checkpoint(enc_state)
+        print("  [Checkpoint] Applied Net2Net weight transfer for Tc head upgrade", flush=True)
+
     decoder.load_state_dict(dec_state)
     start_epoch = checkpoint.get('epoch', 0) + 1  # Resume from next epoch
     print(f"  Loaded checkpoint from epoch {checkpoint.get('epoch', 'unknown')}", flush=True)
@@ -2712,6 +2899,7 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
     total_hp_loss = 0  # V12.19
     total_sc_loss = 0  # V12.21
     total_theory_loss = 0  # V12.22
+    total_tc_class_loss = 0  # V12.28
     total_sc_exact = 0
     total_non_sc_exact = 0
     total_spec_accept = 0  # V12.9: Speculative decoding acceptance rate
@@ -2776,6 +2964,9 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
             # NOTE: 'kl_loss' is actually L2 reg (mean(z²)) since deterministic encoder.
             # Key name kept for compatibility — see attention_vae.py forward() comment.
             kl_loss = encoder_out['kl_loss']
+
+            # V12.28: Tc classification logits
+            tc_class_logits = encoder_out.get('tc_class_logits')
 
             # Stoichiometry predictions for loss and conditioning
             fraction_pred = encoder_out.get('fraction_pred')
@@ -2870,6 +3061,7 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
                     z=z,
                     encoder_skip=attended_input,
                     stoich_pred_for_reinforce=stoich_pred,
+                    tc_class_logits=tc_class_logits,  # V12.28
                 )
                 loss = (loss_dict['total'] + contrastive_weight * contrastive_loss_val
                         + hp_loss_weight * hp_loss_val
@@ -2895,6 +3087,7 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
                     z=None,  # No REINFORCE for non-SC
                     encoder_skip=attended_input,
                     stoich_pred_for_reinforce=None,
+                    tc_class_logits=tc_class_logits,  # V12.28
                 )
                 # Scale formula loss by non_sc_formula_weight
                 loss = (non_sc_formula_weight * loss_dict['total'] + contrastive_weight * contrastive_loss_val
@@ -2924,6 +3117,7 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
                     z=z[sc_mask],
                     encoder_skip=attended_input[sc_mask],
                     stoich_pred_for_reinforce=stoich_pred[sc_mask] if stoich_pred is not None else None,
+                    tc_class_logits=tc_class_logits[sc_mask] if tc_class_logits is not None else None,  # V12.28
                 )
 
                 # Non-SC portion: formula-only, lower weight
@@ -2944,6 +3138,7 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
                     z=None,  # No REINFORCE for non-SC
                     encoder_skip=attended_input[~sc_mask],
                     stoich_pred_for_reinforce=None,
+                    tc_class_logits=tc_class_logits[~sc_mask] if tc_class_logits is not None else None,  # V12.28
                 )
 
                 # Weighted combination: SC at full weight, non-SC at reduced weight
@@ -3057,6 +3252,7 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
         total_hp_loss += hp_loss_val.item() if torch.is_tensor(hp_loss_val) else hp_loss_val
         total_sc_loss += sc_loss_val.item() if torch.is_tensor(sc_loss_val) else sc_loss_val  # V12.21
         total_theory_loss += theory_loss_val.item() if torch.is_tensor(theory_loss_val) else theory_loss_val  # V12.22
+        total_tc_class_loss += loss_dict.get('tc_class_loss', torch.tensor(0.0)).item()  # V12.28
         z_norm_val = z.detach().float().norm(dim=1).mean().item()
         if not math.isnan(z_norm_val):
             total_z_norm += z_norm_val
@@ -3118,6 +3314,7 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
         'hp_loss': total_hp_loss / n_batches,  # V12.19
         'sc_loss': total_sc_loss / n_batches,  # V12.21
         'theory_loss': total_theory_loss / n_batches,  # V12.22
+        'tc_class_loss': total_tc_class_loss / n_batches,  # V12.28
         'z_norm': total_z_norm / n_batches,
         'n_skipped': n_skipped,  # V12.12: Selective backprop skips
         'n_total_batches': n_batches,
@@ -3235,6 +3432,7 @@ def train():
         focal_gamma=TRAIN_CONFIG['focal_gamma'],
         label_smoothing=TRAIN_CONFIG['label_smoothing'],
         use_autoregressive_reinforce=TRAIN_CONFIG.get('use_autoregressive_reinforce', True),
+        rl_method=TRAIN_CONFIG.get('rl_method', 'scst'),
         tc_huber_delta=TRAIN_CONFIG.get('tc_huber_delta', 0.0),  # V12.20
         tc_kelvin_weighting=TRAIN_CONFIG.get('tc_kelvin_weighting', False),      # V12.23
         tc_kelvin_weight_scale=TRAIN_CONFIG.get('tc_kelvin_weight_scale', 50.0), # V12.23
@@ -3243,6 +3441,10 @@ def train():
         tc_mean=norm_stats['tc_mean'],                                           # V12.23
         tc_std=norm_stats['tc_std'],                                             # V12.23
         tc_log_transform=norm_stats.get('tc_log_transform', False),              # V12.23
+        # V12.28: Tc prediction improvements
+        tc_bin_weights=TRAIN_CONFIG.get('tc_bin_weights', {}),
+        tc_class_weight=TRAIN_CONFIG.get('tc_class_weight', 0.0),
+        tc_class_bins=TRAIN_CONFIG.get('tc_class_bins', [0, 10, 50, 100]),
     )
 
     # V12.9: Build or load draft model for speculative decoding
@@ -3274,19 +3476,23 @@ def train():
             print("  Falling back to standard autoregressive sampling")
             draft_model = None
 
-    # V12.8: Wire up decoder for autoregressive REINFORCE sampling
+    # Wire up decoder for autoregressive REINFORCE/SCST sampling
     if TRAIN_CONFIG.get('rl_weight', 0.0) > 0 and TRAIN_CONFIG.get('use_autoregressive_reinforce', True):
         loss_fn.set_decoder(decoder, max_len=TRAIN_CONFIG['max_formula_len'], draft_model=draft_model)
-        spec_str = " + speculative" if draft_model is not None else ""
-        print(f"REINFORCE: Enabled with rl_weight={TRAIN_CONFIG['rl_weight']}, "
-              f"n_samples={TRAIN_CONFIG.get('n_samples_rloo', 2)}, "
-              f"autoregressive=True (KV-cached{spec_str})")
+        rl_method = TRAIN_CONFIG.get('rl_method', 'scst')
+        method_name = 'SCST (Self-Critical)' if rl_method == 'scst' else 'RLOO (Leave-One-Out)'
+        print(f"RL: {method_name}, rl_weight={TRAIN_CONFIG['rl_weight']}, "
+              f"autoregressive=True (KV-cached)")
+        if rl_method == 'scst':
+            print(f"  Baseline: greedy decode reward (2 passes per batch)")
+        else:
+            print(f"  Baseline: leave-one-out ({TRAIN_CONFIG.get('n_samples_rloo', 2)} samples)")
     elif TRAIN_CONFIG.get('rl_weight', 0.0) > 0:
-        print(f"REINFORCE: Enabled with rl_weight={TRAIN_CONFIG['rl_weight']}, "
+        print(f"RL: RLOO, rl_weight={TRAIN_CONFIG['rl_weight']}, "
               f"n_samples={TRAIN_CONFIG.get('n_samples_rloo', 2)}, "
               f"autoregressive=False (logit sampling)")
     else:
-        print("REINFORCE: Disabled (rl_weight=0)")
+        print("RL: Disabled (rl_weight=0)")
 
     # V12.12: Create contrastive loss function
     contrastive_loss_fn = None
@@ -3760,6 +3966,10 @@ def train():
         # V12.22: Show theory loss if enabled
         if theory_loss_fn is not None and metrics.get('theory_loss', 0) > 0:
             base_msg += f" | Thry: {metrics['theory_loss']:.4f} (w={effective_theory_weight:.3f})"
+
+        # V12.28: Show Tc classification loss if enabled
+        if TRAIN_CONFIG.get('tc_class_weight', 0) > 0 and metrics.get('tc_class_loss', 0) > 0:
+            base_msg += f" | TcCl: {metrics['tc_class_loss']:.4f}"
 
         # V12.12: Show selective backprop stats
         if metrics.get('n_skipped', 0) > 0 and metrics.get('n_total_batches', 0) > 0:

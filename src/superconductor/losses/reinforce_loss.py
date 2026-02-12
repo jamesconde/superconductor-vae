@@ -398,19 +398,20 @@ class REINFORCELoss(nn.Module):
         # For sample i: baseline_i = (sum of all rewards - reward_i) / (n_samples - 1)
         total_reward = rewards_stack.sum(dim=0)  # [batch]
 
-        advantages_list = []
+        # BUG FIX: Each RLOO sample contributes its own independent gradient.
+        # Previously averaged advantages across samples — since sum of RLOO
+        # advantages = 0 for any K, this guaranteed zero gradient. Fix: multiply
+        # each sample's advantage with its own log_probs, then sum. More samples
+        # = stronger, better-informed gradient. rl_weight controls magnitude.
+        reinforce_loss = torch.zeros(1, device=rewards_stack.device)
         for i in range(n_samples):
-            # Leave-one-out baseline for sample i
             baseline_i = (total_reward - rewards_stack[i]) / (n_samples - 1)
             advantage_i = rewards_stack[i] - baseline_i
-            advantages_list.append(advantage_i)
+            reinforce_loss = reinforce_loss + -(advantage_i * log_probs_stack[i]).mean()
 
-        # Use mean advantage and log prob across samples
-        advantages = torch.stack(advantages_list, dim=0).mean(dim=0)  # [batch]
-        mean_log_probs = log_probs_stack.mean(dim=0)  # [batch]
         mean_rewards = rewards_stack.mean(dim=0)  # [batch]
 
-        return advantages, mean_log_probs, mean_rewards
+        return reinforce_loss, mean_rewards
 
     def compute_kl_divergence(
         self,
@@ -481,7 +482,8 @@ class REINFORCELoss(nn.Module):
         # ===============================
         if self.n_samples_rloo > 1:
             # Use RLOO baseline (sample multiple times)
-            advantages, sequence_log_probs, rewards = self.compute_rloo_baseline(
+            # Returns pre-computed reinforce_loss (bug fix: per-sample loss averaging)
+            reinforce_loss, rewards = self.compute_rloo_baseline(
                 logits, targets, mask, temperature
             )
         else:
@@ -504,9 +506,8 @@ class REINFORCELoss(nn.Module):
             masked_log_probs = sampled_log_probs * mask.float()
             sequence_log_probs = masked_log_probs.sum(dim=1)
 
-        # REINFORCE gradient: -advantage * log_prob
-        # We want to maximize reward, so minimize negative advantage * log_prob
-        reinforce_loss = -(advantages * sequence_log_probs).mean()
+            # REINFORCE gradient: -advantage * log_prob
+            reinforce_loss = -(advantages * sequence_log_probs).mean()
 
         # ===============================
         # 3. Entropy Regularization

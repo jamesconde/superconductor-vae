@@ -677,11 +677,32 @@ class FullMaterialsVAE(nn.Module):
             prev_dim = hidden_dim
         self.decoder_backbone = nn.Sequential(*decoder_layers)
 
-        # Head 1: Tc prediction
-        self.tc_head = nn.Sequential(
-            nn.Linear(prev_dim, prev_dim // 2),
+        # Head 1: Tc prediction (V12.28 — deeper residual MLP with Net2Net transfer)
+        # Old: tc_head = Linear(512→256) → GELU → Linear(256→1)
+        # New: tc_proj(512→256) + residual_block(256→256) + tc_out(256→128→1)
+        # Net2Net: tc_proj inherits tc_head.0 weights; residual block identity-init;
+        #          tc_out.2 (Linear 256→128) is new; tc_out.4 (Linear 128→1) gets
+        #          tc_head.2 weights via net2net wider expansion in checkpoint loading.
+        self.tc_proj = nn.Linear(prev_dim, 256)  # Project to residual dim
+        self.tc_res_block = nn.Sequential(
+            nn.Linear(256, 256),
+            nn.LayerNorm(256),
             nn.GELU(),
-            nn.Linear(prev_dim // 2, 1)
+            nn.Dropout(dropout),
+            nn.Linear(256, 256),
+        )
+        # Initialize residual block as near-identity so initial behavior ≈ old tc_head
+        with torch.no_grad():
+            nn.init.eye_(self.tc_res_block[0].weight)
+            nn.init.zeros_(self.tc_res_block[0].bias)
+            nn.init.eye_(self.tc_res_block[4].weight)
+            nn.init.zeros_(self.tc_res_block[4].bias)
+        self.tc_out = nn.Sequential(
+            nn.LayerNorm(256),
+            nn.GELU(),
+            nn.Linear(256, 128),
+            nn.GELU(),
+            nn.Linear(128, 1),
         )
 
         # Head 2: Magpie feature reconstruction
@@ -748,7 +769,22 @@ class FullMaterialsVAE(nn.Module):
         )
 
         # =====================================================================
-        # SC/NON-SC CLASSIFICATION HEAD (V12.21 — Cross-Head Consistency)
+        # Tc BUCKET CLASSIFICATION HEAD (V12.28 — auxiliary signal)
+        # =====================================================================
+        # Classifies Tc into 5 buckets for coarse-grained signal:
+        #   0=non-SC(Tc=0), 1=low(0-10K), 2=medium(10-50K),
+        #   3=high(50-100K), 4=very-high(100K+)
+        # This auxiliary loss helps the Tc head learn bucket boundaries.
+        # =====================================================================
+        self.tc_class_head = nn.Sequential(
+            nn.Linear(prev_dim, 256),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(256, 5),  # 5 Tc buckets
+        )
+
+        # =====================================================================
+        # SC/NON-SC CLASSIFICATION HEAD (V12.21/V12.28 — Cross-Head Consistency)
         # =====================================================================
         # Binary classifier: P(is_superconductor | z, head_predictions)
         # Unlike other heads that read only z, this head receives z CONCATENATED
@@ -758,10 +794,12 @@ class FullMaterialsVAE(nn.Module):
         # Gradients flow through the concatenated predictions back into the other
         # heads, so the SC loss also improves the other heads' accuracy.
         #
-        # Input: z(2048) + tc_pred(1) + magpie_pred(145) + hp_pred(1)
-        #        + fraction_pred(12) + element_count_pred(1) + competence(1) = 2209
+        # V12.28: Added tc_class_logits(5) to input
+        # Input: z(2048) + tc_pred(1) + magpie_pred(magpie_dim) + hp_pred(1)
+        #        + fraction_pred(12) + element_count_pred(1) + competence(1)
+        #        + tc_class_logits(5) = 2069 + magpie_dim
         # =====================================================================
-        sc_input_dim = latent_dim + 1 + magpie_dim + 1 + self.max_elements + 1 + 1  # 2209
+        sc_input_dim = latent_dim + 1 + magpie_dim + 1 + self.max_elements + 1 + 1 + 5  # +5 for tc_class
         self.sc_head = nn.Sequential(
             nn.Linear(sc_input_dim, 512),
             nn.GELU(),
@@ -847,14 +885,22 @@ class FullMaterialsVAE(nn.Module):
         h = self.decoder_backbone(z)
 
         # Multi-head outputs
-        tc_pred = self.tc_head(h).squeeze(-1)
+        # V12.28: Deeper residual Tc head
+        tc_h = self.tc_proj(h)
+        tc_h = tc_h + self.tc_res_block(tc_h)  # Residual connection
+        tc_pred = self.tc_out(tc_h).squeeze(-1)
+
         magpie_pred = self.magpie_head(h)
         attended_input = self.attended_head(h)
+
+        # V12.28: Tc bucket classification
+        tc_class_logits = self.tc_class_head(h)
 
         return {
             'tc_pred': tc_pred,
             'magpie_pred': magpie_pred,
             'attended_input': attended_input,
+            'tc_class_logits': tc_class_logits,
         }
 
     def forward(
@@ -891,18 +937,23 @@ class FullMaterialsVAE(nn.Module):
         # High-pressure prediction (V12.19)
         hp_pred = self.hp_head(enc_out['z']).squeeze(-1)  # [batch] logits
 
-        # SC/non-SC classification with cross-head consistency (V12.21)
+        # V12.28: Tc bucket classification logits
+        tc_class_logits = dec_out['tc_class_logits']
+
+        # SC/non-SC classification with cross-head consistency (V12.21/V12.28)
         # Feed z + all other head predictions so the classifier learns
         # cross-head consistency patterns (e.g., high Tc + SC Magpie → SC)
+        # V12.28: Added tc_class_logits(5) to input
         sc_input = torch.cat([
             enc_out['z'],                          # 2048
             dec_out['tc_pred'].unsqueeze(-1),       # 1
-            dec_out['magpie_pred'],                 # 145
+            dec_out['magpie_pred'],                 # magpie_dim
             hp_pred.unsqueeze(-1),                  # 1
             fraction_pred,                          # 12
             element_count_pred.unsqueeze(-1),       # 1
             competence.unsqueeze(-1),               # 1
-        ], dim=-1)  # Total: 2209
+            tc_class_logits,                        # 5 (V12.28)
+        ], dim=-1)
         sc_pred = self.sc_head(sc_input).squeeze(-1)  # [batch] logits
 
         # Latent regularization: L2 on z (deterministic mode) or KL (VAE mode)
@@ -946,7 +997,86 @@ class FullMaterialsVAE(nn.Module):
             # SC/non-SC classification (V12.21) — logits, apply sigmoid for probability
             # Cross-head consistency: uses z + all other head predictions as input
             'sc_pred': sc_pred,
+            # Tc bucket classification (V12.28) — 5 classes, cross-entropy loss
+            'tc_class_logits': tc_class_logits,
         }
+
+    def predict_tc_mc(self, z: torch.Tensor, n_samples: int = 10) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        MC Dropout: run decode N times with dropout active, average Tc predictions.
+
+        This gives both a refined prediction (mean) and an uncertainty estimate (std).
+        Higher std indicates the model is less confident about this sample.
+
+        Args:
+            z: [batch, latent_dim] latent representation
+            n_samples: Number of forward passes (default 10)
+
+        Returns:
+            Tuple of (tc_mean, tc_std) each [batch]
+        """
+        was_training = self.training
+        self.decoder_backbone.train()  # Enable dropout
+        self.tc_res_block.train()      # Enable dropout in residual block
+
+        tc_preds = []
+        with torch.no_grad():
+            for _ in range(n_samples):
+                h = self.decoder_backbone(z)
+                tc_h = self.tc_proj(h)
+                tc_h = tc_h + self.tc_res_block(tc_h)
+                tc_preds.append(self.tc_out(tc_h).squeeze(-1))
+
+        # Restore original mode
+        if not was_training:
+            self.decoder_backbone.eval()
+            self.tc_res_block.eval()
+
+        tc_stack = torch.stack(tc_preds)
+        return tc_stack.mean(dim=0), tc_stack.std(dim=0)
+
+    def upgrade_tc_head_from_checkpoint(self, old_state_dict: dict):
+        """
+        Net2Net weight transfer from old tc_head to new tc_proj/tc_res_block/tc_out.
+
+        Old architecture: tc_head = Sequential(Linear(512,256), GELU, Linear(256,1))
+        New architecture: tc_proj(512→256) + tc_res_block(256→256) + tc_out(LN,GELU,256→128,GELU,128→1)
+
+        Transfer strategy:
+          - tc_head.0.weight/bias → tc_proj.weight/bias (direct copy, same shape)
+          - tc_head.2.weight/bias → used to initialize tc_out final layer via Net2Net wider
+          - tc_res_block stays identity-initialized (from __init__)
+        """
+        from .net2net_expansion import expand_linear_wider
+
+        with torch.no_grad():
+            # Transfer tc_head.0 → tc_proj (Linear 512→256, exact match)
+            if 'tc_head.0.weight' in old_state_dict:
+                self.tc_proj.weight.copy_(old_state_dict['tc_head.0.weight'])
+                self.tc_proj.bias.copy_(old_state_dict['tc_head.0.bias'])
+                print("  [Net2Net] tc_head.0 → tc_proj: direct weight transfer")
+
+            # Transfer tc_head.2 → tc_out final layer via Net2Net wider expansion
+            # Old: Linear(256→1), New: Linear(128→1)
+            # The old 256→1 layer's knowledge gets compressed into the new 128→1 layer.
+            # We use the old weights for the first 128 input connections and zero the rest,
+            # letting the new intermediate 256→128 layer learn the projection.
+            if 'tc_head.2.weight' in old_state_dict:
+                old_w = old_state_dict['tc_head.2.weight']  # [1, 256]
+                old_b = old_state_dict['tc_head.2.bias']    # [1]
+                # tc_out[4] is Linear(128→1)
+                # Copy first 128 columns of old [1,256] weight
+                self.tc_out[4].weight[:, :min(128, old_w.shape[1])].copy_(
+                    old_w[:, :min(128, old_w.shape[1])]
+                )
+                self.tc_out[4].bias.copy_(old_b)
+                # tc_out[2] is Linear(256→128) — initialize to pass through first 128 dims
+                nn.init.zeros_(self.tc_out[2].weight)
+                nn.init.zeros_(self.tc_out[2].bias)
+                # Identity-like: first 128 outputs = first 128 inputs
+                for i in range(128):
+                    self.tc_out[2].weight[i, i] = 1.0
+                print("  [Net2Net] tc_head.2 → tc_out: wider expansion with identity projection")
 
 
 class FullMaterialsLoss(nn.Module):

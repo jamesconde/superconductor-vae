@@ -643,16 +643,17 @@ TRAIN_CONFIG = {
     'magpie_weight': 2.0,    # Magpie reconstruction (MSE) → ~1.0 contrib (was 0.1!)
     'kl_weight': 0.0,        # Zero for jagged latent
 
-    # REINFORCE settings - V12.6: DISABLED FOR DEBUGGING
-    'ce_weight': 1.0,        # V12.6: Full CE weight (focus on supervised with focal loss)
-    'rl_weight': 0.0,        # V12.6: DISABLED to debug slow training (was 2.5)
-    'n_samples_rloo': 2,
+    # REINFORCE settings
+    'ce_weight': 1.0,
+    'rl_weight': 2.5,        # Re-enabled: RLOO bug fix (advantages were averaging to 0)
+    'n_samples_rloo': 2,     # A100: use 4 samples for better baseline variance
     'temperature': 0.5,      # AGGRESSIVE: 0.8 → 0.5 (sharper distributions)
     'entropy_weight': 0.01,
-    # V12.7: True autoregressive REINFORCE with KV caching
-    # When True, samples using decoder's sample_for_reinforce() with KV cache
-    # instead of sampling from teacher-forced logits (more accurate but slower)
-    'use_autoregressive_reinforce': True,  # Enable KV-cached autoregressive sampling
+    # RL method: 'scst' (Self-Critical Sequence Training) or 'rloo'
+    # SCST: 1 greedy + 1 sample (2 passes), baseline = greedy reward (Rennie et al. 2017)
+    # RLOO: K samples, leave-one-out baseline (Ahmadian et al. 2024)
+    'rl_method': 'scst',     # SCST: lower variance, aligns baseline with test-time greedy
+    'use_autoregressive_reinforce': True,  # KV-cached autoregressive sampling
 
     'max_formula_len': 60,  # V12.6: Match checkpoint (pos_encoding.pe shape)
 
@@ -832,7 +833,9 @@ class REINFORCELossV12(nn.Module):
         label_smoothing: float = 0.1,
         use_focal_loss: bool = True,
         # V12.7: True autoregressive REINFORCE with KV caching
-        use_autoregressive_reinforce: bool = False,  # Use KV-cached sampling for REINFORCE
+        use_autoregressive_reinforce: bool = False,
+        # RL method: 'scst' (Self-Critical Sequence Training) or 'rloo'
+        rl_method: str = 'scst',
     ):
         super().__init__()
 
@@ -851,17 +854,16 @@ class REINFORCELossV12(nn.Module):
         self.target_cache = target_cache
         self.use_gpu_reward = use_gpu_reward  # V12: Use GPU-native rewards
 
-        # V12.6: Use focal loss with label smoothing to break 98.8% plateau
+        # V12.6: Focal loss with label smoothing
         self.use_focal_loss = use_focal_loss
         self.focal_gamma = focal_gamma
         self.label_smoothing = label_smoothing
 
-        # V12.7: Autoregressive REINFORCE with KV caching
-        # When True, uses decoder.sample_for_reinforce() instead of sampling from logits
-        # This is more accurate but requires passing decoder and z to forward()
+        # RL method and autoregressive sampling
         self.use_autoregressive_reinforce = use_autoregressive_reinforce
+        self.rl_method = rl_method  # 'scst' or 'rloo'
         self._decoder = None  # Set via set_decoder()
-        self._max_len = 60    # Max sequence length for autoregressive sampling
+        self._max_len = 60
 
         if use_focal_loss:
             self.ce_loss = FocalLossWithLabelSmoothing(
@@ -967,17 +969,129 @@ class REINFORCELossV12(nn.Module):
         log_probs_stack = torch.stack(all_log_probs, dim=0)
         total_reward = rewards_stack.sum(dim=0)
 
-        advantages_list = []
+        # BUG FIX: Each RLOO sample contributes its own independent gradient.
+        # Previously averaged advantages across samples before multiplying with
+        # log_probs — since sum of RLOO advantages = 0 for any K, this guaranteed
+        # zero gradient. Fix: multiply each sample's advantage with its own
+        # log_probs, then sum (not average). More samples = stronger, better-
+        # informed gradient. rl_weight controls overall magnitude.
+        reinforce_loss = torch.zeros(1, device=rewards_stack.device)
         for i in range(n_samples):
             baseline_i = (total_reward - rewards_stack[i]) / (n_samples - 1)
             advantage_i = rewards_stack[i] - baseline_i
-            advantages_list.append(advantage_i)
+            reinforce_loss = reinforce_loss + -(advantage_i * log_probs_stack[i]).mean()
 
-        advantages = torch.stack(advantages_list, dim=0).mean(dim=0)
-        mean_log_probs = log_probs_stack.mean(dim=0)
         mean_rewards = rewards_stack.mean(dim=0)
 
-        return advantages, mean_log_probs, mean_rewards
+        return reinforce_loss, mean_rewards
+
+    def compute_scst(
+        self,
+        z: torch.Tensor,
+        targets: torch.Tensor,
+        encoder_skip: torch.Tensor = None,
+        stoich_pred: torch.Tensor = None,
+    ):
+        """
+        Self-Critical Sequence Training (Rennie et al. 2017).
+
+        Uses greedy decode reward as baseline instead of RLOO leave-one-out.
+        Advantage = reward(sampled) - reward(greedy). If the sample beats
+        greedy, reinforce it; if greedy beats sample, push away from sample.
+
+        Benefits over RLOO:
+        - Baseline aligns with test-time behavior (greedy decode)
+        - Only 2 forward passes (1 greedy + 1 sample) vs K for RLOO
+        - No advantage-cancellation issues
+        - Lower variance baseline (greedy is deterministic)
+
+        Returns:
+            reinforce_loss: Scalar SCST loss
+            mean_rewards: Mean sampled rewards [batch] (for logging)
+        """
+        if self._decoder is None:
+            raise RuntimeError("Decoder not set. Call set_decoder() first.")
+
+        # Precompute memory once — shared by both greedy and sample passes
+        cached_memory = self._decoder.precompute_memory(z, encoder_skip, stoich_pred)
+
+        # 1. Greedy decode (deterministic baseline) — no gradients needed
+        with torch.no_grad():
+            greedy_tokens, _, _ = self._decoder.generate_with_kv_cache(
+                z=z,
+                encoder_skip=encoder_skip,
+                stoich_pred=stoich_pred,
+                temperature=0.0,  # argmax
+                max_len=self._max_len,
+                return_log_probs=False,
+                cached_memory=cached_memory,
+            )
+
+            # Pad/truncate greedy tokens to match target length for reward computation
+            if greedy_tokens.size(1) < targets.size(1):
+                pad_len = targets.size(1) - greedy_tokens.size(1)
+                greedy_tokens = F.pad(greedy_tokens, (0, pad_len), value=PAD_IDX)
+            elif greedy_tokens.size(1) > targets.size(1):
+                greedy_tokens = greedy_tokens[:, :targets.size(1)]
+
+            # Greedy mask (valid until END token)
+            greedy_is_end = (greedy_tokens == END_IDX)
+            greedy_end_pos = torch.argmax(greedy_is_end.int(), dim=1)
+            greedy_has_end = greedy_is_end.any(dim=1)
+            greedy_end_pos = torch.where(
+                greedy_has_end, greedy_end_pos,
+                torch.tensor(greedy_tokens.size(1), device=z.device)
+            )
+            positions = torch.arange(greedy_tokens.size(1), device=z.device).unsqueeze(0)
+            greedy_mask = (positions <= greedy_end_pos.unsqueeze(1)).float()
+
+            # Compute greedy reward (baseline)
+            greedy_rewards = compute_reward_gpu_native(
+                greedy_tokens, targets, greedy_mask,
+                config=self.gpu_reward_config,
+                pad_idx=PAD_IDX, end_idx=END_IDX
+            )
+
+        # 2. Sample decode — need log_probs for gradient
+        sampled_tokens, log_probs, _entropy, sample_mask = self._decoder.sample_for_reinforce(
+            z=z,
+            encoder_skip=encoder_skip,
+            stoich_pred=stoich_pred,
+            temperature=self.temperature,
+            max_len=self._max_len,
+            cached_memory=cached_memory,
+        )
+
+        # Pad/truncate sampled tokens to match target length
+        if sampled_tokens.size(1) < targets.size(1):
+            pad_len = targets.size(1) - sampled_tokens.size(1)
+            sampled_tokens = F.pad(sampled_tokens, (0, pad_len), value=PAD_IDX)
+            log_probs = F.pad(log_probs, (0, pad_len), value=0.0)
+            sample_mask = F.pad(sample_mask, (0, pad_len), value=0.0)
+        elif sampled_tokens.size(1) > targets.size(1):
+            sampled_tokens = sampled_tokens[:, :targets.size(1)]
+            log_probs = log_probs[:, :targets.size(1)]
+            sample_mask = sample_mask[:, :targets.size(1)]
+
+        # Compute sample reward
+        with torch.no_grad():
+            sample_rewards = compute_reward_gpu_native(
+                sampled_tokens, targets, sample_mask,
+                config=self.gpu_reward_config,
+                pad_idx=PAD_IDX, end_idx=END_IDX
+            )
+
+        # 3. SCST advantage: how much better is the sample than greedy?
+        advantages = sample_rewards - greedy_rewards
+
+        # 4. Sequence log prob (sum over valid positions)
+        seq_log_prob = (log_probs * sample_mask).sum(dim=1)
+
+        # 5. REINFORCE loss: push toward samples that beat greedy,
+        #    push away from samples worse than greedy
+        reinforce_loss = -(advantages * seq_log_prob).mean()
+
+        return reinforce_loss, sample_rewards
 
     def sample_from_logits(self, logits: torch.Tensor, temperature: float):
         batch_size, seq_len, vocab_size = logits.shape
@@ -1022,17 +1136,17 @@ class REINFORCELossV12(nn.Module):
         log_probs_stack = torch.stack(all_log_probs, dim=0)
         total_reward = rewards_stack.sum(dim=0)
 
-        advantages_list = []
+        # BUG FIX: Same fix as compute_rloo_autoregressive — each sample's
+        # advantage multiplied with its own log_probs, summed (not averaged).
+        reinforce_loss = torch.zeros(1, device=rewards_stack.device)
         for i in range(n_samples):
             baseline_i = (total_reward - rewards_stack[i]) / (n_samples - 1)
             advantage_i = rewards_stack[i] - baseline_i
-            advantages_list.append(advantage_i)
+            reinforce_loss = reinforce_loss + -(advantage_i * log_probs_stack[i]).mean()
 
-        advantages = torch.stack(advantages_list, dim=0).mean(dim=0)
-        mean_log_probs = log_probs_stack.mean(dim=0)
         mean_rewards = rewards_stack.mean(dim=0)
 
-        return advantages, mean_log_probs, mean_rewards
+        return reinforce_loss, mean_rewards
 
     def forward(
         self,
@@ -1087,20 +1201,27 @@ class REINFORCELossV12(nn.Module):
         t2 = time.time()
         # 2. Formula REINFORCE Loss - SKIP if rl_weight=0
         if self.rl_weight > 0:
-            # V12.7: Use true autoregressive sampling with KV cache if enabled
             if self.use_autoregressive_reinforce and z is not None and self._decoder is not None:
-                advantages, mean_log_probs, mean_rewards = self.compute_rloo_autoregressive(
-                    z=z,
-                    targets=formula_targets,
-                    encoder_skip=encoder_skip,
-                    stoich_pred=stoich_pred_for_reinforce,
-                )
+                # SCST or RLOO with true autoregressive sampling
+                if self.rl_method == 'scst':
+                    reinforce_loss, mean_rewards = self.compute_scst(
+                        z=z,
+                        targets=formula_targets,
+                        encoder_skip=encoder_skip,
+                        stoich_pred=stoich_pred_for_reinforce,
+                    )
+                else:
+                    reinforce_loss, mean_rewards = self.compute_rloo_autoregressive(
+                        z=z,
+                        targets=formula_targets,
+                        encoder_skip=encoder_skip,
+                        stoich_pred=stoich_pred_for_reinforce,
+                    )
             else:
-                # Original: sample from teacher-forced logits (faster but less accurate)
-                advantages, mean_log_probs, mean_rewards = self.compute_rloo_advantages(
+                # Fallback: sample from teacher-forced logits (faster but less accurate)
+                reinforce_loss, mean_rewards = self.compute_rloo_advantages(
                     formula_logits, formula_targets, mask
                 )
-            reinforce_loss = -(advantages * mean_log_probs).mean()
         else:
             # Skip REINFORCE computation entirely
             reinforce_loss = torch.tensor(0.0, device=formula_logits.device)
@@ -1539,15 +1660,22 @@ def load_models(device, checkpoint_path, magpie_dim, is_v12_checkpoint=False):
             print(f"    RESUMING from V12 checkpoint (epoch {checkpoint.get('epoch', '?')})")
             print(f"    Previous best exact match: {checkpoint.get('best_train_exact', 0)*100:.2f}%")
 
-            # Load encoder state (V12.4: use strict=False to allow new fraction_head)
+            # Load encoder state (V12.4/V12.28: use strict=False + shape-mismatch filtering)
             if 'encoder_state_dict' in checkpoint:
-                # V12.4: Allow missing keys for new fraction_head
-                missing, unexpected = encoder.load_state_dict(
-                    checkpoint['encoder_state_dict'], strict=False
-                )
+                enc_state = checkpoint['encoder_state_dict']
+
+                # V12.28: Shape-mismatch filtering for robust checkpoint loading
+                model_state = encoder.state_dict()
+                has_old_tc_head = any(k.startswith('tc_head.') for k in enc_state.keys())
+                for key in list(enc_state.keys()):
+                    if key in model_state and enc_state[key].shape != model_state[key].shape:
+                        print(f"    [Checkpoint] Shape mismatch for {key}: "
+                              f"checkpoint {enc_state[key].shape} vs model {model_state[key].shape}, re-initializing")
+                        del enc_state[key]
+
+                missing, unexpected = encoder.load_state_dict(enc_state, strict=False)
                 if missing:
                     print(f"    Loaded encoder (new layers initialized fresh): {len(missing)} new params")
-                    # Check if it's just the fraction_head (expected for V12.4)
                     fraction_keys = [k for k in missing if 'fraction_head' in k]
                     if len(fraction_keys) == len(missing):
                         print(f"    ✓ V12.4: FractionValueHead initialized (stoichiometry-aware learning)")
@@ -1555,6 +1683,11 @@ def load_models(device, checkpoint_path, magpie_dim, is_v12_checkpoint=False):
                         print(f"    Other missing keys: {[k for k in missing if 'fraction_head' not in k]}")
                 else:
                     print(f"    Loaded encoder state dict (all layers)")
+
+                # V12.28: Net2Net weight transfer for old tc_head → new tc_proj/tc_res_block/tc_out
+                if has_old_tc_head and hasattr(encoder, 'upgrade_tc_head_from_checkpoint'):
+                    encoder.upgrade_tc_head_from_checkpoint(enc_state)
+                    print("    [Checkpoint] Applied Net2Net weight transfer for Tc head upgrade")
             else:
                 print(f"    WARNING: No encoder state in checkpoint, using fresh weights")
 
@@ -1941,16 +2074,24 @@ def train_v12(encoder, formula_decoder, train_loader, target_cache, device, conf
         use_focal_loss=config.get('use_focal_loss', True),
         focal_gamma=config.get('focal_gamma', 2.0),
         label_smoothing=config.get('label_smoothing', 0.1),
-        # V12.7: Autoregressive REINFORCE with KV caching
+        # Autoregressive REINFORCE with KV caching
         use_autoregressive_reinforce=config.get('use_autoregressive_reinforce', False),
+        rl_method=config.get('rl_method', 'scst'),
     )
 
-    # V12.7: Set decoder for autoregressive REINFORCE (if enabled)
+    # Set decoder for autoregressive REINFORCE/SCST (if enabled)
     if config.get('use_autoregressive_reinforce', False):
         loss_fn.set_decoder(formula_decoder, max_len=config['max_formula_len'])
-        print(f"\n*** V12.7: AUTOREGRESSIVE REINFORCE ENABLED ***")
-        print(f"  Using KV-cached sampling for REINFORCE (true autoregressive)")
+        rl_method = config.get('rl_method', 'scst')
+        print(f"\n*** AUTOREGRESSIVE RL ENABLED ***")
+        print(f"  Method: {rl_method.upper()} ({'Self-Critical Sequence Training' if rl_method == 'scst' else 'RLOO Leave-One-Out'})")
         print(f"  Max sequence length: {config['max_formula_len']}")
+        if rl_method == 'scst':
+            print(f"  Baseline: greedy decode reward (Rennie et al. 2017)")
+            print(f"  Forward passes per batch: 2 (1 greedy + 1 sample)")
+        else:
+            print(f"  Baseline: leave-one-out (Ahmadian et al. 2024)")
+            print(f"  Forward passes per batch: {config['n_samples_rloo']} samples")
 
     # OPTIMIZATION: Mixed precision scaler
     scaler = GradScaler(enabled=config.get('use_amp', True))
