@@ -1664,14 +1664,32 @@ def load_models(device, checkpoint_path, magpie_dim, is_v12_checkpoint=False):
             if 'encoder_state_dict' in checkpoint:
                 enc_state = checkpoint['encoder_state_dict']
 
-                # V12.28: Shape-mismatch filtering for robust checkpoint loading
+                # V12.28: Shape-mismatch handling with partial weight preservation
                 model_state = encoder.state_dict()
                 has_old_tc_head = any(k.startswith('tc_head.') for k in enc_state.keys())
                 for key in list(enc_state.keys()):
                     if key in model_state and enc_state[key].shape != model_state[key].shape:
-                        print(f"    [Checkpoint] Shape mismatch for {key}: "
-                              f"checkpoint {enc_state[key].shape} vs model {model_state[key].shape}, re-initializing")
-                        del enc_state[key]
+                        old_shape = enc_state[key].shape
+                        new_shape = model_state[key].shape
+                        preserved = False
+                        if len(old_shape) == 2 and len(new_shape) == 2:
+                            min_r, min_c = min(old_shape[0], new_shape[0]), min(old_shape[1], new_shape[1])
+                            new_w = torch.zeros(new_shape, dtype=enc_state[key].dtype)
+                            new_w[:min_r, :min_c] = enc_state[key][:min_r, :min_c]
+                            enc_state[key] = new_w
+                            preserved = True
+                            print(f"    [Checkpoint] Partial preserve {key}: {old_shape}→{new_shape}, kept [{min_r},{min_c}]")
+                        elif len(old_shape) == 1 and len(new_shape) == 1:
+                            min_len = min(old_shape[0], new_shape[0])
+                            new_b = torch.zeros(new_shape, dtype=enc_state[key].dtype)
+                            new_b[:min_len] = enc_state[key][:min_len]
+                            enc_state[key] = new_b
+                            preserved = True
+                            print(f"    [Checkpoint] Partial preserve {key}: {old_shape}→{new_shape}, kept [{min_len}]")
+                        if not preserved:
+                            print(f"    [Checkpoint] Shape mismatch for {key}: "
+                                  f"checkpoint {old_shape} vs model {new_shape}, re-initializing")
+                            del enc_state[key]
 
                 missing, unexpected = encoder.load_state_dict(enc_state, strict=False)
                 if missing:

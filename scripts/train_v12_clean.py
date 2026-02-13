@@ -2383,17 +2383,38 @@ def load_checkpoint(encoder, decoder, checkpoint_path, entropy_manager=None,
         pass
     # else: both uncompiled — keys match directly
 
-    # V12.28: Shape-mismatch filtering for robust checkpoint loading
-    # When architecture changes (e.g., magpie_dim 145→151, sc_head input dim change),
-    # mismatched layers are cleanly re-initialized while all unchanged weights load normally.
+    # V12.28: Shape-mismatch handling with partial weight preservation
+    # For reshaped layers (e.g., magpie_dim 145→151), preserve the overlapping region
+    # and zero-init new dimensions. This avoids disrupting learned representations.
     model_state = encoder.state_dict()
     has_old_tc_head = any(k.startswith('tc_head.') for k in enc_state.keys())
     for key in list(enc_state.keys()):
         if key in model_state and enc_state[key].shape != model_state[key].shape:
-            print(f"  [Checkpoint] Shape mismatch for {key}: "
-                  f"checkpoint {enc_state[key].shape} vs model {model_state[key].shape}, re-initializing",
-                  flush=True)
-            del enc_state[key]
+            old_shape = enc_state[key].shape
+            new_shape = model_state[key].shape
+            # Try partial weight preservation (copy overlapping region, zero-init new)
+            preserved = False
+            if len(old_shape) == 2 and len(new_shape) == 2:
+                min_r, min_c = min(old_shape[0], new_shape[0]), min(old_shape[1], new_shape[1])
+                new_w = torch.zeros(new_shape, dtype=enc_state[key].dtype)
+                new_w[:min_r, :min_c] = enc_state[key][:min_r, :min_c]
+                enc_state[key] = new_w
+                preserved = True
+                print(f"  [Checkpoint] Partial preserve {key}: {old_shape}→{new_shape}, "
+                      f"kept [{min_r},{min_c}]", flush=True)
+            elif len(old_shape) == 1 and len(new_shape) == 1:
+                min_len = min(old_shape[0], new_shape[0])
+                new_b = torch.zeros(new_shape, dtype=enc_state[key].dtype)
+                new_b[:min_len] = enc_state[key][:min_len]
+                enc_state[key] = new_b
+                preserved = True
+                print(f"  [Checkpoint] Partial preserve {key}: {old_shape}→{new_shape}, "
+                      f"kept [{min_len}]", flush=True)
+            if not preserved:
+                print(f"  [Checkpoint] Shape mismatch for {key}: "
+                      f"checkpoint {old_shape} vs model {new_shape}, re-initializing",
+                      flush=True)
+                del enc_state[key]
 
     # strict=False: deterministic encoder drops fc_logvar, so old checkpoint has extra keys
     missing, unexpected = encoder.load_state_dict(enc_state, strict=False)

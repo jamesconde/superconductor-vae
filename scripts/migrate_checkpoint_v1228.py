@@ -163,25 +163,64 @@ def main():
     print(f"  tc_out: {model.tc_out}")
     print(f"  tc_class_head: {model.tc_class_head}")
 
-    # ── Step 5: Shape-mismatch filtering ─────────────────────────────────
-    print("\nStep 5: Shape-mismatch filtering...")
+    # ── Step 5: Partial weight preservation for reshaped layers ─────────
+    # The 6 physics features are APPENDED to the end of the feature vector,
+    # so the first old_magpie_dim columns/rows are still valid and must be preserved.
+    # This avoids disrupting the encoder's learned representation.
+    print("\nStep 5: Partial weight preservation for reshaped layers...")
     model_state = model.state_dict()
+    partially_preserved = []
     dropped_keys = []
+
     for key in list(enc_state.keys()):
-        if key in model_state and enc_state[key].shape != model_state[key].shape:
-            print(f"  MISMATCH: {key}: checkpoint {enc_state[key].shape} vs model {model_state[key].shape}")
+        if key not in model_state:
+            continue
+        if enc_state[key].shape == model_state[key].shape:
+            continue
+
+        old_shape = enc_state[key].shape
+        new_shape = model_state[key].shape
+        print(f"  MISMATCH: {key}: checkpoint {old_shape} vs model {new_shape}")
+
+        # Try partial weight preservation (copy overlapping region, zero-init new)
+        preserved = False
+        if len(old_shape) == 2 and len(new_shape) == 2:
+            # Weight matrix: copy min(old, new) rows/cols
+            min_rows = min(old_shape[0], new_shape[0])
+            min_cols = min(old_shape[1], new_shape[1])
+            new_w = torch.zeros(new_shape, dtype=enc_state[key].dtype)
+            new_w[:min_rows, :min_cols] = enc_state[key][:min_rows, :min_cols]
+            enc_state[key] = new_w
+            preserved = True
+            print(f"    → Preserved [{min_rows}, {min_cols}] of [{new_shape[0]}, {new_shape[1]}], "
+                  f"zero-init remaining")
+        elif len(old_shape) == 1 and len(new_shape) == 1:
+            # Bias vector: copy min(old, new) elements
+            min_len = min(old_shape[0], new_shape[0])
+            new_b = torch.zeros(new_shape, dtype=enc_state[key].dtype)
+            new_b[:min_len] = enc_state[key][:min_len]
+            enc_state[key] = new_b
+            preserved = True
+            print(f"    → Preserved [{min_len}] of [{new_shape[0]}], zero-init remaining")
+
+        if preserved:
+            partially_preserved.append(key)
+        else:
             dropped_keys.append(key)
             del enc_state[key]
+            print(f"    → Dropped (incompatible shape)")
 
+    if partially_preserved:
+        print(f"  Partially preserved {len(partially_preserved)} reshaped layers")
     if dropped_keys:
-        print(f"  Dropped {len(dropped_keys)} mismatched keys (will be re-initialized)")
-    else:
+        print(f"  Dropped {len(dropped_keys)} incompatible keys (fully re-initialized)")
+    if not partially_preserved and not dropped_keys:
         print("  No shape mismatches found")
 
-    # ── Step 6: Load compatible weights ──────────────────────────────────
-    print("\nStep 6: Loading compatible weights...")
+    # ── Step 6: Load weights (compatible + partially preserved) ──────────
+    print("\nStep 6: Loading weights...")
     missing, unexpected = model.load_state_dict(enc_state, strict=False)
-    print(f"  Missing keys (new/reshaped — randomly initialized): {len(missing)}")
+    print(f"  Missing keys (new — randomly initialized): {len(missing)}")
     for k in missing:
         print(f"    {k}")
     print(f"  Unexpected keys (old — ignored): {len(unexpected)}")
