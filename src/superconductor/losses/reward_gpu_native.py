@@ -79,6 +79,7 @@ def detect_fraction_positions(tokens: torch.Tensor, mask: torch.Tensor) -> torch
     """
     batch_size, seq_len = tokens.shape
     device = tokens.device
+    mask = mask.bool()
 
     # Find opening and closing parentheses
     is_lparen = (tokens == LPAREN_IDX) & mask
@@ -108,6 +109,7 @@ def detect_digit_positions(tokens: torch.Tensor, mask: torch.Tensor) -> torch.Te
     Returns:
         is_digit: [batch, seq_len] boolean mask
     """
+    mask = mask.bool()
     is_digit = (tokens >= DIGIT_START) & (tokens <= DIGIT_END) & mask
     return is_digit
 
@@ -124,6 +126,7 @@ def detect_fraction_structure(tokens: torch.Tensor, mask: torch.Tensor) -> torch
     Returns:
         is_structure: [batch, seq_len] boolean mask
     """
+    mask = mask.bool()
     is_lparen = tokens == LPAREN_IDX
     is_rparen = tokens == RPAREN_IDX
     is_slash = tokens == SLASH_IDX
@@ -161,6 +164,7 @@ def compute_semantic_digit_penalty(
         total_penalty: [batch] total semantic digit penalty per sample
     """
     device = sampled_tokens.device
+    mask = mask.bool()
 
     # Identify digit positions in target that are in fractions
     target_is_digit = (target_tokens >= DIGIT_START) & (target_tokens <= DIGIT_END)
@@ -226,6 +230,7 @@ def compute_reward_gpu_native(
 
     batch_size = sampled_tokens.shape[0]
     device = sampled_tokens.device
+    mask = mask.bool()
 
     # 1. Token-level comparison (all on GPU)
     matches = (sampled_tokens == target_tokens) & mask  # [batch, seq_len]
@@ -338,6 +343,7 @@ def compute_reward_gpu_simple(
     reward = exact_match_bonus if all tokens match
              else per_token_bonus * (num_correct_tokens)
     """
+    mask = mask.bool()
     matches = (sampled_tokens == target_tokens) & mask
     n_matches = matches.sum(dim=1).float()
     n_mismatches = ((sampled_tokens != target_tokens) & mask).sum(dim=1)
