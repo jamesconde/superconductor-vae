@@ -70,6 +70,7 @@ PROJECT_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 from superconductor.utils.env_config import detect_environment
+from superconductor.utils.manifest import build_manifest, check_config_drift
 from superconductor.models.attention_vae import FullMaterialsVAE
 from superconductor.models.autoregressive_decoder import (
     EnhancedTransformerDecoder, tokenize_formula, tokens_to_indices,
@@ -699,12 +700,20 @@ _shutdown_state = {
     'enc_scheduler': None, 'dec_scheduler': None,
     'prev_exact': 0, 'best_exact': 0,
     'theory_loss_fn': None,  # V12.22
+    'manifest_builder': None,  # V12.29
 }
 
 def signal_handler(signum, frame):
     print(f"\n*** Interrupt received - saving and exiting... ***")
     _shutdown_state['should_stop'] = True
     if _shutdown_state['encoder'] is not None:
+        # V12.29: Build manifest for interrupt checkpoint if builder available
+        _interrupt_manifest = None
+        if _shutdown_state.get('manifest_builder') is not None:
+            try:
+                _interrupt_manifest = _shutdown_state['manifest_builder']()
+            except Exception:
+                pass  # Don't let manifest failure block emergency save
         save_checkpoint(
             _shutdown_state['encoder'], _shutdown_state['decoder'],
             _shutdown_state['epoch'], 'interrupt',
@@ -716,6 +725,7 @@ def signal_handler(signum, frame):
             prev_exact=_shutdown_state.get('prev_exact', 0),
             best_exact=_shutdown_state.get('best_exact', 0),
             theory_loss_fn=_shutdown_state.get('theory_loss_fn'),  # V12.22
+            manifest=_interrupt_manifest,  # V12.29
         )
     sys.exit(0)
 
@@ -1941,7 +1951,8 @@ CombinedLoss = CombinedLossWithREINFORCE
 
 def save_checkpoint(encoder, decoder, epoch, suffix='', entropy_manager=None,
                     enc_opt=None, dec_opt=None, enc_scheduler=None, dec_scheduler=None,
-                    prev_exact=None, best_exact=None, theory_loss_fn=None):
+                    prev_exact=None, best_exact=None, theory_loss_fn=None,
+                    manifest=None):
     """Save model checkpoint with full training state for proper resumption."""
     OUTPUT_DIR.mkdir(exist_ok=True)
 
@@ -1981,6 +1992,10 @@ def save_checkpoint(encoder, decoder, epoch, suffix='', entropy_manager=None,
     if best_exact is not None:
         checkpoint_data['best_exact'] = best_exact
 
+    # V12.29: Embed training manifest for version/config tracking
+    if manifest is not None:
+        checkpoint_data['manifest'] = manifest
+
     torch.save(checkpoint_data, path)
     print(f"  Saved checkpoint: {path.name}", flush=True)
 
@@ -1990,7 +2005,7 @@ def save_checkpoint(encoder, decoder, epoch, suffix='', entropy_manager=None,
 # ============================================================================
 
 def cache_z_vectors(encoder, loader, device, epoch, cache_path, dataset_info=None,
-                    decoder=None, mode='z_only'):
+                    decoder=None, mode='z_only', manifest=None):
     """
     Compute and cache latent z vectors and optionally decoder predictions.
 
@@ -2229,6 +2244,10 @@ def cache_z_vectors(encoder, loader, device, epoch, cache_path, dataset_info=Non
         'n_superconductors': is_sc_values.sum().item(),
         'n_non_sc': (1 - is_sc_values).sum().item(),
     }
+
+    # V12.29: Embed training manifest
+    if manifest is not None:
+        cache_data['manifest'] = manifest
 
     # Save cache
     cache_path = Path(cache_path)
@@ -3438,6 +3457,28 @@ def train():
     _shutdown_state['encoder'] = encoder
     _shutdown_state['decoder'] = decoder
 
+    # V12.29: Build dataset fingerprint and manifest helper for checkpoints/caches
+    contrastive = TRAIN_CONFIG.get('contrastive_mode', False)
+    _csv_path = CONTRASTIVE_DATA_PATH if contrastive else DATA_PATH
+    _dataset_fingerprint = {
+        'n_rows': len(train_loader.dataset),
+        'magpie_dim': magpie_dim,
+        'csv_path': str(_csv_path),
+    }
+
+    def _build_current_manifest():
+        import superconductor
+        actual_encoder = encoder._orig_mod if hasattr(encoder, '_orig_mod') else encoder
+        return build_manifest(
+            model_config=MODEL_CONFIG,
+            train_config=TRAIN_CONFIG,
+            dataset_fingerprint=_dataset_fingerprint,
+            encoder=actual_encoder,
+            package_version=superconductor.__version__,
+        )
+
+    _shutdown_state['manifest_builder'] = _build_current_manifest
+
     # V12.8: Loss function with REINFORCE support
     loss_fn = CombinedLossWithREINFORCE(
         ce_weight=TRAIN_CONFIG.get('ce_weight', 1.0),
@@ -3742,6 +3783,22 @@ def train():
         checkpoint_path = PROJECT_ROOT / TRAIN_CONFIG['resume_checkpoint']
         if checkpoint_path.exists():
             print(f"\nResuming from checkpoint: {checkpoint_path}")
+
+            # V12.29: Check manifest for config drift before loading weights
+            _raw_checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
+            if 'manifest' in _raw_checkpoint:
+                current_manifest = _build_current_manifest()
+                drift_warnings = check_config_drift(_raw_checkpoint['manifest'], current_manifest)
+                if drift_warnings:
+                    print("  [Manifest] Config drift detected:", flush=True)
+                    for w in drift_warnings:
+                        print(f"    {w}", flush=True)
+                else:
+                    print("  [Manifest] Config matches checkpoint", flush=True)
+            else:
+                print("  [Manifest] No manifest in checkpoint (pre-V12.29)", flush=True)
+            del _raw_checkpoint  # Free memory before full load
+
             # V12.10: Load full training state including optimizer/scheduler
             resume_state = load_checkpoint(
                 encoder, decoder, checkpoint_path,
@@ -3901,7 +3958,8 @@ def train():
                                enc_opt=enc_opt, dec_opt=dec_opt,
                                enc_scheduler=enc_scheduler, dec_scheduler=dec_scheduler,
                                prev_exact=prev_exact, best_exact=best_exact,
-                               theory_loss_fn=theory_loss_fn)
+                               theory_loss_fn=theory_loss_fn,
+                               manifest=_build_current_manifest())
                 raise RuntimeError(f"Training stopped: {max_rollbacks} consecutive rollbacks detected. "
                                    f"Check data, model architecture, or hyperparameters.")
 
@@ -4039,12 +4097,14 @@ def train():
         log_training_metrics(epoch, metrics, training_log_path, true_eval=true_eval)
 
         # Save checkpoints (V12.10: include full training state)
+        _manifest = _build_current_manifest()  # V12.29
         checkpoint_kwargs = dict(
             entropy_manager=entropy_manager,
             enc_opt=enc_opt, dec_opt=dec_opt,
             enc_scheduler=enc_scheduler, dec_scheduler=dec_scheduler,
             prev_exact=metrics['exact_match'], best_exact=best_exact,
             theory_loss_fn=theory_loss_fn,  # V12.22
+            manifest=_manifest,  # V12.29
         )
 
         if metrics['exact_match'] > best_exact:
@@ -4058,7 +4118,8 @@ def train():
                 z_cache_path = PROJECT_ROOT / TRAIN_CONFIG.get('z_cache_path', 'outputs/latent_cache.pt')
                 z_cache_mode = TRAIN_CONFIG.get('z_cache_mode', 'z_only')
                 cache_z_vectors(encoder, train_loader, device, epoch, z_cache_path,
-                               dataset_info=norm_stats, decoder=decoder, mode=z_cache_mode)
+                               dataset_info=norm_stats, decoder=decoder, mode=z_cache_mode,
+                               manifest=_manifest)
 
         # V12.17: Cache z-vectors at configured interval (or every epoch if configured)
         z_cache_interval = TRAIN_CONFIG.get('z_cache_interval', 0)
@@ -4071,7 +4132,8 @@ def train():
             # Save with epoch suffix to track evolution
             epoch_cache_path = z_cache_path.with_stem(f"{z_cache_path.stem}_epoch{epoch:04d}")
             cache_z_vectors(encoder, train_loader, device, epoch, epoch_cache_path,
-                           dataset_info=norm_stats, decoder=decoder, mode=z_cache_mode)
+                           dataset_info=norm_stats, decoder=decoder, mode=z_cache_mode,
+                           manifest=_manifest)
 
         if (epoch + 1) % TRAIN_CONFIG['checkpoint_interval'] == 0:
             save_checkpoint(encoder, decoder, epoch, **checkpoint_kwargs)
@@ -4085,7 +4147,8 @@ def train():
         z_cache_mode = TRAIN_CONFIG.get('z_cache_mode', 'z_only')
         final_cache_path = z_cache_path.with_stem(f"{z_cache_path.stem}_final")
         cache_z_vectors(encoder, train_loader, device, epoch, final_cache_path,
-                       dataset_info=norm_stats, decoder=decoder, mode=z_cache_mode)
+                       dataset_info=norm_stats, decoder=decoder, mode=z_cache_mode,
+                       manifest=_build_current_manifest())
 
     print(f"\nTraining complete. Best exact match: {best_exact*100:.1f}%")
 

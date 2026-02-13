@@ -4,6 +4,47 @@ Chronological record of training runs, architecture changes, and optimization de
 
 ---
 
+## V12.29: Training Manifest System (2026-02-13)
+
+### Problem
+
+No version tracking embedded in training artifacts (checkpoints, latent caches). When loading a checkpoint saved weeks ago, there was no way to know what code version produced it, what MODEL_CONFIG / TRAIN_CONFIG were active, what dataset was used, or whether the current code/config had drifted. This caused real pain during the V12.28 migration when exact match dropped to 0% due to a magpie_dim mismatch that wasn't detectable from the checkpoint itself.
+
+### Changes
+
+**New file: `src/superconductor/utils/manifest.py`** (~200 lines)
+- `get_git_info()` — captures commit, branch, dirty state
+- `get_environment_info()` — captures Python, PyTorch, CUDA, GPU
+- `get_model_architecture_fingerprint()` — captures all parameter names and shapes
+- `compute_config_hash()` — stable SHA-256 hash of config dicts
+- `build_manifest()` — assembles complete manifest dict for embedding
+- `check_config_drift()` — compares saved vs current manifest with tiered warnings:
+  - `[CRITICAL]`: architecture fingerprint mismatch (param shapes differ)
+  - `[WARNING]`: model_config_hash or train_config_hash changed
+  - `[INFO]`: git commit, environment, or dataset changed
+
+**Modified: `src/superconductor/models/attention_vae.py`**
+- Added `get_config()` method to `FullMaterialsVAE` — returns constructor parameters for manifest
+
+**Modified: `scripts/train_v12_clean.py`**
+- `save_checkpoint()`: new `manifest=None` parameter, embedded in checkpoint_data
+- `cache_z_vectors()`: new `manifest=None` parameter, embedded in cache_data
+- `train()`: builds dataset fingerprint and manifest helper after data/model creation
+- Config drift detection on checkpoint resume (before weight loading)
+- Signal handler and emergency saves include manifest
+
+**Version bump**: `superconductor.__version__` 0.1.0 → 0.2.0
+
+### Design Decisions
+
+- **train_config stored as hash only** — too large and changes between runs; hash detects drift
+- **model_config stored in full** — small (8 keys), directly affects architecture compatibility
+- **Dataset fingerprint uses row count + magpie_dim** — not a full CSV hash (too expensive for 50K rows)
+- **Backward compatible** — old checkpoints without manifests load fine with a single info log line
+- **Drift detection runs before weight loading** — warns early, doesn't block loading
+
+---
+
 ## V12.26: Disable Contrastive & Theory Losses — Unblock Plateau (2026-02-11)
 
 ### Problem

@@ -810,6 +810,15 @@ class FullMaterialsVAE(nn.Module):
             nn.Linear(128, 1),  # logits — apply sigmoid for probability
         )
 
+    def get_config(self) -> Dict:
+        """Return the constructor parameters for manifest embedding."""
+        return {
+            'n_elements': self.n_elements,
+            'latent_dim': self.latent_dim,
+            'magpie_dim': self.magpie_dim,
+            'fusion_dim': self.fusion_dim,
+        }
+
     def reparameterize(self, mean: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
         """Reparameterization trick for VAE, or passthrough in deterministic mode."""
         if logvar is None:
