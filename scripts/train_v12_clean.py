@@ -117,7 +117,14 @@ from superconductor.models.family_classifier import (
 
 class TimingStats:
     """
-    Track timing for different phases of training.
+    Track timing for different phases of training using CUDA events.
+
+    V12.31: Uses torch.cuda.Event(enable_timing=True) for async GPU timing.
+    This avoids torch.cuda.synchronize() at every phase boundary, which was
+    breaking GPU pipeline overlap and adding ~16,800 sync stalls per epoch.
+
+    CUDA events record timestamps on the GPU stream without blocking the CPU.
+    Elapsed times are computed lazily at epoch end (single sync point).
 
     Phases tracked:
     - data_load: Time to fetch batch from DataLoader
@@ -142,6 +149,7 @@ class TimingStats:
     ]
 
     def __init__(self):
+        self._use_cuda_events = torch.cuda.is_available()
         self.reset()
 
     def reset(self):
@@ -151,33 +159,55 @@ class TimingStats:
         self._phase_start = None
         self._current_phase = None
         self._epoch_start = None
+        # CUDA event pairs: list of (start_event, end_event, phase_name)
+        self._pending_events = []
 
     def start_epoch(self):
         """Mark the start of an epoch."""
         self._epoch_start = time.perf_counter()
 
     def start(self, phase: str):
-        """Start timing a phase."""
-        # Ensure CUDA operations are complete before timing
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
-        self._phase_start = time.perf_counter()
+        """Start timing a phase (non-blocking CUDA event)."""
         self._current_phase = phase
+        if self._use_cuda_events:
+            event = torch.cuda.Event(enable_timing=True)
+            event.record()
+            self._phase_start = event
+        else:
+            self._phase_start = time.perf_counter()
 
     def stop(self, phase: str = None):
-        """Stop timing the current phase."""
+        """Stop timing the current phase (non-blocking CUDA event)."""
         if self._phase_start is None:
             return
-        # Ensure CUDA operations are complete before timing
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
-        elapsed = time.perf_counter() - self._phase_start
         phase = phase or self._current_phase
-        if phase:
-            self.times[phase] += elapsed
-            self.counts[phase] += 1
+        if self._use_cuda_events:
+            end_event = torch.cuda.Event(enable_timing=True)
+            end_event.record()
+            if phase:
+                self._pending_events.append((self._phase_start, end_event, phase))
+                self.counts[phase] += 1
+        else:
+            elapsed = time.perf_counter() - self._phase_start
+            if phase:
+                self.times[phase] += elapsed
+                self.counts[phase] += 1
         self._phase_start = None
         self._current_phase = None
+
+    def _flush_cuda_events(self):
+        """Synchronize and compute all pending CUDA event timings.
+
+        Called once at epoch end — single sync point instead of thousands.
+        """
+        if not self._pending_events:
+            return
+        torch.cuda.synchronize()
+        for start_event, end_event, phase in self._pending_events:
+            # elapsed_time returns milliseconds
+            elapsed_ms = start_event.elapsed_time(end_event)
+            self.times[phase] += elapsed_ms / 1000.0  # Convert to seconds
+        self._pending_events.clear()
 
     def get_epoch_time(self) -> float:
         """Get total epoch time in seconds."""
@@ -187,6 +217,7 @@ class TimingStats:
 
     def get_total_tracked(self) -> float:
         """Get sum of all tracked phase times."""
+        self._flush_cuda_events()
         return sum(self.times.values())
 
     def get_breakdown(self) -> Dict[str, float]:
@@ -196,17 +227,19 @@ class TimingStats:
         Returns:
             Dict mapping phase name to percentage of total time.
         """
-        total = self.get_total_tracked()
+        total = self.get_total_tracked()  # Flushes CUDA events
         if total == 0:
             return {phase: 0.0 for phase in self.PHASES}
         return {phase: (self.times[phase] / total) * 100 for phase in self.PHASES}
 
     def get_absolute(self) -> Dict[str, float]:
         """Get absolute times in seconds for each phase."""
+        self._flush_cuda_events()
         return dict(self.times)
 
     def get_per_batch(self) -> Dict[str, float]:
         """Get average time per batch for each phase (in ms)."""
+        self._flush_cuda_events()
         result = {}
         for phase in self.PHASES:
             if self.counts[phase] > 0:
@@ -544,6 +577,32 @@ TRAIN_CONFIG = {
 
     'use_family_classifier': False,        # Train learned family classifier alongside
     'family_classifier_weight': 0.01,      # Weight for family classification loss
+
+    # =========================================================================
+    # V12.30: Stop-Prediction Head Settings
+    # =========================================================================
+    # Dedicated binary head that predicts "should the decoder stop here?"
+    # Decouples the END decision from competing with 150+ element tokens in softmax.
+    # At inference, boosts END_IDX logit by stop_boost * sigmoid(stop_logit).
+    # =========================================================================
+    'stop_loss_weight': 5.0,   # Weight for stop-prediction BCE loss (high due to 1:14 class imbalance)
+    'stop_boost': 4.0,        # Additive END logit boost from stop head at inference (0 = disabled)
+
+    # =========================================================================
+    # V12.31: Physics-Supervised Z Coordinates
+    # =========================================================================
+    # Partition 2048-dim Z into named coordinate blocks encoding specific
+    # physical quantities. Blocks 1-11 (0-511) are supervised/constrained.
+    # Block 12 (512-2047) is unsupervised discovery space.
+    # No architectural changes — physics enforced via loss gradient pressure.
+    # =========================================================================
+    'use_physics_z': True,                    # Enable physics Z infrastructure
+    'physics_z_comp_weight': 1.0,             # Block 8 compositional supervision
+    'physics_z_magpie_weight': 0.5,           # Block 11 Magpie encoding
+    'physics_z_consistency_weight': 0.1,      # GL/BCS/cobordism consistency
+    'physics_z_direct_weight': 0.0,           # Direct supervision (placeholder)
+    'physics_z_warmup_epochs': 20,            # Ramp up physics Z losses
+    'physics_z_data_path': None,              # Path to optional physics data CSV
 }
 
 CONTRASTIVE_DATA_PATH = PROJECT_ROOT / 'data/processed/supercon_fractions_contrastive.csv'
@@ -847,6 +906,11 @@ def _try_load_cache(csv_hash: str, max_formula_len: int):
         if family_cache_path.exists():
             tensors['family_tensor'] = torch.load(family_cache_path, weights_only=True)
 
+        # V12.31: Load compositional targets if available
+        comp_cache_path = cache_dir / 'comp_targets_tensor.pt'
+        if comp_cache_path.exists():
+            tensors['comp_targets_tensor'] = torch.load(comp_cache_path, weights_only=True)
+
         norm_stats = {
             'tc_mean': meta['tc_mean'],
             'tc_std': meta['tc_std'],
@@ -970,6 +1034,20 @@ def load_and_prepare_data():
             # Not in cache — will be recomputed below after dataset creation
             n = tensors['element_indices'].size(0)
             tensor_list.append(torch.zeros(n, dtype=torch.long))
+
+        # V12.31: Compositional targets tensor (backward compatible)
+        if 'comp_targets_tensor' in tensors:
+            tensor_list.append(tensors['comp_targets_tensor'])
+        elif TRAIN_CONFIG.get('use_physics_z', False):
+            # Not in cache — compute now
+            from superconductor.data.compositional_targets import CompositionalTargetComputer
+            comp_computer = CompositionalTargetComputer()
+            comp_targets_tensor, comp_norm_stats = comp_computer.compute_from_dataset(
+                tensors['element_indices'], tensors['element_fractions'],
+                tensors['element_mask'],
+            )
+            tensor_list.append(comp_targets_tensor)
+            print(f"  V12.31: Computed {comp_targets_tensor.shape[1]} compositional targets (cache miss)")
 
         dataset = TensorDataset(*tensor_list)
         train_dataset = Subset(dataset, train_indices)
@@ -1145,6 +1223,18 @@ def load_and_prepare_data():
         for fam_val, count in sorted(_fam_counts.items()):
             print(f"    {_fam_names.get(fam_val, 'UNKNOWN')}: {count}")
 
+        # V12.31: Pre-compute compositional targets for Physics Z Block 8
+        comp_targets_tensor = None
+        comp_norm_stats = None
+        if TRAIN_CONFIG.get('use_physics_z', False):
+            from superconductor.data.compositional_targets import CompositionalTargetComputer
+            comp_computer = CompositionalTargetComputer()
+            comp_targets_tensor, comp_norm_stats = comp_computer.compute_from_dataset(
+                element_indices, element_fractions, element_mask
+            )
+            print(f"  V12.31: Computed {comp_targets_tensor.shape[1]} compositional targets "
+                  f"for {comp_targets_tensor.shape[0]} samples")
+
         # Get train indices (exclude holdout — matched by formula, not position)
         holdout_indices = load_holdout_indices(HOLDOUT_PATH, formulas)
         all_indices = set(range(len(formulas)))
@@ -1168,8 +1258,7 @@ def load_and_prepare_data():
         }
 
         # Save cache for next run
-        _save_cache(
-            tensors={
+        _cache_tensors = {
                 'formula_tokens': formula_tokens,
                 'element_indices': element_indices,
                 'element_fractions': element_fractions,
@@ -1180,7 +1269,12 @@ def load_and_prepare_data():
                 'label_tensor': label_tensor,
                 'hp_tensor': hp_tensor,  # V12.19
                 'family_tensor': family_tensor,  # V12.22
-            },
+        }
+        # V12.31: Include compositional targets in cache
+        if comp_targets_tensor is not None:
+            _cache_tensors['comp_targets_tensor'] = comp_targets_tensor
+        _save_cache(
+            tensors=_cache_tensors,
             norm_stats=norm_stats,
             n_magpie_cols=n_magpie_cols,
             train_indices=train_indices,
@@ -1188,12 +1282,16 @@ def load_and_prepare_data():
             max_formula_len=max_len,
         )
 
-        # Create dataset (10 tensors: 6 original + is_sc + label + hp + family)
-        dataset = TensorDataset(
+        # Create dataset (10 or 11 tensors: 6 original + is_sc + label + hp + family [+ comp_targets])
+        _dataset_tensors = [
             element_indices, element_fractions, element_mask,
             formula_tokens, tc_tensor, magpie_tensor,
             is_sc_tensor, label_tensor, hp_tensor, family_tensor,
-        )
+        ]
+        # V12.31: Append compositional targets as index 10
+        if comp_targets_tensor is not None:
+            _dataset_tensors.append(comp_targets_tensor)
+        dataset = TensorDataset(*_dataset_tensors)
         train_dataset = Subset(dataset, train_indices)
 
     # V12.11: Auto batch size based on GPU memory
@@ -1396,6 +1494,7 @@ class CombinedLossWithREINFORCE(nn.Module):
         self.rl_method = rl_method  # 'scst' or 'rloo'
         self._decoder = None
         self._max_len = 60
+        self._stop_boost = 0.0  # V12.30: Set via set_decoder()
 
         # GPU-native reward config
         self.gpu_reward_config = get_default_gpu_reward_config()
@@ -1411,17 +1510,19 @@ class CombinedLossWithREINFORCE(nn.Module):
         else:
             self.ce_loss = nn.CrossEntropyLoss(reduction='none', ignore_index=PAD_IDX)
 
-    def set_decoder(self, decoder, max_len: int = 60, draft_model=None):
+    def set_decoder(self, decoder, max_len: int = 60, draft_model=None, stop_boost: float = 0.0):
         """Set decoder for autoregressive REINFORCE sampling (V12.8).
 
         Args:
             decoder: The EnhancedTransformerDecoder
             max_len: Maximum sequence length
             draft_model: Optional HybridDraft for speculative decoding (V12.9)
+            stop_boost: V12.30 Additive END logit boost from stop head
         """
         self._decoder = decoder
         self._max_len = max_len
         self._draft_model = draft_model
+        self._stop_boost = stop_boost  # V12.30
 
     def set_draft_model(self, draft_model):
         """Set draft model for speculative decoding (V12.9)."""
@@ -1488,6 +1589,7 @@ class CombinedLossWithREINFORCE(nn.Module):
                 stoich_pred=stoich_pred_expanded,
                 temperature=self.temperature,
                 max_len=self._max_len,
+                stop_boost=self._stop_boost,  # V12.30
             )
             self._last_spec_stats = None
 
@@ -1655,6 +1757,7 @@ class CombinedLossWithREINFORCE(nn.Module):
                 max_len=self._max_len,
                 return_log_probs=False,
                 cached_memory=cached_memory,
+                stop_boost=self._stop_boost,  # V12.30
             )
 
             # Pad/truncate greedy tokens to match target length for reward computation
@@ -1690,6 +1793,7 @@ class CombinedLossWithREINFORCE(nn.Module):
             temperature=self.temperature,
             max_len=self._max_len,
             cached_memory=cached_memory,
+            stop_boost=self._stop_boost,  # V12.30
         )
 
         # Pad/truncate sampled tokens to match target length
@@ -2531,7 +2635,7 @@ def load_checkpoint(encoder, decoder, checkpoint_path, entropy_manager=None,
 
 @torch.no_grad()
 def evaluate_true_autoregressive(encoder, decoder, loader, device, max_samples=1000,
-                                  log_errors=True, epoch=None):
+                                  log_errors=True, epoch=None, stop_boost=0.0):
     """
     V12.18: Enhanced evaluation with full Z-space diagnostics and reconstruction metrics.
 
@@ -2576,7 +2680,7 @@ def evaluate_true_autoregressive(encoder, decoder, loader, device, max_samples=1
     all_n_elements = []       # Per-sample number of elements (from elem_mask)
 
     for batch in loader:
-        if total_samples >= max_samples:
+        if max_samples > 0 and total_samples >= max_samples:
             break
 
         # Unpack batch (V12.12: 8 tensors with contrastive data)
@@ -2635,6 +2739,7 @@ def evaluate_true_autoregressive(encoder, decoder, loader, device, max_samples=1
             encoder_skip=encoder_skip,
             temperature=0.001,  # Near-greedy for evaluation
             max_len=decoder.max_len,
+            stop_boost=stop_boost,  # V12.30
         )
 
         # Compare with targets (excluding START token from targets)
@@ -2901,7 +3006,8 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
                 contrastive_loss_fn=None, contrastive_weight=0.0, non_sc_formula_weight=0.5,
                 selective_backprop=False, selective_backprop_threshold=0.33,
                 enable_timing=True, hp_loss_weight=0.0, sc_loss_weight=0.0,
-                theory_loss_fn=None, theory_weight=0.0, norm_stats=None):
+                theory_loss_fn=None, theory_weight=0.0, norm_stats=None,
+                physics_z_loss_fn=None, physics_z_weight=1.0):
     """Train for one epoch with curriculum weights and teacher forcing.
 
     V12.8: Added amp_dtype for configurable mixed precision (bfloat16/float16)
@@ -2913,6 +3019,7 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
     V12.19: Added hp_loss_weight for high-pressure prediction head
     V12.21: Added sc_loss_weight for SC/non-SC classification head
     V12.22: Added theory_loss_fn, theory_weight, norm_stats for theory-guided consistency
+    V12.31: Added physics_z_loss_fn, physics_z_weight for physics Z supervision
     """
     global _timing_stats
 
@@ -2940,6 +3047,8 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
     total_sc_loss = 0  # V12.21
     total_theory_loss = 0  # V12.22
     total_tc_class_loss = 0  # V12.28
+    total_stop_loss = 0  # V12.30
+    total_physics_z_loss = 0  # V12.31
     total_sc_exact = 0
     total_non_sc_exact = 0
     total_spec_accept = 0  # V12.9: Speculative decoding acceptance rate
@@ -2967,11 +3076,12 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
         if timing:
             timing.stop('data_load')
 
-        # V12.22: Unpack 10 tensors (6 original + is_sc + label + hp + family)
+        # V12.31: Unpack up to 11 tensors (6 original + is_sc + label + hp + family [+ comp_targets])
         batch_tensors = [b.to(device) for b in batch]
         elem_idx, elem_frac, elem_mask, tokens, tc, magpie, is_sc, labels = batch_tensors[:8]
         hp_labels = batch_tensors[8] if len(batch_tensors) > 8 else torch.zeros_like(is_sc, dtype=torch.float32)
         family_labels = batch_tensors[9] if len(batch_tensors) > 9 else None
+        comp_targets = batch_tensors[10] if len(batch_tensors) > 10 else None  # V12.31
 
         sc_mask = is_sc.bool()  # True = superconductor
 
@@ -3021,7 +3131,7 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
                 timing.start('decoder_fwd')
 
             # Decoder forward with teacher forcing ratio (all samples)
-            formula_logits, _ = decoder(
+            formula_logits, _, stop_logits = decoder(
                 z, tokens, encoder_skip=attended_input,
                 stoich_pred=stoich_pred, teacher_forcing_ratio=tf_ratio
             )
@@ -3029,6 +3139,21 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
 
             if timing:
                 timing.stop('decoder_fwd')
+
+            # V12.30: Stop-prediction loss (BCE on stop head)
+            stop_loss_weight = TRAIN_CONFIG.get('stop_loss_weight', 0.0)
+            stop_loss_val = torch.tensor(0.0, device=device)
+            if stop_loss_weight > 0 and stop_logits is not None:
+                # Target: 1.0 at positions where target token is END, 0.0 elsewhere
+                stop_targets = (formula_targets == END_IDX).float()  # [batch, seq_len]
+                # Mask: only compute on valid (non-PAD) positions
+                stop_mask = (formula_targets != PAD_IDX).float()
+                # BCE loss (with logits, so no sigmoid needed)
+                stop_bce = F.binary_cross_entropy_with_logits(
+                    stop_logits, stop_targets, reduction='none'
+                )
+                # Apply mask and average
+                stop_loss_val = (stop_bce * stop_mask).sum() / stop_mask.sum().clamp(min=1)
 
             # V12.12: Contrastive loss on full batch (SC + non-SC)
             contrastive_loss_val = torch.tensor(0.0, device=device)
@@ -3077,6 +3202,17 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
                 )
                 theory_loss_val = theory_result['total']
 
+            # V12.31: Physics Z supervision
+            physics_z_loss_val = torch.tensor(0.0, device=device)
+            if physics_z_loss_fn is not None and physics_z_weight > 0 and comp_targets is not None:
+                pz_result = physics_z_loss_fn(
+                    z=z,
+                    comp_targets=comp_targets,
+                    magpie_features=magpie,
+                    physics_targets=None,  # Placeholder until external data exists
+                )
+                physics_z_loss_val = pz_result['total'] * physics_z_weight
+
             # V12.15: Time loss computation (includes REINFORCE sampling)
             if timing:
                 timing.start('loss_compute')
@@ -3106,7 +3242,9 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
                 loss = (loss_dict['total'] + contrastive_weight * contrastive_loss_val
                         + hp_loss_weight * hp_loss_val
                         + sc_loss_weight * sc_loss_val
-                        + theory_weight * theory_loss_val)  # V12.22
+                        + theory_weight * theory_loss_val
+                        + stop_loss_weight * stop_loss_val
+                        + physics_z_loss_val)  # V12.31
 
             elif (~sc_mask).all():
                 # Pure non-SC batch — formula loss only (lower weight), no Tc/Magpie/REINFORCE
@@ -3132,7 +3270,9 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
                 # Scale formula loss by non_sc_formula_weight
                 loss = (non_sc_formula_weight * loss_dict['total'] + contrastive_weight * contrastive_loss_val
                         + sc_loss_weight * sc_loss_val
-                        + theory_weight * theory_loss_val)  # V12.22
+                        + theory_weight * theory_loss_val
+                        + stop_loss_weight * stop_loss_val
+                        + physics_z_loss_val)  # V12.31
 
             else:
                 # Mixed batch — compute SC and non-SC losses separately
@@ -3191,7 +3331,9 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
                         contrastive_weight * contrastive_loss_val +
                         hp_loss_weight * hp_loss_val +
                         sc_loss_weight * sc_loss_val +
-                        theory_weight * theory_loss_val)  # V12.22
+                        theory_weight * theory_loss_val +
+                        stop_loss_weight * stop_loss_val +
+                        physics_z_loss_val)  # V12.31
 
         # V12.15: Stop loss computation timing
         if timing:
@@ -3248,10 +3390,12 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
                 scaler.unscale_(enc_opt)
                 scaler.unscale_(dec_opt)
 
-                # Gradient clipping (V12.22: include theory loss params in encoder clip)
+                # Gradient clipping (V12.22: include theory loss params, V12.31: physics Z params)
                 _enc_params = list(encoder.parameters())
                 if theory_loss_fn is not None:
                     _enc_params = _enc_params + list(theory_loss_fn.parameters())
+                if physics_z_loss_fn is not None:
+                    _enc_params = _enc_params + list(physics_z_loss_fn.parameters())
                 enc_grad_norm = torch.nn.utils.clip_grad_norm_(_enc_params, 1.0)
                 dec_grad_norm = torch.nn.utils.clip_grad_norm_(decoder.parameters(), 1.0)
 
@@ -3293,6 +3437,8 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
         total_sc_loss += sc_loss_val.item() if torch.is_tensor(sc_loss_val) else sc_loss_val  # V12.21
         total_theory_loss += theory_loss_val.item() if torch.is_tensor(theory_loss_val) else theory_loss_val  # V12.22
         total_tc_class_loss += loss_dict.get('tc_class_loss', torch.tensor(0.0)).item()  # V12.28
+        total_stop_loss += stop_loss_val.item() if torch.is_tensor(stop_loss_val) else stop_loss_val  # V12.30
+        total_physics_z_loss += physics_z_loss_val.item() if torch.is_tensor(physics_z_loss_val) else physics_z_loss_val  # V12.31
         z_norm_val = z.detach().float().norm(dim=1).mean().item()
         if not math.isnan(z_norm_val):
             total_z_norm += z_norm_val
@@ -3337,6 +3483,8 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
             'tc_loss': 0, 'magpie_loss': 0, 'stoich_loss': 0,
             'reinforce_loss': 0, 'mean_reward': 0, 'entropy': 0,
             'contrastive_loss': 0, 'hp_loss': 0, 'sc_loss': 0, 'theory_loss': 0,
+            'stop_loss': 0,  # V12.30
+            'physics_z_loss': 0,  # V12.31
             'z_norm': 0, 'n_skipped': n_skipped, 'n_total_batches': 0,
         }
 
@@ -3355,6 +3503,8 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
         'sc_loss': total_sc_loss / n_batches,  # V12.21
         'theory_loss': total_theory_loss / n_batches,  # V12.22
         'tc_class_loss': total_tc_class_loss / n_batches,  # V12.28
+        'stop_loss': total_stop_loss / n_batches,  # V12.30
+        'physics_z_loss': total_physics_z_loss / n_batches,  # V12.31
         'z_norm': total_z_norm / n_batches,
         'n_skipped': n_skipped,  # V12.12: Selective backprop skips
         'n_total_batches': n_batches,
@@ -3540,7 +3690,8 @@ def train():
 
     # Wire up decoder for autoregressive REINFORCE/SCST sampling
     if TRAIN_CONFIG.get('rl_weight', 0.0) > 0 and TRAIN_CONFIG.get('use_autoregressive_reinforce', True):
-        loss_fn.set_decoder(decoder, max_len=TRAIN_CONFIG['max_formula_len'], draft_model=draft_model)
+        loss_fn.set_decoder(decoder, max_len=TRAIN_CONFIG['max_formula_len'], draft_model=draft_model,
+                            stop_boost=TRAIN_CONFIG.get('stop_boost', 0.0))  # V12.30
         rl_method = TRAIN_CONFIG.get('rl_method', 'scst')
         method_name = 'SCST (Self-Critical)' if rl_method == 'scst' else 'RLOO (Leave-One-Out)'
         print(f"RL: {method_name}, rl_weight={TRAIN_CONFIG['rl_weight']}, "
@@ -3600,6 +3751,24 @@ def train():
               f"params={n_theory_params:,}, "
               f"magpie_stats={'yes' if norm_stats.get('magpie_mean') else 'no'})")
 
+    # V12.31: Physics Z supervision loss
+    physics_z_loss_fn = None
+    if TRAIN_CONFIG.get('use_physics_z', False):
+        from superconductor.losses.z_supervision_loss import PhysicsZLoss
+        physics_z_config = {
+            'comp_weight': TRAIN_CONFIG.get('physics_z_comp_weight', 1.0),
+            'magpie_enc_weight': TRAIN_CONFIG.get('physics_z_magpie_weight', 0.5),
+            'consistency_weight': TRAIN_CONFIG.get('physics_z_consistency_weight', 0.1),
+            'direct_weight': TRAIN_CONFIG.get('physics_z_direct_weight', 0.0),
+        }
+        physics_z_loss_fn = PhysicsZLoss(physics_z_config).to(device)
+        n_pz_params = sum(p.numel() for p in physics_z_loss_fn.parameters())
+        print(f"Physics Z Loss: V12.31 (comp={physics_z_config['comp_weight']}, "
+              f"magpie={physics_z_config['magpie_enc_weight']}, "
+              f"consistency={physics_z_config['consistency_weight']}, "
+              f"warmup={TRAIN_CONFIG.get('physics_z_warmup_epochs', 20)} epochs, "
+              f"params={n_pz_params:,})")
+
     # V12.9: Initialize entropy manager for REINFORCE (prevents entropy collapse)
     entropy_manager = None
     if TRAIN_CONFIG.get('rl_weight', 0.0) > 0:
@@ -3637,10 +3806,16 @@ def train():
     )
 
     # V12.22: Include theory loss learnable params (BCS predictors, cuprate predictors)
+    # V12.31: Also include physics Z loss params (Magpie projection)
     # in encoder optimizer so they receive gradients during training
     import itertools as _itertools
+    _extra_params = []
     if theory_loss_fn is not None:
-        enc_params = list(_itertools.chain(encoder.parameters(), theory_loss_fn.parameters()))
+        _extra_params.append(theory_loss_fn.parameters())
+    if physics_z_loss_fn is not None:
+        _extra_params.append(physics_z_loss_fn.parameters())
+    if _extra_params:
+        enc_params = list(_itertools.chain(encoder.parameters(), *_extra_params))
     else:
         enc_params = list(encoder.parameters())
     enc_opt = torch.optim.AdamW(enc_params, lr=TRAIN_CONFIG['learning_rate'])
@@ -3696,6 +3871,7 @@ def train():
     _shutdown_state['enc_scheduler'] = enc_scheduler
     _shutdown_state['dec_scheduler'] = dec_scheduler
     _shutdown_state['theory_loss_fn'] = theory_loss_fn  # V12.22
+    _shutdown_state['physics_z_loss_fn'] = physics_z_loss_fn  # V12.31
 
     # V12.8: AMP dtype configuration with auto-detection
     # bfloat16 requires compute capability 8.0+ (Ampere: RTX 30xx, A100, etc.)
@@ -3765,6 +3941,11 @@ def train():
     if TRAIN_CONFIG.get('use_theory_loss', False):
         print(f"  Theory: {TRAIN_CONFIG.get('theory_weight', 0)} "
               f"(warmup={TRAIN_CONFIG.get('theory_warmup_epochs', 50)} epochs)")
+    if TRAIN_CONFIG.get('use_physics_z', False):
+        print(f"  PhysZ comp: {TRAIN_CONFIG.get('physics_z_comp_weight', 1.0)}, "
+              f"magpie: {TRAIN_CONFIG.get('physics_z_magpie_weight', 0.5)}, "
+              f"consist: {TRAIN_CONFIG.get('physics_z_consistency_weight', 0.1)} "
+              f"(warmup={TRAIN_CONFIG.get('physics_z_warmup_epochs', 20)} epochs)")
     print(f"\nCurriculum:")
     print(f"  Phase 1 (0-{TRAIN_CONFIG['curriculum_phase1_end']}): Tc 5→10, Magpie 1→2")
     print(f"  Phase 2 ({TRAIN_CONFIG['curriculum_phase1_end']}+): Full strength")
@@ -3844,7 +4025,8 @@ def train():
         # Update references
         _shutdown_state['encoder'] = encoder
         # V12.15: Preserve draft_model when updating decoder reference after compile
-        loss_fn.set_decoder(decoder, max_len=TRAIN_CONFIG['max_formula_len'], draft_model=draft_model)
+        loss_fn.set_decoder(decoder, max_len=TRAIN_CONFIG['max_formula_len'], draft_model=draft_model,
+                            stop_boost=TRAIN_CONFIG.get('stop_boost', 0.0))  # V12.30
         print("  Encoder and decoder.transformer_decoder compiled")
 
         # Warmup pass: initialize CUDA graphs with a real batch to prevent NaN on first epoch
@@ -3907,6 +4089,13 @@ def train():
             theory_warmup_prog = min(1.0, epoch / max(theory_warmup, 1))
             effective_theory_weight = TRAIN_CONFIG['theory_weight'] * theory_warmup_prog
 
+        # V12.31: Compute physics Z weight with warmup
+        effective_physics_z_weight = 0.0
+        if physics_z_loss_fn is not None:
+            pz_warmup = TRAIN_CONFIG.get('physics_z_warmup_epochs', 20)
+            pz_warmup_prog = min(1.0, epoch / max(pz_warmup, 1))
+            effective_physics_z_weight = pz_warmup_prog  # Weights are inside PhysicsZLoss config
+
         metrics = train_epoch(
             encoder, decoder, train_loader, loss_fn,
             enc_opt, dec_opt, scaler, device, TRAIN_CONFIG['use_amp'],
@@ -3931,6 +4120,9 @@ def train():
             theory_loss_fn=theory_loss_fn,
             theory_weight=effective_theory_weight,
             norm_stats=norm_stats,
+            # V12.31: Physics Z supervision
+            physics_z_loss_fn=physics_z_loss_fn,
+            physics_z_weight=effective_physics_z_weight,
         )
 
         # V12.11: Catastrophic drop detection - rollback to best checkpoint and halve LR
@@ -4050,6 +4242,14 @@ def train():
         if TRAIN_CONFIG.get('tc_class_weight', 0) > 0 and metrics.get('tc_class_loss', 0) > 0:
             base_msg += f" | TcCl: {metrics['tc_class_loss']:.4f}"
 
+        # V12.30: Show stop loss if enabled
+        if TRAIN_CONFIG.get('stop_loss_weight', 0) > 0 and metrics.get('stop_loss', 0) > 0:
+            base_msg += f" | Stop: {metrics['stop_loss']:.4f}"
+
+        # V12.31: Show physics Z loss if enabled
+        if physics_z_loss_fn is not None and metrics.get('physics_z_loss', 0) > 0:
+            base_msg += f" | PhysZ: {metrics['physics_z_loss']:.4f} (w={effective_physics_z_weight:.2f})"
+
         # V12.12: Show selective backprop stats
         if metrics.get('n_skipped', 0) > 0 and metrics.get('n_total_batches', 0) > 0:
             skip_pct = metrics['n_skipped'] / metrics['n_total_batches'] * 100
@@ -4073,17 +4273,23 @@ def train():
         if epoch % 50 == 0 and 'timing' in metrics and metrics['timing'] is not None:
             print(metrics['timing'].format_detailed())
 
-        # V12.18: Evaluate TRUE autoregressive exact match EVERY epoch
-        # with full Z-space diagnostics, Tc/Magpie/stoich reconstruction stats
+        # V12.18: Evaluate TRUE autoregressive exact match
+        # V12.31: Reduced from every epoch to every 4 epochs (expensive: 2 full
+        # autoregressive decoder passes × 60 sequential steps per sample)
+        # Final epoch: evaluate ALL data (SC + non-SC) for full picture
         # V12.15: Log errors to file for analysis
         true_eval = None
-        if epoch % 1 == 0:
+        is_final_epoch = (epoch == num_epochs - 1)
+        if epoch % 4 == 0 or is_final_epoch:
+            eval_max = 0 if is_final_epoch else 2000  # 0 = all samples
             true_eval = evaluate_true_autoregressive(
-                encoder, decoder, train_loader, device, max_samples=2000,
-                log_errors=True, epoch=epoch
+                encoder, decoder, train_loader, device, max_samples=eval_max,
+                log_errors=True, epoch=epoch,
+                stop_boost=TRAIN_CONFIG.get('stop_boost', 0.0),  # V12.30
             )
             err_dist = true_eval['error_distribution']
-            print(f"  → TRUE Autoregressive: {true_eval['true_exact_match']*100:.1f}% exact "
+            scope = "FULL DATASET" if is_final_epoch else f"{eval_max} samples"
+            print(f"  → TRUE Autoregressive ({scope}): {true_eval['true_exact_match']*100:.1f}% exact "
                   f"({true_eval['exact_count']}/{true_eval['total_samples']}) | "
                   f"Errors: 0={err_dist[0]}, 1={err_dist[1]}, 2={err_dist[2]}, 3={err_dist[3]}, >3={err_dist['more']}", flush=True)
 

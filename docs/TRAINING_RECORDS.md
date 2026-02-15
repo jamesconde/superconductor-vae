@@ -4,6 +4,129 @@ Chronological record of training runs, architecture changes, and optimization de
 
 ---
 
+## V12.31: Physics-Supervised Z Coordinates (2026-02-14)
+
+### Problem
+
+The 2048-dim Z vector has no enforced physical meaning. While it encodes information needed for reconstruction, there is no guarantee that specific coordinates correspond to physically meaningful quantities. This makes the latent space hard to interpret and prevents physics-guided generation.
+
+### Changes
+
+**New Files:**
+- `src/superconductor/models/physics_z.py` -- `PhysicsZ` class defining 12 coordinate blocks (0-511 supervised, 512-2047 discovery)
+- `src/superconductor/losses/z_supervision_loss.py` -- 7 loss classes + `PhysicsZLoss` combiner
+- `src/superconductor/data/compositional_targets.py` -- Computes 15 Block 8 targets from formula
+- `docs/PHYSICS_Z_COORDINATES.md` -- Full documentation of block layout, formulas, and usage
+
+**Modified Files:**
+- `scripts/train_v12_clean.py` -- TRAIN_CONFIG keys, dataset augmentation, loss wiring, logging
+- `src/superconductor/losses/__init__.py` -- New exports
+- `src/superconductor/models/__init__.py` -- PhysicsZ export
+
+### Architecture
+
+No changes to FullMaterialsVAE. The encoder still outputs 2048-dim Z from `fc_mean`. Physics meaning is enforced purely via loss gradient pressure. Existing checkpoints load unchanged.
+
+### Loss Components
+
+| Component | Block | Source | Weight |
+|-----------|-------|--------|--------|
+| CompositionalSupervisionLoss | 8 | Formula-derived (always available) | 1.0 |
+| MagpieEncodingLoss | 11 | Learnable projection 145->62 | 0.5 |
+| GLConsistencyLoss | 1 | Self-consistency (kappa=lambda/xi, etc.) | 0.1 |
+| BCSConsistencyLoss | 2 | Self-consistency (xi proportional to vF/Delta0) | 0.1 |
+| CobordismConsistencyLoss | 9 | Derived from GL coords | 0.1 |
+| DimensionlessRatioConsistencyLoss | 10 | Cross-block ratios | 0.1 |
+| DirectSupervisionLoss | any | External data (placeholder, weight=0) | 0.0 |
+
+### Parameters Added
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `use_physics_z` | True | Enable physics Z infrastructure |
+| `physics_z_comp_weight` | 1.0 | Block 8 compositional supervision |
+| `physics_z_magpie_weight` | 0.5 | Block 11 Magpie encoding |
+| `physics_z_consistency_weight` | 0.1 | GL/BCS/cobordism/ratio consistency |
+| `physics_z_direct_weight` | 0.0 | Direct supervision (placeholder) |
+| `physics_z_warmup_epochs` | 20 | Linear warmup ramp |
+| `physics_z_data_path` | None | Path to optional physics data CSV |
+
+### Design Decisions
+
+- **No architecture change**: Checkpoint compatibility preserved. Physics Z is loss-only.
+- **Proportional consistency**: GL/BCS formulas enforce ratios, not absolute physical units. The encoder learns its own internal scale.
+- **Pre-computed compositional targets**: Computed once during dataset creation, stored as tensor index 10 in TensorDataset. Follows existing pattern.
+- **MagpieEncodingLoss learns jointly**: Both encoder and projection trained together (~9K new params in projection).
+- **Warmup**: 20-epoch linear ramp prevents physics Z from overwhelming early training.
+- **Coexists with theory_losses.py**: Theory losses operate on Tc + Magpie. Physics Z operates on Z coordinates. Complementary, not competing.
+
+### Performance Optimizations (V12.31)
+
+- **CUDA event timing**: Replaced `torch.cuda.synchronize()` in `TimingStats` with async `torch.cuda.Event(enable_timing=True)`. Previously, synchronize was called at every phase start/stop (~16,800 calls per epoch), breaking GPU pipeline overlap. Now events are recorded asynchronously and flushed once at epoch end. Works on all CUDA devices (RTX 4060, A100, Colab).
+- **Autoregressive eval frequency**: Reduced `evaluate_true_autoregressive` from every epoch to every 4 epochs. This eval runs 2 full autoregressive decoder passes x 60 sequential steps per sample — expensive. Intermediate evals use 2,000 samples; final epoch evaluates ALL ~50K samples (SC + non-SC) for the complete picture.
+
+---
+
+## V12.30: Stop-Prediction Head (2026-02-13)
+
+### Problem
+
+279 samples (13.8% of all data) at epoch 2542 generate the **perfect formula** then fail to emit `<END>`, appending an extra element token instead. This is the #1 error type (34.4% of all errors). Fixing it would improve true autoregressive exact match from ~60% to ~73%.
+
+**Root cause (two complementary failures)**:
+
+1. **Architectural**: `<END>` (token index 2) competes in softmax with 150+ other tokens via `output_proj`. At the stop position, the model must assign higher probability to END than to any element, but element logits are strongly reinforced by the formula pattern while END is a structurally different decision.
+2. **REINFORCE reward bug**: Near-exact cases (1-3 mismatches) get their reward bonus **without length penalty**. "Perfect formula + 1 extra token" scores +50.0 because the length_mismatch_penalty was only applied to partial_credit cases (4+ mismatches). The model is rewarded for this failure.
+
+### Changes
+
+**`src/superconductor/models/autoregressive_decoder.py`**
+- Added `stop_head` to `EnhancedTransformerDecoder.__init__()`: `Linear(512->128) + GELU + Linear(128->1)` (~65K params, 0.1% of model)
+- `forward()` now returns `(logits, generated, stop_logits)` (was `(logits, generated)`)
+- `generate_with_kv_cache()`: new `stop_boost` parameter. When > 0, boosts `END_IDX` logit by `stop_boost * sigmoid(stop_logit)` at each generation step
+- `generate()` (legacy): same `stop_boost` parameter added
+- `sample_for_reinforce()`: passes `stop_boost` through to `generate_with_kv_cache()`
+
+**`scripts/train_v12_clean.py`**
+- New TRAIN_CONFIG keys: `stop_loss_weight` (5.0), `stop_boost` (4.0)
+- Decoder forward unpacks `stop_logits` (third return value)
+- Computes BCE stop loss: target=1.0 at END positions, 0.0 elsewhere, masked to non-PAD
+- Stop loss added to all three loss computation branches (pure SC, pure non-SC, mixed)
+- `CombinedLossWithREINFORCE.set_decoder()`: accepts and stores `stop_boost`
+- All REINFORCE sampling calls (RLOO and SCST) pass `stop_boost` through
+- `evaluate_true_autoregressive()`: new `stop_boost` parameter, passed to generation
+- Epoch summary shows stop loss: `Stop: X.XXXX`
+- New metric accumulators: `total_stop_loss`, `stop_loss` in results dict
+
+**`src/superconductor/losses/reward_gpu_native.py`**
+- Applied `length_penalty` (`length_diff * config.length_mismatch_penalty`) to all three near-exact reward tiers (was only applied to partial_credit). "Perfect + 1 extra token" now gets +50.0 - 2.0 = +48.0 instead of +50.0.
+
+### Design Decisions
+
+- **Soft boost, not hard override**: At inference, stop_head boosts the END logit additively rather than forcing END. Avoids edge cases where the model correctly continues.
+- **BCE loss, not cross-entropy**: The stop decision is binary (stop/continue), so BCE is the natural loss.
+- **High stop_loss_weight (5.0)**: Only 1 END token per sequence of ~15 tokens. Without upweighting, the stop head sees 14:1 class imbalance.
+- **stop_boost=4.0**: A +4.0 additive boost when sigmoid(logit)=1.0 shifts a marginal END probability (~0.3) to dominant (>0.8) in softmax. Conservative enough to avoid premature stopping.
+- **Reward fix is complementary**: The stop head teaches "when to stop" during CE training. The reward fix prevents RL from un-teaching it.
+- **Old checkpoints**: stop_head params will be randomly initialized when loading pre-V12.30 checkpoints. No crash, but first few epochs will have high stop_loss until the head converges.
+
+### Parameters Added
+
+| Parameter | Value | Description |
+|-----------|-------|-------------|
+| `stop_loss_weight` | 5.0 | BCE loss weight for stop-prediction head |
+| `stop_boost` | 4.0 | Additive END logit boost at inference (0 = disabled) |
+
+### Expected Impact
+
+| Change | Expected Impact |
+|--------|----------------|
+| Stop head on decoder | +10-13 pp true autoregressive exact match |
+| Fix reward length penalty | +2-3 pp (prevents RL from reinforcing the bug) |
+| Stop loss in training | Trains the stop head (necessary for stop head to work) |
+
+---
+
 ## V12.29: Training Manifest System (2026-02-13)
 
 ### Problem

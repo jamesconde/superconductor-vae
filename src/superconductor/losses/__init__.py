@@ -7,6 +7,7 @@ Includes:
 - reinforce_loss: REINFORCE-based sequence-level optimization with RLOO baseline
 - consistency_losses: Self-consistency and bidirectional consistency losses
 - theory_losses: BCS, cuprate, and other theory-based regularization
+- z_supervision_loss: V12.31 Physics Z coordinate supervision
 """
 
 from .formula_loss import (
@@ -54,6 +55,17 @@ from .theory_losses import (
     compute_theory_regularization,
 )
 
+from .z_supervision_loss import (
+    CompositionalSupervisionLoss,
+    MagpieEncodingLoss,
+    GLConsistencyLoss,
+    BCSConsistencyLoss,
+    CobordismConsistencyLoss,
+    DimensionlessRatioConsistencyLoss,
+    DirectSupervisionLoss,
+    PhysicsZLoss,
+)
+
 __all__ = [
     # formula_loss
     'TokenType',
@@ -90,4 +102,13 @@ __all__ = [
     'UnknownTheoryLoss',
     'TheoryRegularizationLoss',
     'compute_theory_regularization',
+    # z_supervision_loss (V12.31)
+    'CompositionalSupervisionLoss',
+    'MagpieEncodingLoss',
+    'GLConsistencyLoss',
+    'BCSConsistencyLoss',
+    'CobordismConsistencyLoss',
+    'DimensionlessRatioConsistencyLoss',
+    'DirectSupervisionLoss',
+    'PhysicsZLoss',
 ]

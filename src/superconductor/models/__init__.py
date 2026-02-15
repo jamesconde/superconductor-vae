@@ -48,6 +48,8 @@ from .autoregressive_decoder import (
     VOCAB_SIZE,
 )
 
+from .physics_z import PhysicsZ
+
 from .family_classifier import (
     SuperconductorFamily,
     FamilyClassifierConfig,
@@ -80,6 +82,9 @@ __all__ = [
     'indices_to_formula',
     'create_formula_tokenizer',
     'VOCAB_SIZE',
+
+    # Physics Z coordinate map (V12.31)
+    'PhysicsZ',
 
     # Family classifier (for theory-based regularization)
     'SuperconductorFamily',
