@@ -580,8 +580,8 @@ TRAIN_CONFIG = {
     'theory_warmup_epochs': 50,            # V12.22: Ramp up over 50 epochs
     'theory_use_soft_constraints': True,   # V12.22: Soft quadratic penalties (no hard caps)
 
-    'use_family_classifier': False,        # Train learned family classifier alongside
-    'family_classifier_weight': 0.01,      # Weight for family classification loss
+    'use_family_classifier': True,         # V12.32: Family classification head (14 classes)
+    'family_classifier_weight': 0.5,       # V12.32: Weight for family cross-entropy loss
 
     # =========================================================================
     # V12.30: Stop-Prediction Head Settings
@@ -3043,7 +3043,8 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
                 selective_backprop=False, selective_backprop_threshold=0.33,
                 enable_timing=True, hp_loss_weight=0.0, sc_loss_weight=0.0,
                 theory_loss_fn=None, theory_weight=0.0, norm_stats=None,
-                physics_z_loss_fn=None, physics_z_weight=1.0):
+                physics_z_loss_fn=None, physics_z_weight=1.0,
+                family_loss_weight=0.0):
     """Train for one epoch with curriculum weights and teacher forcing.
 
     V12.8: Added amp_dtype for configurable mixed precision (bfloat16/float16)
@@ -3056,6 +3057,7 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
     V12.21: Added sc_loss_weight for SC/non-SC classification head
     V12.22: Added theory_loss_fn, theory_weight, norm_stats for theory-guided consistency
     V12.31: Added physics_z_loss_fn, physics_z_weight for physics Z supervision
+    V12.32: Added family_loss_weight for family classification head (14 classes)
     """
     global _timing_stats
 
@@ -3085,6 +3087,7 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
     total_tc_class_loss = 0  # V12.28
     total_stop_loss = 0  # V12.30
     total_physics_z_loss = 0  # V12.31
+    total_family_loss = 0  # V12.32
     total_sc_exact = 0
     total_non_sc_exact = 0
     total_spec_accept = 0  # V12.9: Speculative decoding acceptance rate
@@ -3223,6 +3226,13 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
                         sc_pred, is_sc.float(),
                     )
 
+            # V12.32: Family classification loss (ALL samples — class 0 = not SC)
+            family_loss_val = torch.tensor(0.0, device=device)
+            if family_loss_weight > 0 and TRAIN_CONFIG.get('use_family_classifier', False):
+                family_logits = encoder_out.get('family_logits')
+                if family_logits is not None and family_labels is not None:
+                    family_loss_val = F.cross_entropy(family_logits, family_labels)
+
             # V12.22: Theory-guided consistency loss (SC samples only)
             theory_loss_val = torch.tensor(0.0, device=device)
             if theory_loss_fn is not None and theory_weight > 0 and sc_mask.any():
@@ -3280,7 +3290,8 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
                         + sc_loss_weight * sc_loss_val
                         + theory_weight * theory_loss_val
                         + stop_loss_weight * stop_loss_val
-                        + physics_z_loss_val)  # V12.31
+                        + physics_z_loss_val  # V12.31
+                        + family_loss_weight * family_loss_val)  # V12.32
 
             elif (~sc_mask).all():
                 # Pure non-SC batch — formula loss only (lower weight), no Tc/Magpie/REINFORCE
@@ -3308,7 +3319,8 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
                         + sc_loss_weight * sc_loss_val
                         + theory_weight * theory_loss_val
                         + stop_loss_weight * stop_loss_val
-                        + physics_z_loss_val)  # V12.31
+                        + physics_z_loss_val  # V12.31
+                        + family_loss_weight * family_loss_val)  # V12.32
 
             else:
                 # Mixed batch — compute SC and non-SC losses separately
@@ -3369,7 +3381,8 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
                         sc_loss_weight * sc_loss_val +
                         theory_weight * theory_loss_val +
                         stop_loss_weight * stop_loss_val +
-                        physics_z_loss_val)  # V12.31
+                        physics_z_loss_val +  # V12.31
+                        family_loss_weight * family_loss_val)  # V12.32
 
         # V12.15: Stop loss computation timing
         if timing:
@@ -3475,6 +3488,7 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
         total_tc_class_loss += loss_dict.get('tc_class_loss', torch.tensor(0.0)).item()  # V12.28
         total_stop_loss += stop_loss_val.item() if torch.is_tensor(stop_loss_val) else stop_loss_val  # V12.30
         total_physics_z_loss += physics_z_loss_val.item() if torch.is_tensor(physics_z_loss_val) else physics_z_loss_val  # V12.31
+        total_family_loss += family_loss_val.item() if torch.is_tensor(family_loss_val) else family_loss_val  # V12.32
         z_norm_val = z.detach().float().norm(dim=1).mean().item()
         if not math.isnan(z_norm_val):
             total_z_norm += z_norm_val
@@ -3521,6 +3535,7 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
             'contrastive_loss': 0, 'hp_loss': 0, 'sc_loss': 0, 'theory_loss': 0,
             'stop_loss': 0,  # V12.30
             'physics_z_loss': 0,  # V12.31
+            'family_loss': 0,  # V12.32
             'z_norm': 0, 'n_skipped': n_skipped, 'n_total_batches': 0,
         }
 
@@ -3541,6 +3556,7 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
         'tc_class_loss': total_tc_class_loss / n_batches,  # V12.28
         'stop_loss': total_stop_loss / n_batches,  # V12.30
         'physics_z_loss': total_physics_z_loss / n_batches,  # V12.31
+        'family_loss': total_family_loss / n_batches,  # V12.32
         'z_norm': total_z_norm / n_batches,
         'n_skipped': n_skipped,  # V12.12: Selective backprop skips
         'n_total_batches': n_batches,
@@ -3966,6 +3982,7 @@ def train():
     print(f"  Stoich: {TRAIN_CONFIG['stoich_weight']}")
     print(f"  HP: {TRAIN_CONFIG.get('hp_loss_weight', 0)}")
     print(f"  SC: {TRAIN_CONFIG.get('sc_loss_weight', 0)}")
+    print(f"  Family: {TRAIN_CONFIG.get('family_classifier_weight', 0)}")  # V12.32
     if TRAIN_CONFIG.get('tc_kelvin_weighting', False):
         print(f"  Tc Kelvin weighting: scale={TRAIN_CONFIG['tc_kelvin_weight_scale']} "
               f"(3x at {2*TRAIN_CONFIG['tc_kelvin_weight_scale']:.0f}K)")
@@ -4177,6 +4194,8 @@ def train():
             norm_stats=norm_stats,
             # V12.31: Physics Z supervision
             physics_z_loss_fn=physics_z_loss_fn,
+            # V12.32: Family classification
+            family_loss_weight=TRAIN_CONFIG.get('family_classifier_weight', 0.0),
             physics_z_weight=effective_physics_z_weight,
         )
 
@@ -4307,6 +4326,10 @@ def train():
         # V12.31: Show physics Z loss if enabled
         if physics_z_loss_fn is not None and metrics.get('physics_z_loss', 0) > 0:
             base_msg += f" | PhysZ: {metrics['physics_z_loss']:.4f} (w={effective_physics_z_weight:.2f})"
+
+        # V12.32: Show family classification loss if enabled
+        if TRAIN_CONFIG.get('use_family_classifier', False) and metrics.get('family_loss', 0) > 0:
+            base_msg += f" | Fam: {metrics['family_loss']:.4f}"
 
         # V12.12: Show selective backprop stats
         if metrics.get('n_skipped', 0) > 0 and metrics.get('n_total_batches', 0) > 0:

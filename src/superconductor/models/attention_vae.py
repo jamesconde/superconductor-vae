@@ -810,6 +810,20 @@ class FullMaterialsVAE(nn.Module):
             nn.Linear(128, 1),  # logits — apply sigmoid for probability
         )
 
+        # =====================================================================
+        # FAMILY CLASSIFICATION HEAD (V12.32)
+        # =====================================================================
+        # Predicts superconductor family (14 classes) from decoder backbone.
+        # Classes defined in SuperconductorFamily enum (family_classifier.py).
+        # Loss: cross-entropy on ALL samples (non-SC = class 0).
+        # =====================================================================
+        self.family_head = nn.Sequential(
+            nn.Linear(prev_dim, 256),   # prev_dim = 512 (decoder backbone output)
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(256, 14),  # 14 family classes
+        )
+
     def get_config(self) -> Dict:
         """Return the constructor parameters for manifest embedding."""
         return {
@@ -905,11 +919,15 @@ class FullMaterialsVAE(nn.Module):
         # V12.28: Tc bucket classification
         tc_class_logits = self.tc_class_head(h)
 
+        # V12.32: Family classification
+        family_logits = self.family_head(h)
+
         return {
             'tc_pred': tc_pred,
             'magpie_pred': magpie_pred,
             'attended_input': attended_input,
             'tc_class_logits': tc_class_logits,
+            'family_logits': family_logits,  # V12.32
         }
 
     def forward(
@@ -1008,6 +1026,8 @@ class FullMaterialsVAE(nn.Module):
             'sc_pred': sc_pred,
             # Tc bucket classification (V12.28) — 5 classes, cross-entropy loss
             'tc_class_logits': tc_class_logits,
+            # Family classification (V12.32) — 14 classes, cross-entropy loss
+            'family_logits': dec_out.get('family_logits'),
         }
 
     def predict_tc_mc(self, z: torch.Tensor, n_samples: int = 10) -> Tuple[torch.Tensor, torch.Tensor]:

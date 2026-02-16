@@ -4,6 +4,46 @@ Chronological record of training runs, architecture changes, and optimization de
 
 ---
 
+## V12.32: Family Classification Head (2026-02-16)
+
+### Problem
+
+The model can classify SC vs non-SC (`sc_head`) and bucket Tc into 5 ranges (`tc_class_head`), but cannot predict which family/class of superconductor a sample belongs to (cuprate, iron-based, BCS conventional, etc.). The infrastructure existed (`SuperconductorFamily` enum, `family_tensor` in dataset at batch index 9, config flags) but the head was never wired into `FullMaterialsVAE`.
+
+### Changes
+
+**Modified Files:**
+- `src/superconductor/models/attention_vae.py` -- Added `family_head` (512->256->14), updated `decode()` and `forward()` return dicts
+- `scripts/train_v12_clean.py` -- Enabled config (`use_family_classifier: True`, weight=0.5), added `family_loss_weight` param to `train_epoch()`, cross-entropy loss computation on ALL samples, loss aggregation in all 3 batch-type branches, accumulator, metrics, epoch summary logging
+- `docs/TRAINING_RECORDS.md` -- This entry
+
+### Architecture
+
+`family_head` reads from the shared decoder backbone (512-dim), matching the `tc_class_head` pattern:
+```
+decoder_backbone(z) → h [512] → family_head → [14] logits
+```
+
+14 classes from `SuperconductorFamily` enum:
+- 0: NOT_SUPERCONDUCTOR, 1: BCS_CONVENTIONAL, 2-7: CUPRATE variants (YBCO, LSCO, BSCCO, TBCCO, HBCCO, OTHER), 8-9: IRON (pnictide, chalcogenide), 10: MGB2_TYPE, 11: HEAVY_FERMION, 12: ORGANIC, 13: OTHER_UNKNOWN
+
+### Loss
+
+Cross-entropy on ALL samples (non-SC = class 0). Weight = 0.5 (matches `sc_loss_weight`).
+
+### Checkpoint Compatibility
+
+New `family_head` parameters initialize randomly when loading old checkpoints (`strict=False` in `load_state_dict`). They train from scratch while other heads continue from their saved state.
+
+### Parameters
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `use_family_classifier` | True | Enable family classification head |
+| `family_classifier_weight` | 0.5 | Weight for family cross-entropy loss |
+
+---
+
 ## V12.31: Physics-Supervised Z Coordinates (2026-02-14)
 
 ### Problem
