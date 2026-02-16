@@ -784,6 +784,7 @@ def signal_handler(signum, frame):
             prev_exact=_shutdown_state.get('prev_exact', 0),
             best_exact=_shutdown_state.get('best_exact', 0),
             theory_loss_fn=_shutdown_state.get('theory_loss_fn'),  # V12.22
+            physics_z_loss_fn=_shutdown_state.get('physics_z_loss_fn'),  # V12.31
             manifest=_interrupt_manifest,  # V12.29
         )
     sys.exit(0)
@@ -2056,7 +2057,7 @@ CombinedLoss = CombinedLossWithREINFORCE
 def save_checkpoint(encoder, decoder, epoch, suffix='', entropy_manager=None,
                     enc_opt=None, dec_opt=None, enc_scheduler=None, dec_scheduler=None,
                     prev_exact=None, best_exact=None, theory_loss_fn=None,
-                    manifest=None):
+                    manifest=None, physics_z_loss_fn=None):
     """Save model checkpoint with full training state for proper resumption."""
     OUTPUT_DIR.mkdir(exist_ok=True)
 
@@ -2089,6 +2090,10 @@ def save_checkpoint(encoder, decoder, epoch, suffix='', entropy_manager=None,
     # V12.22: Save theory loss function state (learnable BCS/cuprate predictors)
     if theory_loss_fn is not None:
         checkpoint_data['theory_loss_fn_state_dict'] = theory_loss_fn.state_dict()
+
+    # V12.31: Save physics Z loss function state (learnable Magpie projection)
+    if physics_z_loss_fn is not None:
+        checkpoint_data['physics_z_loss_fn_state_dict'] = physics_z_loss_fn.state_dict()
 
     # V12.10: Save training state variables
     if prev_exact is not None:
@@ -2463,7 +2468,7 @@ def _strip_compiled_prefix(state_dict):
 
 def load_checkpoint(encoder, decoder, checkpoint_path, entropy_manager=None,
                     enc_opt=None, dec_opt=None, enc_scheduler=None, dec_scheduler=None,
-                    theory_loss_fn=None):
+                    theory_loss_fn=None, physics_z_loss_fn=None):
     """Load model checkpoint with full training state for proper resumption.
 
     Returns:
@@ -2587,6 +2592,16 @@ def load_checkpoint(encoder, decoder, checkpoint_path, entropy_manager=None,
     elif theory_loss_fn is not None:
         print(f"  [Checkpoint] No theory_loss_fn state in checkpoint — starting fresh", flush=True)
 
+    # V12.31: Load physics Z loss function state if available
+    if physics_z_loss_fn is not None and 'physics_z_loss_fn_state_dict' in checkpoint:
+        try:
+            physics_z_loss_fn.load_state_dict(checkpoint['physics_z_loss_fn_state_dict'])
+            print(f"  Restored physics Z loss function state (Magpie projection)", flush=True)
+        except (RuntimeError, KeyError) as e:
+            print(f"  [Checkpoint] Physics Z loss state incompatible, starting fresh: {e}", flush=True)
+    elif physics_z_loss_fn is not None:
+        print(f"  [Checkpoint] No physics_z_loss_fn state in checkpoint — starting fresh", flush=True)
+
     # V12.10: Load optimizer state if available
     # Encoder optimizer may fail to restore if parameter count changed (e.g., fc_logvar removed)
     if enc_opt is not None and 'enc_optimizer_state_dict' in checkpoint:
@@ -2597,8 +2612,12 @@ def load_checkpoint(encoder, decoder, checkpoint_path, entropy_manager=None,
             print(f"  [Checkpoint] Encoder optimizer state incompatible (param count changed), "
                   f"using fresh optimizer: {e}", flush=True)
     if dec_opt is not None and 'dec_optimizer_state_dict' in checkpoint:
-        dec_opt.load_state_dict(checkpoint['dec_optimizer_state_dict'])
-        print(f"  Restored decoder optimizer state", flush=True)
+        try:
+            dec_opt.load_state_dict(checkpoint['dec_optimizer_state_dict'])
+            print(f"  Restored decoder optimizer state", flush=True)
+        except (ValueError, KeyError, RuntimeError) as e:
+            print(f"  [Checkpoint] Decoder optimizer state incompatible (param count changed), "
+                  f"using fresh optimizer: {e}", flush=True)
 
     # V12.11: Load scheduler state if available AND scheduler type matches
     # Incompatible scheduler types (e.g., CosineAnnealingWarmRestarts vs CosineAnnealingLR)
@@ -3992,6 +4011,7 @@ def train():
                 enc_opt=enc_opt, dec_opt=dec_opt,
                 enc_scheduler=enc_scheduler, dec_scheduler=dec_scheduler,
                 theory_loss_fn=theory_loss_fn,  # V12.22
+                physics_z_loss_fn=physics_z_loss_fn,  # V12.31
             )
             start_epoch = resume_state['start_epoch']
             prev_exact = resume_state['prev_exact']
@@ -4156,6 +4176,7 @@ def train():
                                enc_scheduler=enc_scheduler, dec_scheduler=dec_scheduler,
                                prev_exact=prev_exact, best_exact=best_exact,
                                theory_loss_fn=theory_loss_fn,
+                               physics_z_loss_fn=physics_z_loss_fn,
                                manifest=_build_current_manifest())
                 raise RuntimeError(f"Training stopped: {max_rollbacks} consecutive rollbacks detected. "
                                    f"Check data, model architecture, or hyperparameters.")
@@ -4315,6 +4336,7 @@ def train():
             enc_scheduler=enc_scheduler, dec_scheduler=dec_scheduler,
             prev_exact=metrics['exact_match'], best_exact=best_exact,
             theory_loss_fn=theory_loss_fn,  # V12.22
+            physics_z_loss_fn=physics_z_loss_fn,  # V12.31
             manifest=_manifest,  # V12.29
         )
 
