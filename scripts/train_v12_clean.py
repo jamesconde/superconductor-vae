@@ -535,6 +535,11 @@ TRAIN_CONFIG = {
     # Set to True when training data has changed (new normalization stats)
     'retrain_new_data': True,
 
+    # V12.31: Disable catastrophic drop detection entirely
+    # Use when making large architectural changes (e.g., physics Z reorganizes 512 Z coords)
+    # that will cause expected multi-epoch performance drops during adaptation.
+    'disable_drop_detection': True,
+
     # =========================================================================
     # V12.12: Contrastive Learning Settings
     # =========================================================================
@@ -4185,7 +4190,9 @@ def train():
         if epoch - last_rollback_epoch > 50:
             rollback_count = 0
 
-        if prev_exact > 0.1 and (prev_exact - current_exact) > 0.05 and epoch >= drop_grace_until:
+        if (not TRAIN_CONFIG.get('disable_drop_detection', False)
+                and prev_exact > 0.1 and (prev_exact - current_exact) > 0.05
+                and epoch >= drop_grace_until):
             drop_pct = (prev_exact - current_exact) * 100
             rollback_count += 1
             last_rollback_epoch = epoch
