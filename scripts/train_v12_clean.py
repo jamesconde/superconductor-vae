@@ -2553,7 +2553,12 @@ def load_checkpoint(encoder, decoder, checkpoint_path, entropy_manager=None,
         actual_encoder.upgrade_tc_head_from_checkpoint(enc_state)
         print("  [Checkpoint] Applied Net2Net weight transfer for Tc head upgrade", flush=True)
 
-    decoder.load_state_dict(dec_state)
+    # strict=False: V12.30 adds stop_head, so old checkpoints have missing keys
+    dec_missing, dec_unexpected = decoder.load_state_dict(dec_state, strict=False)
+    if dec_missing:
+        print(f"  [Checkpoint] Missing keys in decoder (randomly initialized): {dec_missing}", flush=True)
+    if dec_unexpected:
+        print(f"  [Checkpoint] Unexpected keys in decoder (ignored): {dec_unexpected}", flush=True)
     start_epoch = checkpoint.get('epoch', 0) + 1  # Resume from next epoch
     print(f"  Loaded checkpoint from epoch {checkpoint.get('epoch', 'unknown')}", flush=True)
 
