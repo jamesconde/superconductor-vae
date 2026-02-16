@@ -4305,7 +4305,7 @@ def train():
         # Final epoch: evaluate ALL data (SC + non-SC) for full picture
         # V12.15: Log errors to file for analysis
         true_eval = None
-        is_final_epoch = (epoch == num_epochs - 1)
+        is_final_epoch = (epoch == TRAIN_CONFIG['num_epochs'] - 1)
         if epoch % 4 == 0 or is_final_epoch:
             eval_max = 0 if is_final_epoch else 2000  # 0 = all samples
             true_eval = evaluate_true_autoregressive(
