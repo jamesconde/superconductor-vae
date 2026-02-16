@@ -2604,11 +2604,13 @@ def load_checkpoint(encoder, decoder, checkpoint_path, entropy_manager=None,
 
     # V12.10: Load optimizer state if available
     # Encoder optimizer may fail to restore if parameter count changed (e.g., fc_logvar removed)
+    fresh_optimizers = False  # V12.31: Track for grace period
     if enc_opt is not None and 'enc_optimizer_state_dict' in checkpoint:
         try:
             enc_opt.load_state_dict(checkpoint['enc_optimizer_state_dict'])
             print(f"  Restored encoder optimizer state", flush=True)
         except (ValueError, KeyError) as e:
+            fresh_optimizers = True
             print(f"  [Checkpoint] Encoder optimizer state incompatible (param count changed), "
                   f"using fresh optimizer: {e}", flush=True)
     if dec_opt is not None and 'dec_optimizer_state_dict' in checkpoint:
@@ -2616,6 +2618,7 @@ def load_checkpoint(encoder, decoder, checkpoint_path, entropy_manager=None,
             dec_opt.load_state_dict(checkpoint['dec_optimizer_state_dict'])
             print(f"  Restored decoder optimizer state", flush=True)
         except (ValueError, KeyError, RuntimeError) as e:
+            fresh_optimizers = True
             print(f"  [Checkpoint] Decoder optimizer state incompatible (param count changed), "
                   f"using fresh optimizer: {e}", flush=True)
 
@@ -2641,10 +2644,14 @@ def load_checkpoint(encoder, decoder, checkpoint_path, entropy_manager=None,
         # Skip silently if types don't match (warning printed above)
 
     # V12.10: Return training state variables
+    physics_z_is_new = (physics_z_loss_fn is not None
+                        and 'physics_z_loss_fn_state_dict' not in checkpoint)
     result = {
         'start_epoch': start_epoch,
         'prev_exact': checkpoint.get('prev_exact', 0),
         'best_exact': checkpoint.get('best_exact', 0),
+        'fresh_optimizers': fresh_optimizers,        # V12.31: Grace period needed
+        'physics_z_is_new': physics_z_is_new,        # V12.31: Warmup from introduction
     }
 
     if 'prev_exact' in checkpoint:
@@ -3777,6 +3784,7 @@ def train():
 
     # V12.31: Physics Z supervision loss
     physics_z_loss_fn = None
+    physics_z_intro_epoch = 0  # V12.31: When physics Z was introduced (for relative warmup)
     if TRAIN_CONFIG.get('use_physics_z', False):
         from superconductor.losses.z_supervision_loss import PhysicsZLoss
         physics_z_config = {
@@ -4018,6 +4026,21 @@ def train():
             best_exact = resume_state['best_exact']
             print(f"  Starting from epoch {start_epoch}")
 
+            # V12.31: Grace period when optimizers were freshly initialized
+            # Fresh optimizers (lost Adam momentum) cause multi-epoch performance drops.
+            # Suppress the catastrophic drop detector for 10 epochs to let them stabilize.
+            if resume_state.get('fresh_optimizers', False):
+                drop_grace_until = start_epoch + 10
+                print(f"  [GRACE] Fresh optimizers detected — drop detector suppressed "
+                      f"until epoch {drop_grace_until}", flush=True)
+                prev_exact = 0.0  # Disable drop detection during grace
+                best_exact = 0.0  # Don't compare against pre-upgrade performance
+
+            # V12.31: Track physics Z introduction epoch for relative warmup
+            if resume_state.get('physics_z_is_new', False):
+                physics_z_intro_epoch = start_epoch
+                print(f"  [PhysZ] First introduction — warmup will ramp from epoch {start_epoch}", flush=True)
+
             # V12.12: Reset drop detector when retraining on new data
             # When the training data changes (e.g., combined dataset), normalization
             # stats shift and the model will see an initial performance drop. Without
@@ -4075,6 +4098,7 @@ def train():
     rollback_count = 0
     max_rollbacks = 3  # Stop training if we hit this many rollbacks
     last_rollback_epoch = -100  # Track when last rollback occurred
+    drop_grace_until = -1  # V12.31: Epoch until drop detector is suppressed
 
     for epoch in range(start_epoch, TRAIN_CONFIG['num_epochs']):
         _shutdown_state['epoch'] = epoch
@@ -4114,12 +4138,13 @@ def train():
             theory_warmup_prog = min(1.0, epoch / max(theory_warmup, 1))
             effective_theory_weight = TRAIN_CONFIG['theory_weight'] * theory_warmup_prog
 
-        # V12.31: Compute physics Z weight with warmup
+        # V12.31: Compute physics Z weight with warmup (relative to introduction epoch)
         effective_physics_z_weight = 0.0
         if physics_z_loss_fn is not None:
             pz_warmup = TRAIN_CONFIG.get('physics_z_warmup_epochs', 20)
-            pz_warmup_prog = min(1.0, epoch / max(pz_warmup, 1))
-            effective_physics_z_weight = pz_warmup_prog  # Weights are inside PhysicsZLoss config
+            pz_epochs_active = epoch - physics_z_intro_epoch
+            pz_warmup_prog = min(1.0, pz_epochs_active / max(pz_warmup, 1))
+            effective_physics_z_weight = max(0.0, pz_warmup_prog)  # Clamp >=0
 
         metrics = train_epoch(
             encoder, decoder, train_loader, loss_fn,
@@ -4160,7 +4185,7 @@ def train():
         if epoch - last_rollback_epoch > 50:
             rollback_count = 0
 
-        if prev_exact > 0.1 and (prev_exact - current_exact) > 0.05:
+        if prev_exact > 0.1 and (prev_exact - current_exact) > 0.05 and epoch >= drop_grace_until:
             drop_pct = (prev_exact - current_exact) * 100
             rollback_count += 1
             last_rollback_epoch = epoch
