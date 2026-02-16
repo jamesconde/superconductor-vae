@@ -1416,6 +1416,15 @@ class EnhancedTransformerDecoder(nn.Module):
             nn.Linear(d_model, VOCAB_SIZE)
         )
 
+        # V12.30: Dedicated stop-prediction head
+        # Decouples the "should I stop?" decision from competing in the vocab softmax.
+        # Trained with BCE loss; at inference, boosts END_IDX logit.
+        self.stop_head = nn.Sequential(
+            nn.Linear(d_model, d_model // 4),  # 512 → 128
+            nn.GELU(),
+            nn.Linear(d_model // 4, 1),         # 128 → 1 (logit)
+        )
+
         self._init_weights()
 
     def _init_weights(self):
@@ -1501,7 +1510,7 @@ class EnhancedTransformerDecoder(nn.Module):
         teacher_forcing_ratio: float = 1.0,
         stoich_pred: Optional[torch.Tensor] = None,  # V12.4: [batch, max_elements + 1]
         cached_memory: Optional[torch.Tensor] = None,  # V12.8: Pre-computed memory
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Forward pass with scheduled sampling (teacher forcing).
 
@@ -1524,6 +1533,7 @@ class EnhancedTransformerDecoder(nn.Module):
         Returns:
             logits: Token logits (batch, seq_len-1, vocab_size)
             generated: Predicted token indices (batch, seq_len-1)
+            stop_logits: V12.30 Stop-prediction logits (batch, seq_len-1)
         """
         batch_size = z.size(0)
         device = z.device
@@ -1566,8 +1576,9 @@ class EnhancedTransformerDecoder(nn.Module):
                 )
 
             logits = self.output_proj(output)
+            stop_logits = self.stop_head(output).squeeze(-1)  # V12.30: [batch, seq_len]
             generated = logits.argmax(dim=-1)
-            return logits, generated
+            return logits, generated, stop_logits
 
         # OPTIMIZED path: Scheduled sampling (TF < 1.0) - 2 passes instead of 60
         # V12.6: This is 30x faster than the original sequential approach
@@ -1650,16 +1661,18 @@ class EnhancedTransformerDecoder(nn.Module):
             )
 
         logits = self.output_proj(output)  # [batch, seq_len, vocab]
+        stop_logits = self.stop_head(output).squeeze(-1)  # V12.30: [batch, seq_len]
         generated = logits.argmax(dim=-1)  # [batch, seq_len]
 
-        return logits, generated
+        return logits, generated, stop_logits
 
     def generate(
         self,
         z: torch.Tensor,
         encoder_skip: Optional[torch.Tensor] = None,
         temperature: float = 1.0,
-        max_len: Optional[int] = None
+        max_len: Optional[int] = None,
+        stop_boost: float = 0.0,  # V12.30: Additive END logit boost from stop head
     ) -> List[str]:
         """Generate formulas autoregressively (legacy, no KV cache)."""
         self.eval()
@@ -1689,6 +1702,11 @@ class EnhancedTransformerDecoder(nn.Module):
                 )
 
                 logits = self.output_proj(output[:, -1, :])
+
+                # V12.30: Boost END logit based on stop head prediction
+                if stop_boost > 0:
+                    stop_logit = self.stop_head(output[:, -1, :]).squeeze(-1)  # [batch]
+                    logits[:, END_IDX] = logits[:, END_IDX] + stop_boost * torch.sigmoid(stop_logit)
 
                 if temperature != 1.0:
                     logits = logits / temperature
@@ -1879,6 +1897,7 @@ class EnhancedTransformerDecoder(nn.Module):
         return_log_probs: bool = False,
         return_entropy: bool = False,  # V12.8: Return proper entropy from full distribution
         cached_memory: Optional[torch.Tensor] = None,  # V12.8: Pre-computed memory
+        stop_boost: float = 0.0,  # V12.30: Additive END logit boost from stop head
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
         """
         Generate token sequences with KV caching for O(n) complexity.
@@ -1936,6 +1955,12 @@ class EnhancedTransformerDecoder(nn.Module):
 
                 # Get logits for this position
                 logits = self.output_proj(output).squeeze(1)  # [batch, vocab_size]
+
+                # V12.30: Boost END logit based on stop head prediction
+                if stop_boost > 0:
+                    stop_logit = self.stop_head(output).squeeze(1).squeeze(-1)  # [batch]
+                    # Sigmoid > 0.5 means logit > 0; scale proportionally
+                    logits[:, END_IDX] = logits[:, END_IDX] + stop_boost * torch.sigmoid(stop_logit)
 
                 # V12.8: Compute proper entropy BEFORE temperature/filtering
                 # H(p) = -sum(p * log(p)) over vocabulary
@@ -2010,6 +2035,7 @@ class EnhancedTransformerDecoder(nn.Module):
         temperature: float = 0.8,
         max_len: Optional[int] = None,
         cached_memory: Optional[torch.Tensor] = None,  # V12.8: Pre-computed memory
+        stop_boost: float = 0.0,  # V12.30: Additive END logit boost from stop head
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Sample sequences for REINFORCE training with KV caching.
@@ -2024,6 +2050,7 @@ class EnhancedTransformerDecoder(nn.Module):
             temperature: Sampling temperature
             max_len: Maximum sequence length
             cached_memory: V12.8 Pre-computed memory from precompute_memory()
+            stop_boost: V12.30 Additive END logit boost from stop head
 
         Returns:
             sampled_tokens: [batch, seq_len] - sampled token indices
@@ -2043,6 +2070,7 @@ class EnhancedTransformerDecoder(nn.Module):
             return_log_probs=True,
             return_entropy=True,  # V12.8: Get proper entropy
             cached_memory=cached_memory,  # V12.8: Pass through cached memory
+            stop_boost=stop_boost,  # V12.30: Pass through stop boost
         )
 
         # Create mask: 1 for valid tokens, 0 after END

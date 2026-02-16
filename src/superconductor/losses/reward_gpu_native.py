@@ -304,15 +304,18 @@ def compute_reward_gpu_native(
 
     # Near-exact bonuses (only if not exact)
     # V12.5: Apply semantic fraction penalty to near-exact cases too!
+    # V12.30: Apply length_mismatch_penalty to near-exact tiers (previously only applied to partial_credit).
+    # This prevents RL from rewarding "perfect formula + extra token" with full near_exact bonus.
     not_exact = ~exact_match
+    length_penalty = length_diff * config.length_mismatch_penalty
     rewards = torch.where(not_exact & near_exact_1,
-                          torch.full_like(rewards, config.near_exact_1) + fraction_penalty,
+                          torch.full_like(rewards, config.near_exact_1) + fraction_penalty + length_penalty,
                           rewards)
     rewards = torch.where(not_exact & near_exact_2,
-                          torch.full_like(rewards, config.near_exact_2) + fraction_penalty,
+                          torch.full_like(rewards, config.near_exact_2) + fraction_penalty + length_penalty,
                           rewards)
     rewards = torch.where(not_exact & near_exact_3,
-                          torch.full_like(rewards, config.near_exact_3) + fraction_penalty,
+                          torch.full_like(rewards, config.near_exact_3) + fraction_penalty + length_penalty,
                           rewards)
 
     # For samples with 4+ mismatches, use token-level partial credit
