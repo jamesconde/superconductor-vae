@@ -392,7 +392,7 @@ def build_family_lookup_tensors(device):
     return fine_to_coarse, fine_to_cuprate_sub, fine_to_iron_sub
 
 
-ALGO_VERSION = 'V12.38'  # Bump this when making algorithm changes
+ALGO_VERSION = 'V12.39'  # Bump this when making algorithm changes
 
 TRAIN_CONFIG = {
     'num_epochs': 4000,
@@ -490,7 +490,7 @@ TRAIN_CONFIG = {
     #   - Then enable rl_weight=1.0-2.5 for fine-tuning
     #   - Higher n_samples_rloo = lower variance but slower
     # =========================================================================
-    'rl_weight': 1.0,            # V12.33: Reduced from 2.5 to rebalance gradient budget (was ~55% of total)
+    'rl_weight': 0.05,           # V12.39: Aggressive reduction 1.0→0.05 — RL was 80% of gradient budget, drowning supervised signals on hard tail
     'ce_weight': 1.0,            # Cross-entropy weight (keep at 1.0)
     'n_samples_rloo': 4,         # Number of samples for RLOO baseline (A100: 4)
     'rl_temperature': 0.5,       # Sampling temperature for RL

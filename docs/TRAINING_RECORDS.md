@@ -4,6 +4,32 @@ Chronological record of training runs, architecture changes, and optimization de
 
 ---
 
+## V12.39: Aggressive RL Weight Reduction (2026-02-17)
+
+### Problem
+At epoch ~3030, RL (REINFORCE/SCST) consumes ~80% of the gradient budget (18.6 out of 23.3 total loss) despite `rl_weight` already being reduced from 2.5→1.0 in V12.33. All supervised losses (Tc, Magpie, Stoich, Family) have converged to tiny values, so RL dominates by default. Teacher-forced exact match is stuck at ~77% with noisy, slow improvement. The supervised signals (focal CE with gamma=2.0, numden loss) that know exactly which tokens are wrong are drowned out by RL's high-variance gradients averaged over all samples (including the 77% already correct).
+
+### Change
+- `rl_weight`: 1.0 → **0.05** (aggressive 20x reduction)
+
+### Expected Gradient Budget (estimated from epoch 3027)
+| Component | Old Weighted | New Weighted | New % |
+|-----------|-------------|-------------|-------|
+| RL | 18.57 | **0.93** | **18%** |
+| NumDen | 2.96 | 2.96 | **57%** |
+| Formula CE | ~0.7 | ~0.7 | 13% |
+| Tc | 0.43 | 0.43 | 8% |
+| Others | ~0.3 | ~0.3 | 4% |
+| **Total** | ~23.3 | **~5.3** | 100% |
+
+### Rationale
+- At 77% exact match, the model needs focused supervised gradients on the hard 23%, not high-variance RL exploration
+- Focal loss (gamma=2.0) already down-weights easy tokens — but only if it can be "heard" over RL noise
+- NumDen conditioning (V12.38) is the strongest new signal and should drive the hard-example gradient
+- At 0.05, RL contributes ~18% — still provides sequence-level reward signal but supervised losses truly dominate
+
+---
+
 ## V12.38: Numerator/Denominator Conditioning for Decoder (2026-02-17)
 
 ### Problem
