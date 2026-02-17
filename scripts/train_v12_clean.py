@@ -392,6 +392,8 @@ def build_family_lookup_tensors(device):
     return fine_to_coarse, fine_to_cuprate_sub, fine_to_iron_sub
 
 
+ALGO_VERSION = 'V12.38'  # Bump this when making algorithm changes
+
 TRAIN_CONFIG = {
     'num_epochs': 4000,
     'learning_rate': 3e-5,      # Reduced for stable fine-tuning (was 1e-4)
@@ -2854,6 +2856,7 @@ def log_training_metrics(epoch, metrics, log_path, true_eval=None):
 
     # Define columns
     columns = [
+        'algo_version',  # V12.38: Track which algorithm version produced this row
         'epoch', 'exact_match', 'accuracy', 'loss', 'tc_loss', 'magpie_loss',
         'stoich_loss', 'rl_loss', 'reward', 'entropy', 'entropy_weight',
         'z_norm', 'tf_ratio', 'contrastive_loss', 'hp_loss', 'sc_loss',
@@ -2864,6 +2867,7 @@ def log_training_metrics(epoch, metrics, log_path, true_eval=None):
 
     # Extract values
     row = {
+        'algo_version': ALGO_VERSION,
         'epoch': epoch,
         'exact_match': metrics.get('exact_match', 0),
         'accuracy': metrics.get('accuracy', 0),
@@ -3696,6 +3700,7 @@ def evaluate_true_autoregressive(encoder, decoder, loader, device, max_samples=1
         error_records.sort(key=lambda x: (-x['n_errors'], -x['seq_len']))
 
         error_summary = {
+            'algo_version': ALGO_VERSION,
             'epoch': epoch,
             'total_samples': total_samples,
             'total_errors': len(error_records),
@@ -4729,7 +4734,7 @@ def train():
     print(f"AMP: dtype={amp_dtype_str}, scaler={'enabled' if use_scaler else 'disabled'}")
 
     print("\n" + "=" * 60)
-    print("Training")
+    print(f"Training [{ALGO_VERSION}]")
     print("=" * 60)
     print(f"Epochs: {TRAIN_CONFIG['num_epochs']}")
     actual_batch_size = train_loader.batch_size
@@ -5068,7 +5073,7 @@ def train():
         dec_scheduler.step()
 
         # Print progress with all metrics including TF ratio and curriculum weights
-        base_msg = (f"Epoch {epoch:4d} | TF: {tf_ratio:.2f} | Loss: {metrics['loss']:.4f} | "
+        base_msg = (f"[{ALGO_VERSION}] Epoch {epoch:4d} | TF: {tf_ratio:.2f} | Loss: {metrics['loss']:.4f} | "
                     f"Acc: {metrics['accuracy']*100:.1f}% | Exact: {metrics['exact_match']*100:.1f}% | "
                     f"Tc: {metrics['tc_loss']:.4f} | Magpie: {metrics['magpie_loss']:.4f} | "
                     f"Stoich: {metrics['stoich_loss']:.4f} | "
