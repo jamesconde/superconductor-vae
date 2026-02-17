@@ -3,16 +3,20 @@
 Targeted Holdout Search — Element-Anchored Z-Space Exploration
 ===============================================================
 
-For each missed holdout formula, find training samples that share the same
+For each holdout formula, find training samples that share the same
 elements, encode those as seeds, and explore that specific Z neighborhood.
 
-This complements holdout_search.py which used family-level (highest Tc) seeds.
+Uses PCA walks along principal components of neighbor Z-vectors to
+generate candidates, plus perturbation and interpolation strategies.
 
 Usage:
     cd /home/james/superconductor-vae
-    PYTHONPATH=src python -u scratch/holdout_search_targeted.py
+    PYTHONPATH=src python -u scripts/analysis/holdout_search_targeted.py
+    PYTHONPATH=src python -u scripts/analysis/holdout_search_targeted.py --checkpoint outputs/best_checkpoints/checkpoint_best_V12.38_colab.pt
+    PYTHONPATH=src python -u scripts/analysis/holdout_search_targeted.py --checkpoint outputs/best_checkpoints/checkpoint_best_V12.38_colab.pt --all
 """
 
+import argparse
 import json
 import sys
 import os
@@ -28,7 +32,7 @@ import torch
 import torch.nn.functional as F
 import numpy as np
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'src'))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / 'src'))
 
 from superconductor.models.attention_vae import FullMaterialsVAE
 from superconductor.models.autoregressive_decoder import (
@@ -37,11 +41,9 @@ from superconductor.models.autoregressive_decoder import (
 )
 from superconductor.data.canonical_ordering import CanonicalOrderer, ElementWithFraction
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-CHECKPOINT_PATH = PROJECT_ROOT / 'outputs' / 'checkpoint_best.pt'
+PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent  # scripts/analysis/ -> scripts/ -> project root
 HOLDOUT_PATH = PROJECT_ROOT / 'data' / 'GENERATIVE_HOLDOUT_DO_NOT_TRAIN.json'
 CACHE_DIR = PROJECT_ROOT / 'data' / 'processed' / 'cache'
-OUTPUT_PATH = PROJECT_ROOT / 'scratch' / 'holdout_search_targeted_results.json'
 
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -172,10 +174,10 @@ ELEMENT_TO_Z = {
 }
 
 
-def load_models():
+def load_models(checkpoint_path):
     """Load encoder and decoder from checkpoint."""
-    print(f"Loading checkpoint: {CHECKPOINT_PATH}")
-    checkpoint = torch.load(CHECKPOINT_PATH, map_location=DEVICE, weights_only=False)
+    print(f"Loading checkpoint: {checkpoint_path}")
+    checkpoint = torch.load(checkpoint_path, map_location=DEVICE, weights_only=False)
 
     enc_state_raw = checkpoint.get('encoder_state_dict', {})
     magpie_dim = 145
@@ -183,9 +185,11 @@ def load_models():
         if 'magpie_encoder' in k and k.endswith('.weight') and v.dim() == 2:
             magpie_dim = v.shape[1]
             break
-    print(f"  magpie_dim={magpie_dim}")
 
     enc_state = {k.replace('_orig_mod.', ''): v for k, v in enc_state_raw.items()}
+
+    # Detect V12.38+ numden_head
+    has_numden_head = any('numden_head.' in k for k in enc_state)
 
     encoder = FullMaterialsVAE(
         n_elements=118, element_embed_dim=128, n_attention_heads=8,
@@ -197,12 +201,23 @@ def load_models():
     dec_state_raw = checkpoint.get('decoder_state_dict', {})
     dec_state = {k.replace('_orig_mod.', ''): v for k, v in dec_state_raw.items()}
 
+    # Detect stoich_input_dim from checkpoint weights
+    stoich_weight_key = 'stoich_to_memory.0.weight'
+    if stoich_weight_key in dec_state:
+        stoich_dim = dec_state[stoich_weight_key].shape[1]
+        if stoich_dim == 37:
+            max_elements = 12  # V12.38: 12*3+1=37
+        else:
+            max_elements = stoich_dim - 1  # Pre-V12.38: 12+1=13
+    else:
+        max_elements = 12
+
     decoder = EnhancedTransformerDecoder(
         latent_dim=2048, d_model=512, nhead=8, num_layers=12,
         dim_feedforward=2048, dropout=0.1, max_len=60,
         n_memory_tokens=16, encoder_skip_dim=256,
         use_skip_connection=True, use_stoich_conditioning=True,
-        max_elements=12, n_stoich_tokens=4,
+        max_elements=max_elements, n_stoich_tokens=4,
     ).to(DEVICE)
     decoder.load_state_dict(dec_state, strict=False)
 
@@ -210,8 +225,9 @@ def load_models():
     decoder.eval()
 
     epoch = checkpoint.get('epoch', '?')
-    print(f"  Loaded epoch {epoch}")
-    return encoder, decoder, magpie_dim
+    print(f"  Loaded epoch {epoch}, magpie_dim={magpie_dim}, numden_head={has_numden_head}")
+    print(f"  Decoder stoich_input_dim={decoder.stoich_to_memory[0].in_features}")
+    return encoder, decoder, magpie_dim, has_numden_head
 
 
 def load_data(magpie_dim):
@@ -253,7 +269,7 @@ def encode_indices(encoder, data, indices):
 
 
 @torch.no_grad()
-def decode_z_batch(encoder, decoder, z_batch, temperature=0.01):
+def decode_z_batch(encoder, decoder, z_batch, has_numden_head=False, temperature=0.01):
     """Decode Z vectors → formula strings with encoder conditioning."""
     batch_size = 64
     all_formulas = []
@@ -261,9 +277,20 @@ def decode_z_batch(encoder, decoder, z_batch, temperature=0.01):
         z = z_batch[start:start + batch_size].to(DEVICE)
         dec_out = encoder.decode(z)
         encoder_skip = dec_out['attended_input']
+
+        # V12.38: Assemble stoich_pred with numden conditioning
         fraction_output = encoder.fraction_head(z)
+        fraction_pred = fraction_output[:, :encoder.max_elements]
+        element_count_pred = fraction_output[:, -1]
+
+        if has_numden_head and hasattr(encoder, 'numden_head'):
+            numden_pred = encoder.numden_head(z)
+            stoich_pred = torch.cat([fraction_pred, numden_pred, element_count_pred.unsqueeze(-1)], dim=-1)
+        else:
+            stoich_pred = torch.cat([fraction_pred, element_count_pred.unsqueeze(-1)], dim=-1)
+
         generated, _, _ = decoder.generate_with_kv_cache(
-            z=z, encoder_skip=encoder_skip, stoich_pred=fraction_output,
+            z=z, encoder_skip=encoder_skip, stoich_pred=stoich_pred,
             temperature=temperature,
         )
         for i in range(len(z)):
@@ -314,7 +341,7 @@ def find_element_neighbors(target_formula, data, top_k=50):
     return [s[0] for s in scores[:top_k]]
 
 
-def search_single_target(encoder, decoder, data, target_formula, target_tc, target_family):
+def search_single_target(encoder, decoder, data, target_formula, target_tc, target_family, has_numden_head=False):
     """Targeted search for a single holdout formula.
 
     Strategy:
@@ -394,7 +421,7 @@ def search_single_target(encoder, decoder, data, target_formula, target_tc, targ
 
     # Step 4: Decode — greedy
     t0 = time.time()
-    greedy_formulas = decode_z_batch(encoder, decoder, all_z, temperature=0.01)
+    greedy_formulas = decode_z_batch(encoder, decoder, all_z, has_numden_head=has_numden_head, temperature=0.01)
     print(f"    Greedy decoded in {time.time()-t0:.1f}s")
 
     # Step 5: Temperature sampling from seeds
@@ -402,7 +429,7 @@ def search_single_target(encoder, decoder, data, target_formula, target_tc, targ
     for temp in TEMPERATURES:
         for z_idx in range(min(len(z_seeds), 15)):
             z = z_seeds[z_idx].unsqueeze(0).repeat(N_TEMPERATURE_SAMPLES, 1)
-            temp_formulas.extend(decode_z_batch(encoder, decoder, z, temperature=temp))
+            temp_formulas.extend(decode_z_batch(encoder, decoder, z, has_numden_head=has_numden_head, temperature=temp))
 
     all_generated = greedy_formulas + temp_formulas
     unique_formulas = set(f for f in all_generated if f and len(f) > 1)
@@ -460,45 +487,77 @@ def search_single_target(encoder, decoder, data, target_formula, target_tc, targ
 
 
 def main():
+    parser = argparse.ArgumentParser(description='Targeted Holdout Search (Element-Anchored)')
+    parser.add_argument('--checkpoint', type=str,
+                        default=str(PROJECT_ROOT / 'outputs' / 'checkpoint_best.pt'),
+                        help='Path to checkpoint file')
+    parser.add_argument('--all', action='store_true',
+                        help='Search all 45 holdouts (not just previous failures)')
+    args = parser.parse_args()
+
+    checkpoint_path = Path(args.checkpoint)
+    if not checkpoint_path.is_absolute():
+        checkpoint_path = PROJECT_ROOT / checkpoint_path
+    if not checkpoint_path.exists():
+        print(f"ERROR: Checkpoint not found: {checkpoint_path}")
+        sys.exit(1)
+
+    ckpt_stem = checkpoint_path.stem
+    output_path = PROJECT_ROOT / 'outputs' / f'holdout_search_targeted_{ckpt_stem}.json'
+
     print("=" * 70)
     print("TARGETED HOLDOUT SEARCH (Element-Anchored)")
     print("=" * 70)
     print(f"Device: {DEVICE}")
+    print(f"Checkpoint: {checkpoint_path}")
 
-    encoder, decoder, magpie_dim = load_models()
+    encoder, decoder, magpie_dim, has_numden_head = load_models(checkpoint_path)
     data = load_data(magpie_dim)
-
-    # Load previous results to know which targets to redo
-    prev_path = PROJECT_ROOT / 'scratch' / 'holdout_search_results.json'
-    prev_best = {}
-    if prev_path.exists():
-        with open(prev_path) as f:
-            prev_data = json.load(f)
-        for fam, res in prev_data['results'].items():
-            for gen, target in res['exact_matches']:
-                prev_best[target] = 1.0
-            for target, matches in res['fuzzy_matches'].items():
-                if matches:
-                    prev_best[target] = max(prev_best.get(target, 0), matches[0][1])
 
     # Load holdout
     with open(HOLDOUT_PATH) as f:
         holdout = json.load(f)
 
-    # Filter to targets below threshold
-    targets_to_search = []
-    for sample in holdout['holdout_samples']:
-        formula = sample['formula']
-        prev_sim = prev_best.get(formula, 0.0)
-        if prev_sim < REDO_THRESHOLD:
+    # Build target list
+    if args.all:
+        # Search all 45 holdouts
+        targets_to_search = []
+        for sample in holdout['holdout_samples']:
             targets_to_search.append({
-                'formula': formula,
+                'formula': sample['formula'],
                 'Tc': sample['Tc'],
                 'family': sample['family'],
-                'prev_best': prev_sim,
+                'prev_best': 0.0,
             })
+        print(f"\nSearching ALL {len(targets_to_search)} holdout targets")
+    else:
+        # Load previous results to know which targets to redo
+        prev_path = PROJECT_ROOT / 'scratch' / 'holdout_search_results.json'
+        prev_best = {}
+        if prev_path.exists():
+            with open(prev_path) as f:
+                prev_data = json.load(f)
+            for fam, res in prev_data['results'].items():
+                for gen, target in res['exact_matches']:
+                    prev_best[target] = 1.0
+                for target, matches in res['fuzzy_matches'].items():
+                    if matches:
+                        prev_best[target] = max(prev_best.get(target, 0), matches[0][1])
 
-    print(f"\nTargets below {REDO_THRESHOLD} threshold: {len(targets_to_search)}/45")
+        targets_to_search = []
+        for sample in holdout['holdout_samples']:
+            formula = sample['formula']
+            prev_sim = prev_best.get(formula, 0.0)
+            if prev_sim < REDO_THRESHOLD:
+                targets_to_search.append({
+                    'formula': formula,
+                    'Tc': sample['Tc'],
+                    'family': sample['family'],
+                    'prev_best': prev_sim,
+                })
+
+        print(f"\nTargets below {REDO_THRESHOLD} threshold: {len(targets_to_search)}/45")
+
     for t in targets_to_search:
         print(f"  [{t['family']:12s}] prev={t['prev_best']:.3f} | {t['formula']}")
 
@@ -508,6 +567,7 @@ def main():
         result = search_single_target(
             encoder, decoder, data,
             target['formula'], target['Tc'], target['family'],
+            has_numden_head=has_numden_head,
         )
         result['prev_best'] = target['prev_best']
         results.append(result)
@@ -517,50 +577,39 @@ def main():
     print("TARGETED SEARCH SUMMARY")
     print("=" * 70)
 
-    improved = 0
-    now_found = 0
+    found_count = 0
     for r in results:
-        improved_flag = r['best_sim'] > r['prev_best']
         found_flag = r['best_sim'] >= 0.95
-        if improved_flag:
-            improved += 1
         if found_flag:
-            now_found += 1
-        marker = '***' if found_flag else ' + ' if improved_flag else '   '
+            found_count += 1
+        marker = '***' if r.get('exact') else ' + ' if found_flag else '   '
         print(f"{marker} [{r['target_family']:12s}] "
-              f"prev={r['prev_best']:.3f} → new={r['best_sim']:.3f} | {r['target']}")
+              f"best={r['best_sim']:.3f} | {r['target']}")
         if r['best_gen']:
             print(f"     Best: {r['best_gen']}")
 
-    print(f"\nImproved: {improved}/{len(results)}")
-    print(f"Now found (>={REDO_THRESHOLD}): {now_found}/{len(results)}")
-
-    # Combine with previous results for final count
-    combined_best = dict(prev_best)
-    for r in results:
-        if r['best_sim'] > combined_best.get(r['target'], 0):
-            combined_best[r['target']] = r['best_sim']
+    print(f"\nFound (>=0.95): {found_count}/{len(results)}")
+    print(f"Exact matches: {sum(1 for r in results if r.get('exact'))}/{len(results)}")
 
     thresholds = [1.0, 0.99, 0.98, 0.95, 0.90, 0.85, 0.80]
-    print(f"\nCOMBINED RESULTS (family search + targeted search):")
+    print(f"\nRESULTS BY THRESHOLD:")
     for thresh in thresholds:
-        found = sum(1 for v in combined_best.values() if v >= thresh)
-        print(f"  >= {thresh:.2f}: {found}/45 ({found/45*100:.1f}%)")
+        found = sum(1 for r in results if r['best_sim'] >= thresh)
+        print(f"  >= {thresh:.2f}: {found}/{len(results)} ({found/len(results)*100:.1f}%)")
 
     # Save
     output = {
         'timestamp': time.strftime('%Y-%m-%dT%H:%M:%S'),
-        'checkpoint': str(CHECKPOINT_PATH),
-        'redo_threshold': REDO_THRESHOLD,
+        'checkpoint': str(checkpoint_path),
+        'search_mode': 'all' if args.all else 'failures_only',
         'n_targets_searched': len(targets_to_search),
-        'n_improved': improved,
-        'n_now_found': now_found,
+        'n_found_095': found_count,
+        'n_exact': sum(1 for r in results if r.get('exact')),
         'results': results,
-        'combined_best': {k: float(v) for k, v in combined_best.items()},
     }
-    with open(OUTPUT_PATH, 'w') as f:
+    with open(output_path, 'w') as f:
         json.dump(output, f, indent=2, default=str)
-    print(f"\nResults saved to: {OUTPUT_PATH}")
+    print(f"\nResults saved to: {output_path}")
 
 
 if __name__ == '__main__':

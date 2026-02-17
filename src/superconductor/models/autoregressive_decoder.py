@@ -2006,8 +2006,9 @@ class EnhancedTransformerDecoder(nn.Module):
                 # H(p) = -sum(p * log(p)) over vocabulary
                 if return_entropy:
                     # Use raw logits (no temperature) for true distribution entropy
-                    probs_for_entropy = F.softmax(logits, dim=-1)
-                    log_probs_for_entropy = F.log_softmax(logits, dim=-1)
+                    # V12.40: Clamp to avoid 0*log(0)=NaN when softmax produces exact 0.0
+                    probs_for_entropy = F.softmax(logits, dim=-1).clamp(min=1e-8)
+                    log_probs_for_entropy = probs_for_entropy.log()
                     # Entropy: -sum(p * log(p)), sum over vocab dimension
                     step_entropy = -(probs_for_entropy * log_probs_for_entropy).sum(dim=-1)  # [batch]
                     entropy_list.append(step_entropy)
@@ -2252,8 +2253,9 @@ class EnhancedTransformerDecoder(nn.Module):
                     logits = self.output_proj(output).squeeze(1)  # [batch, vocab_size]
                     draft_logits.append(logits)
 
-                    probs_ent = F.softmax(logits, dim=-1)
-                    log_probs_ent = F.log_softmax(logits, dim=-1)
+                    # V12.40: Clamp to avoid 0*log(0)=NaN
+                    probs_ent = F.softmax(logits, dim=-1).clamp(min=1e-8)
+                    log_probs_ent = probs_ent.log()
                     step_entropy = -(probs_ent * log_probs_ent).sum(dim=-1)
                     draft_entropies.append(step_entropy)
 

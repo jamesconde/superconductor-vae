@@ -4,6 +4,56 @@ Chronological record of training runs, architecture changes, and optimization de
 
 ---
 
+## V12.40: RL Temperature Reduction + Smart Per-Loss Skip Scheduling (2026-02-17)
+
+### Problems
+1. **RL temperature too high**: At epoch 3056, temperature=0.5 causes excessive exploration that's counterproductive when model is already at 88% true AR exact match.
+2. **Misleading cache exact match metric**: Cache reports "Exact match: 6.3%" over all 50K samples vs true AR eval's 88.4% on 2K samples.
+3. **Converged losses waste compute**: REINFORCE is 91% of epoch compute, but other losses also run every epoch even when fully converged.
+
+### Changes
+- **`rl_temperature`**: 0.5 → **0.2** — sharper sampling focuses RL gradients on near-optimal sequences
+- **Removed** misleading `exact_match_pct` print from `cache_z_vectors()` (per-sample tensor still stored)
+- **Smart per-loss skip scheduling**: Each loss is tracked **independently**. When a loss drops below its `converge_threshold`, it's only computed every `loss_skip_frequency` epochs (weight set to 0 on skip epochs). If a loss spikes above `baseline + spike_delta` on a check epoch, that specific loss resumes every-epoch computation. Other converged losses remain skipped. RL gets the biggest compute savings (91% of loss time), but all losses participate for clean gradient control.
+
+### New Config Keys
+```python
+'loss_skip_enabled': True,
+'loss_skip_frequency': 4,          # Compute skipped losses every N epochs
+'loss_skip_schedule': {
+    # metric_key: (converge_threshold, spike_delta)
+    'reinforce_loss':  (1.0,   0.5),  # RL raw ~18.6 — THE big compute saver
+    'tc_loss':         (0.5,   0.1),  # Tc MSE ~0.43
+    'magpie_loss':     (0.1,   0.1),  # Magpie MSE ~0.06
+    'stoich_loss':     (0.01,  0.05), # Stoich MSE ~0.001
+    'numden_loss':     (3.0,   0.5),  # NumDen MSE ~2.96
+    'tc_class_loss':   (0.5,   0.2),  # Tc bucket classification
+    'physics_z_loss':  (0.5,   0.2),  # PhysZ ~0.32
+    'hp_loss':         (0.3,   0.1),  # High-pressure BCE
+    'sc_loss':         (0.3,   0.1),  # SC/non-SC classification BCE
+    'stop_loss':       (0.1,   0.1),  # Stop-prediction BCE
+    'family_loss':     (0.5,   0.2),  # Hierarchical family classifier
+},
+```
+
+### Log Output
+- Skipped RL shows `RL: [skip]` in epoch line
+- Skipped non-RL losses show `Skip: tc,magpie,...` suffix
+- Convergence/spike events print `[LossSkip] {loss} converged/spiked` messages
+
+### Expected Impact
+- ~75% compute time reduction on epochs where RL is skipped (RL = 91% of loss compute)
+- Sharper RL gradients from temperature=0.2 on epochs when RL does run
+- Cleaner gradient signal: converged losses don't contribute near-zero noise gradients
+
+### Entropy NaN Fix (also in this version)
+Fixed `Ent: nan` appearing in epoch logs. Cause: `F.softmax()` produces exact 0.0 for very confident predictions → `log(0) = -inf` → `0 * -inf = NaN`. Fix: clamp softmax probabilities to min=1e-8 before taking log, applied in 3 locations:
+- `autoregressive_decoder.py` line ~2009 (generate_with_kv_cache)
+- `autoregressive_decoder.py` line ~2255 (speculative decoding)
+- `train_v12_clean.py` line ~2313 (fallback entropy in loss function)
+
+---
+
 ## V12.39: Aggressive RL Weight Reduction (2026-02-17)
 
 ### Problem

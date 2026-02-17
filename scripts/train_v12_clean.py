@@ -392,7 +392,7 @@ def build_family_lookup_tensors(device):
     return fine_to_coarse, fine_to_cuprate_sub, fine_to_iron_sub
 
 
-ALGO_VERSION = 'V12.39'  # Bump this when making algorithm changes
+ALGO_VERSION = 'V12.40'  # Bump this when making algorithm changes
 
 TRAIN_CONFIG = {
     'num_epochs': 4000,
@@ -493,10 +493,38 @@ TRAIN_CONFIG = {
     'rl_weight': 0.05,           # V12.39: Aggressive reduction 1.0→0.05 — RL was 80% of gradient budget, drowning supervised signals on hard tail
     'ce_weight': 1.0,            # Cross-entropy weight (keep at 1.0)
     'n_samples_rloo': 4,         # Number of samples for RLOO baseline (A100: 4)
-    'rl_temperature': 0.5,       # Sampling temperature for RL
+    'rl_temperature': 0.2,       # V12.40: Reduced 0.5→0.2 — at epoch 3000+, exploration hurts more than helps
     'entropy_weight': 0.2,       # Entropy bonus in REINFORCE reward (encourages exploration)
     'use_autoregressive_reinforce': True,  # Use KV-cached autoregressive sampling
     'rl_method': 'scst',         # 'scst' (Self-Critical, Rennie 2017) or 'rloo' (Ahmadian 2024)
+
+    # V12.40: Smart loss skip scheduling — skip converged losses to save compute
+    # Each loss is tracked independently. When a loss drops below its converge_threshold,
+    # it's only computed every skip_frequency epochs. If it spikes above baseline + spike_delta
+    # on a check epoch, it resumes every-epoch computation.
+    # RL is the big win (91% of loss compute = 4x autoregressive decode/batch).
+    # Other losses are cheap but still get individual skip/resume for clean gradient control.
+    # Formula CE is NOT included — it's the core training signal and should never be skipped.
+    'loss_skip_enabled': True,
+    'loss_skip_frequency': 4,        # Compute skipped losses every N epochs (check epochs)
+    'loss_skip_schedule': {
+        # metric_key: (converge_threshold, spike_delta)
+        # converge_threshold: loss value below which this loss is considered converged
+        # spike_delta: absolute increase above converged baseline that triggers resume
+        # --- Inside CombinedLossWithREINFORCE ---
+        'reinforce_loss':  (1.0,   0.5),   # RL raw ~18.6 (weighted 0.93) — THE big compute saver
+        'tc_loss':         (0.5,   0.1),   # Tc MSE ~0.43 at epoch 3056
+        'magpie_loss':     (0.1,   0.1),   # Magpie MSE ~0.06
+        'stoich_loss':     (0.01,  0.05),  # Stoich MSE ~0.001
+        'numden_loss':     (3.0,   0.5),   # NumDen MSE ~2.96
+        'tc_class_loss':   (0.5,   0.2),   # Tc bucket classification (CE, V12.28)
+        # --- External losses (computed in train_epoch) ---
+        'physics_z_loss':  (0.5,   0.2),   # PhysZ ~0.32 at epoch 3056
+        'hp_loss':         (0.3,   0.1),   # High-pressure BCE (V12.19)
+        'sc_loss':         (0.3,   0.1),   # SC/non-SC classification BCE (V12.21)
+        'stop_loss':       (0.1,   0.1),   # Stop-prediction BCE (V12.30)
+        'family_loss':     (0.5,   0.2),   # Hierarchical family classifier (V12.33)
+    },
 
     # =========================================================================
     # V12.9: Speculative Decoding Settings
@@ -2310,8 +2338,9 @@ class CombinedLossWithREINFORCE(nn.Module):
             entropy = rl_entropy  # Use RL entropy for logging
         else:
             # Compute from logits for monitoring (not used in loss)
-            probs = F.softmax(formula_logits, dim=-1)
-            log_probs = F.log_softmax(formula_logits, dim=-1)
+            # V12.40: Clamp to avoid 0*log(0)=NaN
+            probs = F.softmax(formula_logits, dim=-1).clamp(min=1e-8)
+            log_probs = probs.log()
             entropy_per_position = -(probs * log_probs).sum(dim=-1)
             entropy = (entropy_per_position * mask.float()).sum(dim=1).mean()
 
@@ -2724,7 +2753,8 @@ def cache_z_vectors(encoder, loader, device, epoch, cache_path, dataset_info=Non
         exact_match = torch.cat(all_exact_match, dim=0)
         cache_data['generated_tokens'] = generated_tokens
         cache_data['exact_match'] = exact_match
-        cache_data['exact_match_pct'] = exact_match.float().mean().item() * 100
+        # V12.40: Removed exact_match_pct print — misleading over full dataset (6% cache vs 88% true AR)
+        # The per-sample exact_match tensor is still stored for downstream analysis
 
     if include_log_probs:
         # Pad log_probs to same length
@@ -2813,8 +2843,6 @@ def cache_z_vectors(encoder, loader, device, epoch, cache_path, dataset_info=Non
 
     print(f"  Cached {z_vectors.size(0)} samples to {cache_path.name} (mode={mode})")
     print(f"    Z: {z_vectors.size(1)} dims, norm={z_vectors.norm(dim=1).mean():.2f}±{z_vectors.norm(dim=1).std():.2f}")
-    if include_predictions:
-        print(f"    Exact match: {cache_data['exact_match_pct']:.1f}%")
     # V12.21: Show SC-only Tc MAE as primary metric
     tc_stats = cache_data['stats']
     print(f"    Tc MAE (SC-only): {tc_stats['tc_pred_mae_sc']:.4f} | "
@@ -3748,7 +3776,8 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
                 enable_timing=True, hp_loss_weight=0.0, sc_loss_weight=0.0,
                 theory_loss_fn=None, theory_weight=0.0, norm_stats=None,
                 physics_z_loss_fn=None, physics_z_weight=1.0,
-                family_loss_weight=0.0, family_lookup_tables=None):
+                family_loss_weight=0.0, family_lookup_tables=None,
+                stop_loss_weight=None):  # V12.40: Pass as param for skip scheduling
     """Train for one epoch with curriculum weights and teacher forcing.
 
     V12.8: Added amp_dtype for configurable mixed precision (bfloat16/float16)
@@ -3767,6 +3796,10 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
 
     encoder.train()
     decoder.train()
+
+    # V12.40: Resolve stop_loss_weight (parameter for skip scheduling, fallback to config)
+    if stop_loss_weight is None:
+        stop_loss_weight = TRAIN_CONFIG.get('stop_loss_weight', 0.0)
 
     # V12.15: Initialize timing stats
     timing = TimingStats() if enable_timing else None
@@ -3896,7 +3929,6 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
                 timing.stop('decoder_fwd')
 
             # V12.30: Stop-prediction loss (BCE on stop head)
-            stop_loss_weight = TRAIN_CONFIG.get('stop_loss_weight', 0.0)
             stop_loss_val = torch.tensor(0.0, device=device)
             if stop_loss_weight > 0 and stop_logits is not None:
                 # Target: 1.0 at positions where target token is END, 0.0 elsewhere
@@ -4922,6 +4954,41 @@ def train():
     last_rollback_epoch = -100  # Track when last rollback occurred
     drop_grace_until = -1  # V12.31: Epoch until drop detector is suppressed
 
+    # V12.40: Smart loss skip scheduling state
+    # Each loss independently tracked: converge → skip on non-check epochs, spike → resume
+    loss_skip_enabled = TRAIN_CONFIG.get('loss_skip_enabled', False)
+    loss_skip_schedule = TRAIN_CONFIG.get('loss_skip_schedule', {})
+    loss_skip_freq = TRAIN_CONFIG.get('loss_skip_frequency', 4)
+    # Per-loss state: {metric_key: {'converged': bool, 'baseline': float, 'base_weight': float}}
+    loss_skip_state = {}
+    # Store original weights so we can restore them after skip epochs
+    # Map from metric_key → (object, attribute_name) for weight zeroing via loss_fn attrs
+    # Losses with (None, None) are controlled by local variables (tc_weight, magpie_weight,
+    # effective_physics_z_weight) and handled separately in the local override block.
+    loss_weight_map = {
+        # (object, attribute) for loss_fn attrs; (None, None) for local-var losses
+        'reinforce_loss': (loss_fn, 'rl_weight'),
+        'tc_loss':        (None, None),      # Local var: tc_weight (curriculum)
+        'magpie_loss':    (None, None),      # Local var: magpie_weight (curriculum)
+        'stoich_loss':    (loss_fn, 'stoich_weight'),
+        'numden_loss':    (loss_fn, 'numden_weight'),
+        'tc_class_loss':  (loss_fn, 'tc_class_weight'),
+        'physics_z_loss': (None, None),      # Local var: effective_physics_z_weight
+        'hp_loss':        (None, None),      # Local var via TRAIN_CONFIG (read inside train_epoch)
+        'sc_loss':        (None, None),      # Local var via TRAIN_CONFIG (read inside train_epoch)
+        'stop_loss':      (None, None),      # Read from TRAIN_CONFIG inside train_epoch
+        'family_loss':    (None, None),      # Local var: family_loss_weight
+    }
+    if loss_skip_enabled:
+        for key in loss_skip_schedule:
+            obj, attr = loss_weight_map.get(key, (None, None))
+            base_w = getattr(obj, attr, 0.0) if obj else 1.0  # Default 1.0 for local-var losses
+            loss_skip_state[key] = {
+                'converged': False,
+                'baseline': float('inf'),
+                'base_weight': base_w,
+            }
+
     for epoch in range(start_epoch, TRAIN_CONFIG['num_epochs']):
         _shutdown_state['epoch'] = epoch
 
@@ -4946,6 +5013,25 @@ def train():
             loss_fn.entropy_weight = new_entropy_weight
             loss_fn.temperature = new_temperature
 
+        # V12.40: Smart loss skip scheduling — skip converged losses to save compute
+        losses_skipped_this_epoch = set()
+        is_check_epoch = (epoch % loss_skip_freq == 0)
+        if loss_skip_enabled:
+            for key, state in loss_skip_state.items():
+                obj, attr = loss_weight_map.get(key, (None, None))
+                if obj is None:
+                    continue
+                if state['converged']:
+                    if is_check_epoch:
+                        # Re-enable to check if still converged
+                        setattr(obj, attr, state['base_weight'])
+                    else:
+                        # Skip this loss — set weight to 0
+                        setattr(obj, attr, 0.0)
+                        losses_skipped_this_epoch.add(key)
+                else:
+                    # Not converged — always compute at full weight
+                    setattr(obj, attr, state['base_weight'])
         # V12.12: Compute contrastive weight with warmup
         effective_contrastive_weight = 0.0
         if contrastive_loss_fn is not None:
@@ -4968,6 +5054,30 @@ def train():
             pz_warmup_prog = min(1.0, pz_epochs_active / max(pz_warmup, 1))
             effective_physics_z_weight = max(0.0, pz_warmup_prog)  # Clamp >=0
 
+        # V12.40: Set local-var weights for losses controlled outside loss_fn
+        # These are set from config first, then zeroed if skipped
+        epoch_hp_loss_weight = TRAIN_CONFIG.get('hp_loss_weight', 0.0)
+        epoch_sc_loss_weight = TRAIN_CONFIG.get('sc_loss_weight', 0.0)
+        epoch_stop_loss_weight = TRAIN_CONFIG.get('stop_loss_weight', 0.0)
+        epoch_family_loss_weight = TRAIN_CONFIG.get('family_classifier_weight', 0.0)
+
+        # V12.40: Zero local-var weights for skipped losses (must be AFTER warmup computations)
+        if loss_skip_enabled and losses_skipped_this_epoch:
+            if 'tc_loss' in losses_skipped_this_epoch:
+                tc_weight = 0.0
+            if 'magpie_loss' in losses_skipped_this_epoch:
+                magpie_weight = 0.0
+            if 'physics_z_loss' in losses_skipped_this_epoch:
+                effective_physics_z_weight = 0.0
+            if 'hp_loss' in losses_skipped_this_epoch:
+                epoch_hp_loss_weight = 0.0
+            if 'sc_loss' in losses_skipped_this_epoch:
+                epoch_sc_loss_weight = 0.0
+            if 'stop_loss' in losses_skipped_this_epoch:
+                epoch_stop_loss_weight = 0.0
+            if 'family_loss' in losses_skipped_this_epoch:
+                epoch_family_loss_weight = 0.0
+
         metrics = train_epoch(
             encoder, decoder, train_loader, loss_fn,
             enc_opt, dec_opt, scaler, device, TRAIN_CONFIG['use_amp'],
@@ -4985,9 +5095,9 @@ def train():
             # V12.15: Timing instrumentation
             enable_timing=TRAIN_CONFIG.get('enable_timing', True),
             # V12.19: High-pressure prediction
-            hp_loss_weight=TRAIN_CONFIG.get('hp_loss_weight', 0.0),
+            hp_loss_weight=epoch_hp_loss_weight,
             # V12.21: SC/non-SC classification
-            sc_loss_weight=TRAIN_CONFIG.get('sc_loss_weight', 0.0),
+            sc_loss_weight=epoch_sc_loss_weight,
             # V12.22: Theory-guided consistency
             theory_loss_fn=theory_loss_fn,
             theory_weight=effective_theory_weight,
@@ -4995,9 +5105,10 @@ def train():
             # V12.31: Physics Z supervision
             physics_z_loss_fn=physics_z_loss_fn,
             # V12.33: Hierarchical family classification
-            family_loss_weight=TRAIN_CONFIG.get('family_classifier_weight', 0.0),
+            family_loss_weight=epoch_family_loss_weight,
             family_lookup_tables=family_lookup_tables,
             physics_z_weight=effective_physics_z_weight,
+            stop_loss_weight=epoch_stop_loss_weight,  # V12.40: For skip scheduling
         )
 
         # V12.11: Catastrophic drop detection - rollback to best checkpoint and halve LR
@@ -5076,6 +5187,34 @@ def train():
                 exact_match=metrics['exact_match'],
             )
 
+        # V12.40: Update per-loss convergence state
+        # Each loss independently: converge below threshold → skip, spike above baseline + delta → resume
+        if loss_skip_enabled:
+            for key, state in loss_skip_state.items():
+                thresh, delta = loss_skip_schedule[key]
+                current_val = metrics.get(key, 0)
+
+                if key in losses_skipped_this_epoch:
+                    # This loss was skipped — metric is 0, don't use it for convergence check
+                    continue
+
+                if not state['converged']:
+                    # Check if this loss should enter converged state
+                    if current_val < thresh:
+                        state['converged'] = True
+                        state['baseline'] = current_val
+                        print(f"  [LossSkip] {key} converged: {current_val:.4f} < {thresh} — "
+                              f"skipping every {loss_skip_freq-1}/{loss_skip_freq} epochs", flush=True)
+                else:
+                    # Already converged — check for spike on check epochs
+                    if current_val > state['baseline'] + delta:
+                        state['converged'] = False
+                        print(f"  [LossSkip] {key} spiked: {current_val:.4f} > "
+                              f"{state['baseline']:.4f} + {delta} — resuming every-epoch", flush=True)
+                    else:
+                        # Still converged — update baseline to track drift downward
+                        state['baseline'] = min(state['baseline'], current_val)
+
         # Learning rate scheduling
         enc_scheduler.step()
         dec_scheduler.step()
@@ -5090,12 +5229,21 @@ def train():
 
         # V12.8: Add REINFORCE metrics if enabled (includes entropy in reward)
         # V12.9: Also show adaptive entropy weight
-        if TRAIN_CONFIG.get('rl_weight', 0.0) > 0:
-            ent_w = loss_fn.entropy_weight if entropy_manager else TRAIN_CONFIG.get('entropy_weight', 0.2)
-            base_msg += (f" | RL: {metrics['reinforce_loss']:.4f} | "
-                        f"Reward: {metrics['mean_reward']:.3f} | "
-                        f"Ent: {metrics.get('entropy', 0):.2f} | "
-                        f"EntW: {ent_w:.3f}")
+        # V12.40: Show [skip] for any skipped losses
+        rl_base_w = loss_skip_state.get('reinforce_loss', {}).get('base_weight', TRAIN_CONFIG.get('rl_weight', 0.0))
+        if TRAIN_CONFIG.get('rl_weight', 0.0) > 0 or rl_base_w > 0:
+            if 'reinforce_loss' in losses_skipped_this_epoch:
+                base_msg += " | RL: [skip]"
+            else:
+                ent_w = loss_fn.entropy_weight if entropy_manager else TRAIN_CONFIG.get('entropy_weight', 0.2)
+                base_msg += (f" | RL: {metrics['reinforce_loss']:.4f} | "
+                            f"Reward: {metrics['mean_reward']:.3f} | "
+                            f"Ent: {metrics.get('entropy', 0):.2f} | "
+                            f"EntW: {ent_w:.3f}")
+        # V12.40: Show skip summary if any non-RL losses were skipped
+        non_rl_skipped = losses_skipped_this_epoch - {'reinforce_loss'}
+        if non_rl_skipped:
+            base_msg += f" | Skip: {','.join(k.replace('_loss','') for k in sorted(non_rl_skipped))}"
 
         # V12.12: Add contrastive metrics if enabled
         if contrastive_loss_fn is not None:

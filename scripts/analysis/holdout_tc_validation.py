@@ -14,9 +14,11 @@ manipulating Z gives us formula + Tc + Magpie simultaneously.
 
 Usage:
     cd /home/james/superconductor-vae
-    PYTHONPATH=src python -u scratch/holdout_tc_validation.py
+    PYTHONPATH=src python -u scripts/analysis/holdout_tc_validation.py
+    PYTHONPATH=src python -u scripts/analysis/holdout_tc_validation.py --checkpoint outputs/best_checkpoints/checkpoint_best_V12.38_colab.pt
 """
 
+import argparse
 import json
 import sys
 import os
@@ -30,7 +32,7 @@ import torch
 import torch.nn.functional as F
 import numpy as np
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'src'))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / 'src'))
 
 from superconductor.models.attention_vae import FullMaterialsVAE
 from superconductor.models.autoregressive_decoder import (
@@ -39,11 +41,9 @@ from superconductor.models.autoregressive_decoder import (
 )
 from superconductor.data.canonical_ordering import CanonicalOrderer
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-CHECKPOINT_PATH = PROJECT_ROOT / 'outputs' / 'checkpoint_best.pt'
+PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent  # scripts/analysis/ -> scripts/ -> project root
 HOLDOUT_PATH = PROJECT_ROOT / 'data' / 'GENERATIVE_HOLDOUT_DO_NOT_TRAIN.json'
 CACHE_DIR = PROJECT_ROOT / 'data' / 'processed' / 'cache'
-OUTPUT_PATH = PROJECT_ROOT / 'scratch' / 'holdout_tc_validation_results.json'
 
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 _CANONICALIZER = CanonicalOrderer()
@@ -112,9 +112,9 @@ def element_similarity(gen_formula, target_formula):
     return 0.4 * jaccard + 0.6 * frac_sim
 
 
-def load_models():
-    print(f"Loading checkpoint: {CHECKPOINT_PATH}")
-    checkpoint = torch.load(CHECKPOINT_PATH, map_location=DEVICE, weights_only=False)
+def load_models(checkpoint_path):
+    print(f"Loading checkpoint: {checkpoint_path}")
+    checkpoint = torch.load(checkpoint_path, map_location=DEVICE, weights_only=False)
 
     enc_state_raw = checkpoint.get('encoder_state_dict', {})
     magpie_dim = 145
@@ -122,9 +122,12 @@ def load_models():
         if 'magpie_encoder' in k and k.endswith('.weight') and v.dim() == 2:
             magpie_dim = v.shape[1]
             break
-    print(f"  magpie_dim={magpie_dim}")
 
     enc_state = {k.replace('_orig_mod.', ''): v for k, v in enc_state_raw.items()}
+
+    # Detect V12.38+ numden_head
+    has_numden_head = any('numden_head.' in k for k in enc_state)
+
     encoder = FullMaterialsVAE(
         n_elements=118, element_embed_dim=128, n_attention_heads=8,
         magpie_dim=magpie_dim, fusion_dim=256, encoder_hidden=[512, 256],
@@ -142,20 +145,33 @@ def load_models():
 
     dec_state_raw = checkpoint.get('decoder_state_dict', {})
     dec_state = {k.replace('_orig_mod.', ''): v for k, v in dec_state_raw.items()}
+
+    # Detect stoich_input_dim from checkpoint weights
+    stoich_weight_key = 'stoich_to_memory.0.weight'
+    if stoich_weight_key in dec_state:
+        stoich_dim = dec_state[stoich_weight_key].shape[1]
+        if stoich_dim == 37:
+            max_elements = 12  # V12.38: 12*3+1=37
+        else:
+            max_elements = stoich_dim - 1  # Pre-V12.38: 12+1=13, so max_elements=12
+    else:
+        max_elements = 12
+
     decoder = EnhancedTransformerDecoder(
         latent_dim=2048, d_model=512, nhead=8, num_layers=12,
         dim_feedforward=2048, dropout=0.1, max_len=60,
         n_memory_tokens=16, encoder_skip_dim=256,
         use_skip_connection=True, use_stoich_conditioning=True,
-        max_elements=12, n_stoich_tokens=4,
+        max_elements=max_elements, n_stoich_tokens=4,
     ).to(DEVICE)
     decoder.load_state_dict(dec_state, strict=False)
 
     encoder.eval()
     decoder.eval()
     epoch = checkpoint.get('epoch', '?')
-    print(f"  Loaded epoch {epoch}")
-    return encoder, decoder, magpie_dim
+    print(f"  Loaded epoch {epoch}, magpie_dim={magpie_dim}, numden_head={has_numden_head}")
+    print(f"  Decoder stoich_input_dim={decoder.stoich_to_memory[0].in_features}")
+    return encoder, decoder, magpie_dim, has_numden_head
 
 
 def load_data(magpie_dim):
@@ -174,7 +190,7 @@ def load_data(magpie_dim):
 
 
 @torch.no_grad()
-def full_decode(encoder, decoder, z, temperature=0.01):
+def full_decode(encoder, decoder, z, has_numden_head=False, temperature=0.01):
     """Decode Z → formula + Tc + Magpie + stoichiometry (the full enchilada).
 
     Returns dict with all predictions the model makes from a Z vector.
@@ -189,16 +205,25 @@ def full_decode(encoder, decoder, z, temperature=0.01):
     magpie_pred = dec_out['magpie_pred'][0].cpu()
     tc_class_logits = dec_out.get('tc_class_logits', None)
 
-    # Stoichiometry prediction from Z
+    # V12.38: Assemble stoich_pred with numden conditioning
     fraction_output = encoder.fraction_head(z_dev)
-    stoich_pred = fraction_output[0].cpu()
+    fraction_pred = fraction_output[:, :encoder.max_elements]  # [batch, 12]
+    element_count_pred = fraction_output[:, -1]                # [batch]
+
+    if has_numden_head and hasattr(encoder, 'numden_head'):
+        numden_pred = encoder.numden_head(z_dev)  # [batch, 24]
+        stoich_pred = torch.cat([fraction_pred, numden_pred, element_count_pred.unsqueeze(-1)], dim=-1)
+    else:
+        stoich_pred = torch.cat([fraction_pred, element_count_pred.unsqueeze(-1)], dim=-1)
+
+    stoich_pred_cpu = stoich_pred[0].cpu()
 
     # Skip connection for formula decoder
     encoder_skip = dec_out['attended_input']
 
     # Formula generation
     generated, log_probs, entropy = decoder.generate_with_kv_cache(
-        z=z_dev, encoder_skip=encoder_skip, stoich_pred=fraction_output,
+        z=z_dev, encoder_skip=encoder_skip, stoich_pred=stoich_pred,
         temperature=temperature,
     )
     formula = tokens_to_formula(generated[0])
@@ -211,7 +236,7 @@ def full_decode(encoder, decoder, z, temperature=0.01):
         'tc_pred_norm': tc_pred,
         'tc_pred_kelvin': tc_kelvin,
         'magpie_pred': magpie_pred,
-        'stoich_pred': stoich_pred,
+        'stoich_pred': stoich_pred_cpu,
         'log_prob': log_probs[0].sum().item() if log_probs is not None else None,
     }
     if tc_class_logits is not None:
@@ -222,13 +247,31 @@ def full_decode(encoder, decoder, z, temperature=0.01):
 
 
 def main():
+    parser = argparse.ArgumentParser(description='Holdout Tc/Magpie Validation')
+    parser.add_argument('--checkpoint', type=str,
+                        default=str(PROJECT_ROOT / 'outputs' / 'checkpoint_best.pt'),
+                        help='Path to checkpoint file')
+    args = parser.parse_args()
+
+    checkpoint_path = Path(args.checkpoint)
+    if not checkpoint_path.is_absolute():
+        checkpoint_path = PROJECT_ROOT / checkpoint_path
+    if not checkpoint_path.exists():
+        print(f"ERROR: Checkpoint not found: {checkpoint_path}")
+        sys.exit(1)
+
+    # Output path named after checkpoint
+    ckpt_stem = checkpoint_path.stem
+    output_path = PROJECT_ROOT / 'outputs' / f'holdout_tc_validation_{ckpt_stem}.json'
+
     print("=" * 70)
     print("HOLDOUT FULL ENCHILADA VALIDATION")
     print("(Formula + Tc + Magpie from Z)")
     print("=" * 70)
     print(f"Device: {DEVICE}")
+    print(f"Checkpoint: {checkpoint_path}")
 
-    encoder, decoder, magpie_dim = load_models()
+    encoder, decoder, magpie_dim, has_numden_head = load_models(checkpoint_path)
     data = load_data(magpie_dim)
 
     with open(HOLDOUT_PATH) as f:
@@ -290,7 +333,7 @@ def main():
         z = enc_out['z']  # [1, 2048]
 
         # Decode EVERYTHING from Z
-        decoded = full_decode(encoder, decoder, z, temperature=0.01)
+        decoded = full_decode(encoder, decoder, z, has_numden_head=has_numden_head, temperature=0.01)
 
         # Compare
         pred_tc = decoded['tc_pred_kelvin']
@@ -395,7 +438,7 @@ def main():
             # Decode a couple to see formulas
             sample_formulas = []
             for zi in range(min(3, len(z_perturbed))):
-                decoded = full_decode(encoder, decoder, z_perturbed[zi:zi+1])
+                decoded = full_decode(encoder, decoder, z_perturbed[zi:zi+1], has_numden_head=has_numden_head)
                 sample_formulas.append(decoded['formula'])
 
             print(f"    noise={scale:.2f}: Tc={tc_mean:.1f}±{tc_std_val:.1f}K "
@@ -445,7 +488,7 @@ def main():
     # Save
     output = {
         'timestamp': time.strftime('%Y-%m-%dT%H:%M:%S'),
-        'checkpoint': str(CHECKPOINT_PATH),
+        'checkpoint': str(checkpoint_path),
         'roundtrip_results': results,
         'perturbation_results': perturbation_results,
         'summary': {
@@ -457,9 +500,9 @@ def main():
             'tc_class_accuracy': class_correct / class_total if class_total > 0 else None,
         }
     }
-    with open(OUTPUT_PATH, 'w') as f:
+    with open(output_path, 'w') as f:
         json.dump(output, f, indent=2, default=str)
-    print(f"\nResults saved to: {OUTPUT_PATH}")
+    print(f"\nResults saved to: {output_path}")
 
 
 if __name__ == '__main__':
