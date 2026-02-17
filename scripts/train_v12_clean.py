@@ -715,7 +715,10 @@ TRAIN_CONFIG = {
     'oversample_length_base': 15,         # Sequences > this get progressively upweighted
 
     # Intervention 4: Integer-to-fraction normalization
-    'normalize_integers_to_fractions': True,  # Convert integer subscripts to fraction format
+    # DISABLED: Integer subscripts like '13' are better as single concepts than
+    # digit-by-digit '1','3' — the stoich head already handles integer stoichiometry.
+    # Splitting integers into fraction digits would introduce new cascade error sources.
+    'normalize_integers_to_fractions': False,
 }
 
 CONTRASTIVE_DATA_PATH = PROJECT_ROOT / 'data/processed/supercon_fractions_contrastive.csv'
@@ -2439,7 +2442,8 @@ def save_checkpoint(encoder, decoder, epoch, suffix='', entropy_manager=None,
 # ============================================================================
 
 def cache_z_vectors(encoder, loader, device, epoch, cache_path, dataset_info=None,
-                    decoder=None, mode='z_only', manifest=None):
+                    decoder=None, mode='z_only', manifest=None,
+                    stop_boost=0.0, hard_stop_threshold=0.0):
     """
     Compute and cache latent z vectors and optionally decoder predictions.
 
@@ -2530,13 +2534,17 @@ def cache_z_vectors(encoder, loader, device, epoch, cache_path, dataset_info=Non
                 if include_log_probs:
                     gen_tokens, log_probs, _, _ = decoder.sample_for_reinforce(
                         z=z, encoder_skip=attended_input, temperature=0.0,  # Greedy
-                        max_len=tokens.size(1)
+                        max_len=tokens.size(1),
+                        stop_boost=stop_boost,  # V12.37: Was missing — caused 1.6% exact match
+                        hard_stop_threshold=hard_stop_threshold,
                     )
                     all_log_probs.append(log_probs.cpu())
                 else:
                     gen_tokens = decoder.generate_with_kv_cache(
                         z=z, encoder_skip=attended_input, temperature=0.0,
-                        max_len=tokens.size(1), return_log_probs=False, return_entropy=False
+                        max_len=tokens.size(1), return_log_probs=False, return_entropy=False,
+                        stop_boost=stop_boost,  # V12.37: Was missing — caused 1.6% exact match
+                        hard_stop_threshold=hard_stop_threshold,
                     )[0]
 
                 all_generated_tokens.append(gen_tokens.cpu())
@@ -4984,7 +4992,9 @@ def train():
                 z_cache_mode = TRAIN_CONFIG.get('z_cache_mode', 'z_only')
                 cache_z_vectors(encoder, train_loader, device, epoch, z_cache_path,
                                dataset_info=norm_stats, decoder=decoder, mode=z_cache_mode,
-                               manifest=_manifest)
+                               manifest=_manifest,
+                               stop_boost=TRAIN_CONFIG.get('stop_boost', 0.0),
+                               hard_stop_threshold=TRAIN_CONFIG.get('hard_stop_threshold', 0.0))
 
         # V12.17: Cache z-vectors at configured interval (or every epoch if configured)
         z_cache_interval = TRAIN_CONFIG.get('z_cache_interval', 0)
@@ -4998,7 +5008,9 @@ def train():
             epoch_cache_path = z_cache_path.with_stem(f"{z_cache_path.stem}_epoch{epoch:04d}")
             cache_z_vectors(encoder, train_loader, device, epoch, epoch_cache_path,
                            dataset_info=norm_stats, decoder=decoder, mode=z_cache_mode,
-                           manifest=_manifest)
+                           manifest=_manifest,
+                           stop_boost=TRAIN_CONFIG.get('stop_boost', 0.0),
+                           hard_stop_threshold=TRAIN_CONFIG.get('hard_stop_threshold', 0.0))
 
         if (epoch + 1) % TRAIN_CONFIG['checkpoint_interval'] == 0:
             save_checkpoint(encoder, decoder, epoch, **checkpoint_kwargs)
@@ -5013,7 +5025,9 @@ def train():
         final_cache_path = z_cache_path.with_stem(f"{z_cache_path.stem}_final")
         cache_z_vectors(encoder, train_loader, device, epoch, final_cache_path,
                        dataset_info=norm_stats, decoder=decoder, mode=z_cache_mode,
-                       manifest=_build_current_manifest())
+                       manifest=_build_current_manifest(),
+                       stop_boost=TRAIN_CONFIG.get('stop_boost', 0.0),
+                       hard_stop_threshold=TRAIN_CONFIG.get('hard_stop_threshold', 0.0))
 
     print(f"\nTraining complete. Best exact match: {best_exact*100:.1f}%")
 
