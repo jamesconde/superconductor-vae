@@ -4705,7 +4705,9 @@ def train():
             base_msg += f" | PhysZ: {metrics['physics_z_loss']:.4f} (w={effective_physics_z_weight:.2f})"
 
         # V12.32: Show family classification loss if enabled
-        if TRAIN_CONFIG.get('use_family_classifier', False) and metrics.get('family_loss', 0) > 0:
+        # V12.36 FIX: Always show when classifier is enabled (not gated on > 0)
+        # so we can detect if the loss is unexpectedly zero
+        if TRAIN_CONFIG.get('use_family_classifier', False):
             base_msg += f" | Fam: {metrics['family_loss']:.4f}"
 
         # V12.12: Show selective backprop stats
