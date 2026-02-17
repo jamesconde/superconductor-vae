@@ -352,6 +352,46 @@ MODEL_CONFIG = {
     'element_embed_dim': 128,
 }
 
+
+def build_family_lookup_tensors(device):
+    """V12.33: GPU tensors mapping 14-class family labels → hierarchical labels.
+
+    Returns:
+        fine_to_coarse: [14] mapping fine class → coarse class (7 classes, -1 for NOT_SC)
+        fine_to_cuprate_sub: [14] mapping fine class → cuprate sub-class (6 classes, -1 for non-cuprate)
+        fine_to_iron_sub: [14] mapping fine class → iron sub-class (2 classes, -1 for non-iron)
+    """
+    fine_to_coarse = torch.full((14,), -1, dtype=torch.long, device=device)
+    # class 0 (NOT_SC) → -1 (not used in coarse loss, filtered by sc_mask)
+    fine_to_coarse[1] = 0   # BCS_CONVENTIONAL
+    fine_to_coarse[2] = 1   # CUPRATE_YBCO
+    fine_to_coarse[3] = 1   # CUPRATE_LSCO
+    fine_to_coarse[4] = 1   # CUPRATE_BSCCO
+    fine_to_coarse[5] = 1   # CUPRATE_TBCCO
+    fine_to_coarse[6] = 1   # CUPRATE_HBCCO
+    fine_to_coarse[7] = 1   # CUPRATE_OTHER
+    fine_to_coarse[8] = 2   # IRON_PNICTIDE
+    fine_to_coarse[9] = 2   # IRON_CHALCOGENIDE
+    fine_to_coarse[10] = 3  # MGB2
+    fine_to_coarse[11] = 4  # HEAVY_FERMION
+    fine_to_coarse[12] = 5  # ORGANIC
+    fine_to_coarse[13] = 6  # OTHER_UNKNOWN
+
+    fine_to_cuprate_sub = torch.full((14,), -1, dtype=torch.long, device=device)
+    fine_to_cuprate_sub[2] = 0  # YBCO
+    fine_to_cuprate_sub[3] = 1  # LSCO
+    fine_to_cuprate_sub[4] = 2  # BSCCO
+    fine_to_cuprate_sub[5] = 3  # TBCCO
+    fine_to_cuprate_sub[6] = 4  # HBCCO
+    fine_to_cuprate_sub[7] = 5  # OTHER_CUPRATE
+
+    fine_to_iron_sub = torch.full((14,), -1, dtype=torch.long, device=device)
+    fine_to_iron_sub[8] = 0  # PNICTIDE
+    fine_to_iron_sub[9] = 1  # CHALCOGENIDE
+
+    return fine_to_coarse, fine_to_cuprate_sub, fine_to_iron_sub
+
+
 TRAIN_CONFIG = {
     'num_epochs': 4000,
     'learning_rate': 3e-5,      # Reduced for stable fine-tuning (was 1e-4)
@@ -580,8 +620,11 @@ TRAIN_CONFIG = {
     'theory_warmup_epochs': 50,            # V12.22: Ramp up over 50 epochs
     'theory_use_soft_constraints': True,   # V12.22: Soft quadratic penalties (no hard caps)
 
-    'use_family_classifier': True,         # V12.32: Family classification head (14 classes)
-    'family_classifier_weight': 0.5,       # V12.32: Weight for family cross-entropy loss
+    'use_family_classifier': True,          # V12.33: Hierarchical family classification
+    'family_classifier_weight': 0.5,        # V12.33: Master weight for combined hierarchical loss
+    'family_coarse_weight': 0.6,            # V12.33: Internal: 7-class coarse CE (SC only)
+    'family_cuprate_sub_weight': 0.3,       # V12.33: Internal: 6-class cuprate sub CE
+    'family_iron_sub_weight': 0.1,          # V12.33: Internal: 2-class iron sub CE
 
     # =========================================================================
     # V12.30: Stop-Prediction Head Settings
@@ -608,6 +651,47 @@ TRAIN_CONFIG = {
     'physics_z_direct_weight': 0.0,           # Direct supervision (placeholder)
     'physics_z_warmup_epochs': 20,            # Ramp up physics Z losses
     'physics_z_data_path': None,              # Path to optional physics data CSV
+
+    # =========================================================================
+    # V12.34: Error-Driven Training Refinements
+    # =========================================================================
+    # Based on error analysis of epochs 2764-2812 (noisy plateau at 60-65%
+    # exact match). Each signal is independently togglable. Addresses:
+    # sequence length, z-norm, element count, fraction representation,
+    # and late-position error cascade.
+    # =========================================================================
+
+    # A: Sequence-length weighted loss — longer seqs get higher loss weight
+    # (50% of errors occur in final third of sequences)
+    'use_length_weighting': True,
+    'length_weight_base': 15,     # Seqs <= this length get weight 1.0
+    'length_weight_alpha': 1.0,   # Scale: w = 1 + alpha * max(0, (len-base)/base)
+                                  # len=30: w=2.0, len=45: w=3.0
+
+    # B: Fraction canonicalization — GCD-reduce all fractions before tokenization
+    # Eliminates ambiguity when multiple equivalent representations exist
+    # (e.g., 6/10 -> 3/5 saves 2 tokens). Triggers automatic cache rebuild.
+    'use_canonical_fractions': True,
+
+    # C: Z-norm soft penalty — discourage extreme z_norms that decode poorly
+    # Q1 z_norm: 79% exact vs Q4: 43% exact (36pt gap)
+    'use_z_norm_penalty': True,
+    'z_norm_target': 22.0,        # Target z_norm (current mean). Penalty above this.
+    'z_norm_penalty_weight': 0.001, # Gentle — don't collapse latent space
+
+    # D: Element-count weighted loss — focus on complex multi-element formulas
+    # 4+ elements: 9-14 avg errors vs 3-4 for 2-3 elements
+    'use_element_count_weighting': True,
+    'element_count_base': 3,      # Formulas with <= 3 elements get weight 1.0
+    'element_count_beta': 0.5,    # Scale: w = 1 + beta * max(0, n_elem - base)
+                                  # n=5: w=2.0, n=7: w=3.0
+
+    # E: Position-dependent teacher forcing — more TF at start, less at end
+    # NOTE: Currently TF is always 1.0 (full teacher forcing), so this has
+    # no effect. Infrastructure is in place for when TF drops below 1.0.
+    'use_position_dependent_tf': True,
+    'tf_position_decay': 0.5,     # gamma: tf(pos) = base_tf * (1 + gamma*(1 - pos/L))
+                                  # Start of seq: 1.5x base TF, end: 1.0x base TF
 }
 
 CONTRASTIVE_DATA_PATH = PROJECT_ROOT / 'data/processed/supercon_fractions_contrastive.csv'
@@ -646,17 +730,22 @@ class FocalLossWithLabelSmoothing(nn.Module):
         self.smoothing = smoothing
         self.ignore_index = ignore_index
 
-    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor,
+                reduction: str = 'mean') -> torch.Tensor:
         """
         Args:
             logits: [batch*seq_len, vocab_size] or [batch, seq_len, vocab_size]
             targets: [batch*seq_len] or [batch, seq_len]
+            reduction: 'mean' (scalar, default) or 'per_sample' [batch] averages
+                       V12.34: per_sample mode enables length/element-count weighting
 
         Returns:
-            Scalar loss value
+            Scalar loss (reduction='mean') or [batch] per-sample loss (reduction='per_sample')
         """
-        # Flatten if needed
-        if logits.dim() == 3:
+        # Track original shape for per_sample reduction
+        orig_3d = logits.dim() == 3
+        if orig_3d:
+            batch_size, seq_len = logits.shape[0], logits.shape[1]
             logits = logits.reshape(-1, logits.size(-1))
             targets = targets.reshape(-1)
 
@@ -666,6 +755,8 @@ class FocalLossWithLabelSmoothing(nn.Module):
         valid_mask = (targets != self.ignore_index)
 
         if valid_mask.sum() == 0:
+            if reduction == 'per_sample' and orig_3d:
+                return torch.zeros(batch_size, device=logits.device, requires_grad=True)
             return torch.tensor(0.0, device=logits.device, requires_grad=True)
 
         # Get valid logits and targets
@@ -694,6 +785,16 @@ class FocalLossWithLabelSmoothing(nn.Module):
             )
         else:
             focal_loss = focal_weight * (-target_log_probs)
+
+        if reduction == 'per_sample' and orig_3d:
+            # V12.34: Scatter per-token losses back to [batch, seq_len] shape,
+            # then average per sample over valid tokens
+            per_token_loss = torch.zeros(batch_size * seq_len, device=logits.device)
+            per_token_loss[valid_mask] = focal_loss
+            per_token_loss = per_token_loss.view(batch_size, seq_len)
+            valid_per_sample = valid_mask.view(batch_size, seq_len).float()
+            per_sample_loss = per_token_loss.sum(dim=1) / valid_per_sample.sum(dim=1).clamp(min=1)
+            return per_sample_loss  # [batch]
 
         return focal_loss.mean()
 
@@ -820,6 +921,25 @@ def parse_fraction_formula(formula: str) -> Optional[Dict[str, float]]:
     return result if result else None
 
 
+def canonicalize_fractions(formula: str) -> str:
+    """Reduce all fractions in a formula to lowest terms via GCD.
+
+    V12.34: Eliminates ambiguous representations where the same stoichiometry
+    can be expressed as different fractions (e.g., 6/10 vs 3/5).
+
+    Examples:
+        'Ba(6/10)Sr(4/10)CuO3' -> 'Ba(3/5)Sr(2/5)CuO3'
+        'La(70/100)Ce(30/100)' -> 'La(7/10)Ce(3/10)'
+        'Ag(1/500)Al(499/500)' -> 'Ag(1/500)Al(499/500)'  (already reduced)
+    """
+    def reduce_match(m):
+        num, den = int(m.group(1)), int(m.group(2))
+        g = math.gcd(num, den)
+        return f"{num // g}/{den // g}"
+
+    return re.sub(r'(\d+)/(\d+)', reduce_match, formula)
+
+
 def load_holdout_indices(holdout_path: Path, formulas: list) -> set:
     """Load holdout sample indices by matching formulas (robust to row reordering).
 
@@ -891,6 +1011,11 @@ def _try_load_cache(csv_hash: str, max_formula_len: int):
         magpie_sc_only = TRAIN_CONFIG.get('magpie_sc_only_norm', False)
         if meta.get('magpie_sc_only_norm', False) != magpie_sc_only:
             print(f"  Cache stale: magpie_sc_only_norm changed ({meta.get('magpie_sc_only_norm', False)} → {magpie_sc_only})")
+            return None
+        # V12.34: Invalidate cache if fraction canonicalization setting changed
+        use_canonical = TRAIN_CONFIG.get('use_canonical_fractions', False)
+        if meta.get('use_canonical_fractions', False) != use_canonical:
+            print(f"  Cache stale: use_canonical_fractions changed ({meta.get('use_canonical_fractions', False)} → {use_canonical})")
             return None
 
         # Load tensors
@@ -964,6 +1089,8 @@ def _save_cache(tensors: dict, norm_stats: dict, n_magpie_cols: int,
         'magpie_skew_threshold': TRAIN_CONFIG.get('magpie_skew_threshold', 0.0),
         'magpie_sc_only_norm': norm_stats.get('magpie_sc_only_norm', False),
         'magpie_skewed_indices': norm_stats.get('magpie_skewed_indices', []),
+        # V12.34: Fraction canonicalization for cache invalidation
+        'use_canonical_fractions': TRAIN_CONFIG.get('use_canonical_fractions', False),
     }
     with open(cache_dir / 'cache_meta.json', 'w') as f:
         json.dump(meta, f)
@@ -1169,12 +1296,25 @@ def load_and_prepare_data():
         magpie_normalized = (magpie_data - magpie_mean) / magpie_std
 
         # Tokenize formulas
-        print("Tokenizing formulas...")
+        # V12.34: Optionally canonicalize fractions (GCD-reduce) before tokenization
+        use_canonical = TRAIN_CONFIG.get('use_canonical_fractions', False)
+        if use_canonical:
+            print("Tokenizing formulas (with fraction canonicalization)...")
+        else:
+            print("Tokenizing formulas...")
         all_tokens = []
+        n_canonicalized = 0
         for formula in formulas:
+            if use_canonical:
+                canon = canonicalize_fractions(formula)
+                if canon != formula:
+                    n_canonicalized += 1
+                formula = canon
             tokens = tokenize_formula(formula)
             indices = tokens_to_indices(tokens, max_len=max_len)
             all_tokens.append(indices)
+        if use_canonical:
+            print(f"  Canonicalized {n_canonicalized}/{len(formulas)} formulas")
         formula_tokens = torch.stack(all_tokens)
 
         # Parse element compositions
@@ -1413,6 +1553,9 @@ def create_models(magpie_dim: int, device: torch.device):
         dropout=0.1,
         # V12.8: Gradient checkpointing for memory optimization
         use_gradient_checkpointing=TRAIN_CONFIG.get('use_gradient_checkpointing', False),
+        # V12.34: Position-dependent teacher forcing (no effect at TF=1.0)
+        use_position_dependent_tf=TRAIN_CONFIG.get('use_position_dependent_tf', False),
+        tf_position_decay=TRAIN_CONFIG.get('tf_position_decay', 0.5),
     ).to(device)
 
     enc_params = sum(p.numel() for p in encoder.parameters())
@@ -1471,6 +1614,13 @@ class CombinedLossWithREINFORCE(nn.Module):
         tc_bin_weights: dict = None,          # V12.28: Per-bin Tc loss multipliers {threshold: weight}
         tc_class_weight: float = 0.0,         # V12.28: Tc bucket classification loss weight
         tc_class_bins: list = None,           # V12.28: Bin edges in Kelvin [0, 10, 50, 100]
+        # V12.34: Error-driven per-sample formula loss weighting
+        use_length_weighting: bool = False,   # A: Weight by sequence length
+        length_weight_base: float = 15.0,
+        length_weight_alpha: float = 1.0,
+        use_element_count_weighting: bool = False,  # D: Weight by element count
+        element_count_base: float = 3.0,
+        element_count_beta: float = 0.5,
     ):
         super().__init__()
 
@@ -1494,6 +1644,14 @@ class CombinedLossWithREINFORCE(nn.Module):
         self.tc_bin_weights = tc_bin_weights or {}             # V12.28
         self.tc_class_weight = tc_class_weight                # V12.28
         self.tc_class_bins = tc_class_bins or [0, 10, 50, 100]  # V12.28
+
+        # V12.34: Error-driven per-sample formula loss weighting
+        self.use_length_weighting = use_length_weighting
+        self.length_weight_base = length_weight_base
+        self.length_weight_alpha = length_weight_alpha
+        self.use_element_count_weighting = use_element_count_weighting
+        self.element_count_base = element_count_base
+        self.element_count_beta = element_count_beta
 
         # Autoregressive REINFORCE / SCST
         self.use_autoregressive_reinforce = use_autoregressive_reinforce
@@ -1860,6 +2018,8 @@ class CombinedLossWithREINFORCE(nn.Module):
         stoich_pred_for_reinforce: torch.Tensor = None,
         # V12.28: Tc classification
         tc_class_logits: torch.Tensor = None,
+        # V12.34: Element count for per-sample weighting (D)
+        n_elements: torch.Tensor = None,
     ) -> Dict[str, torch.Tensor]:
         """Compute combined loss with optional REINFORCE."""
 
@@ -1870,8 +2030,41 @@ class CombinedLossWithREINFORCE(nn.Module):
         tc_w = tc_weight_override if tc_weight_override is not None else self.tc_weight
         magpie_w = magpie_weight_override if magpie_weight_override is not None else self.magpie_weight
 
+        # V12.34: Check if per-sample weighting is needed (A or D)
+        need_per_sample = self.use_length_weighting or (self.use_element_count_weighting and n_elements is not None)
+
         # 1. Formula CE Loss
-        if self.use_focal_loss:
+        if need_per_sample:
+            # Per-sample path: get [batch] losses, apply A+D weights, then mean
+            if self.use_focal_loss:
+                targets_with_pad = formula_targets.clone()
+                targets_with_pad[~mask] = PAD_IDX
+                per_sample_loss = self.ce_loss(formula_logits, targets_with_pad, reduction='per_sample')
+            else:
+                logits_flat = formula_logits.contiguous().view(-1, vocab_size)
+                targets_flat = formula_targets.contiguous().view(-1)
+                ce_loss_per_token = self.ce_loss(logits_flat, targets_flat)
+                ce_loss_per_token = ce_loss_per_token.view(batch_size, seq_len)
+                per_sample_loss = (ce_loss_per_token * mask.float()).sum(dim=1) / mask.float().sum(dim=1).clamp(min=1)
+
+            # Compute combined sample weights
+            sample_weights = torch.ones(batch_size, device=formula_logits.device)
+
+            # A: Length weighting — longer sequences get higher weight
+            if self.use_length_weighting:
+                seq_lengths = mask.float().sum(dim=1)  # [batch]
+                sample_weights = sample_weights * (1.0 + self.length_weight_alpha * torch.clamp(
+                    (seq_lengths - self.length_weight_base) / self.length_weight_base, min=0.0
+                ))
+
+            # D: Element count weighting — more elements get higher weight
+            if self.use_element_count_weighting and n_elements is not None:
+                sample_weights = sample_weights * (1.0 + self.element_count_beta * torch.clamp(
+                    n_elements.float() - self.element_count_base, min=0.0
+                ))
+
+            formula_ce_loss = (per_sample_loss * sample_weights).mean()
+        elif self.use_focal_loss:
             targets_with_pad = formula_targets.clone()
             targets_with_pad[~mask] = PAD_IDX
             formula_ce_loss = self.ce_loss(formula_logits, targets_with_pad)
@@ -2021,6 +2214,18 @@ class CombinedLossWithREINFORCE(nn.Module):
             # Entropy bonus removed - now in REINFORCE reward signal
         )
 
+        # V12.34 C: Z-norm soft penalty — discourage extreme z_norms that decode poorly
+        # Only penalizes z_norms above the target (current mean ~22). Weight is gentle
+        # (0.001) to avoid collapsing the latent space; existing L2/kl_loss regularizes
+        # all dims uniformly, this targets the outlier norm specifically.
+        z_norm_penalty = torch.tensor(0.0, device=formula_logits.device)
+        if z is not None and TRAIN_CONFIG.get('use_z_norm_penalty', False):
+            z_norms = z.norm(dim=1)  # [batch]
+            z_norm_target = TRAIN_CONFIG['z_norm_target']
+            excess = torch.clamp(z_norms - z_norm_target, min=0.0)
+            z_norm_penalty = (excess ** 2).mean()
+            total = total + TRAIN_CONFIG.get('z_norm_penalty_weight', 0.001) * z_norm_penalty
+
         # Compute accuracy metrics
         predictions = formula_logits.argmax(dim=-1)
         correct = (predictions == formula_targets) & mask
@@ -2037,6 +2242,7 @@ class CombinedLossWithREINFORCE(nn.Module):
             'stoich_loss': stoich_loss,
             'kl_loss': kl_loss,
             'tc_class_loss': tc_class_loss,  # V12.28
+            'z_norm_penalty': z_norm_penalty,  # V12.34
             'entropy': entropy,
             'mean_reward': mean_rewards.mean() if torch.is_tensor(mean_rewards) else mean_rewards,
             'token_accuracy': token_accuracy,
@@ -2671,9 +2877,11 @@ def load_checkpoint(encoder, decoder, checkpoint_path, entropy_manager=None,
 
 @torch.no_grad()
 def evaluate_true_autoregressive(encoder, decoder, loader, device, max_samples=1000,
-                                  log_errors=True, epoch=None, stop_boost=0.0):
+                                  log_errors=True, epoch=None, stop_boost=0.0,
+                                  norm_stats=None):
     """
     V12.18: Enhanced evaluation with full Z-space diagnostics and reconstruction metrics.
+    V12.34: Added norm_stats for Tc denormalization (fixes Tc range analysis bug).
 
     Evaluates TRUE autoregressive exact match (no teacher forcing) AND captures
     per-sample Z norms, Tc/Magpie/stoichiometry reconstruction quality to correlate
@@ -2960,11 +3168,60 @@ def evaluate_true_autoregressive(encoder, decoder, loader, device, max_samples=1
                 }
 
     # Tc range analysis
+    # V12.34 FIX: Denormalize Tc values to Kelvin BEFORE bucketing.
+    # Previously all_tc_true_np contained NORMALIZED values (log1p + z-score),
+    # so comparing against Kelvin thresholds (10, 30, 77...) was a bug —
+    # nearly all samples fell into "0-10K" since normalized values are ~0-3.
+    if norm_stats is not None:
+        tc_std = norm_stats['tc_std']
+        tc_mean = norm_stats['tc_mean']
+        tc_log_transform = norm_stats.get('tc_log_transform', False)
+        # Denormalize true Tc to Kelvin
+        tc_denorm = all_tc_true_np * tc_std + tc_mean
+        if tc_log_transform:
+            tc_true_kelvin = np.expm1(tc_denorm)
+        else:
+            tc_true_kelvin = tc_denorm
+        tc_true_kelvin = np.clip(tc_true_kelvin, 0, None)
+        # Denormalize predicted Tc to Kelvin
+        tc_denorm_p = all_tc_pred_np * tc_std + tc_mean
+        if tc_log_transform:
+            tc_pred_kelvin = np.expm1(tc_denorm_p)
+        else:
+            tc_pred_kelvin = tc_denorm_p
+        tc_pred_kelvin = np.clip(tc_pred_kelvin, 0, None)
+        # Overall Kelvin-space metrics
+        z_diagnostics['tc_r2_kelvin'] = float(
+            1 - np.sum((tc_pred_kelvin - tc_true_kelvin)**2) /
+            max(np.sum((tc_true_kelvin - tc_true_kelvin.mean())**2), 1e-8))
+        z_diagnostics['tc_mae_kelvin_overall'] = float(np.abs(tc_pred_kelvin - tc_true_kelvin).mean())
+    else:
+        # Fallback: use normalized values (pre-V12.34 behavior, known bug)
+        tc_true_kelvin = all_tc_true_np
+        tc_pred_kelvin = all_tc_pred_np
+
     tc_ranges = [(0, 10, '0-10K'), (10, 30, '10-30K'), (30, 77, '30-77K'),
                  (77, 120, '77-120K'), (120, 200, '120-200K'), (200, float('inf'), '>200K')]
     for lo, hi, label in tc_ranges:
-        tc_mask = (all_tc_true_np >= lo) & (all_tc_true_np < hi)
-        if tc_mask.any():
+        tc_mask = (tc_true_kelvin >= lo) & (tc_true_kelvin < hi)
+        if tc_mask.any() and tc_mask.sum() >= 2:
+            pred_bin = tc_pred_kelvin[tc_mask]
+            true_bin = tc_true_kelvin[tc_mask]
+            ss_res = np.sum((pred_bin - true_bin) ** 2)
+            ss_tot = np.sum((true_bin - true_bin.mean()) ** 2)
+            bin_r2 = float(1 - ss_res / max(ss_tot, 1e-8))
+            bin_mae_kelvin = float(np.abs(pred_bin - true_bin).mean())
+            z_diagnostics['errors_by_tc_range'][label] = {
+                'n_samples': int(tc_mask.sum()),
+                'exact_pct': float((all_n_errors_np[tc_mask] == 0).mean() * 100),
+                'avg_errors': float(all_n_errors_np[tc_mask].mean()),
+                'avg_z_norm': float(all_z_norms_np[tc_mask].mean()),
+                'tc_r2': bin_r2,
+                'tc_mae_kelvin': bin_mae_kelvin,
+                'tc_max_error_kelvin': float(np.abs(pred_bin - true_bin).max()),
+            }
+        elif tc_mask.any():
+            # Only 1 sample — can't compute R², but still report basics
             z_diagnostics['errors_by_tc_range'][label] = {
                 'n_samples': int(tc_mask.sum()),
                 'exact_pct': float((all_n_errors_np[tc_mask] == 0).mean() * 100),
@@ -3044,7 +3301,7 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
                 enable_timing=True, hp_loss_weight=0.0, sc_loss_weight=0.0,
                 theory_loss_fn=None, theory_weight=0.0, norm_stats=None,
                 physics_z_loss_fn=None, physics_z_weight=1.0,
-                family_loss_weight=0.0):
+                family_loss_weight=0.0, family_lookup_tables=None):
     """Train for one epoch with curriculum weights and teacher forcing.
 
     V12.8: Added amp_dtype for configurable mixed precision (bfloat16/float16)
@@ -3057,7 +3314,7 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
     V12.21: Added sc_loss_weight for SC/non-SC classification head
     V12.22: Added theory_loss_fn, theory_weight, norm_stats for theory-guided consistency
     V12.31: Added physics_z_loss_fn, physics_z_weight for physics Z supervision
-    V12.32: Added family_loss_weight for family classification head (14 classes)
+    V12.33: Added family_loss_weight + family_lookup_tables for hierarchical family head
     """
     global _timing_stats
 
@@ -3226,12 +3483,46 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
                         sc_pred, is_sc.float(),
                     )
 
-            # V12.32: Family classification loss (ALL samples — class 0 = not SC)
+            # V12.33: Hierarchical family classification loss
             family_loss_val = torch.tensor(0.0, device=device)
             if family_loss_weight > 0 and TRAIN_CONFIG.get('use_family_classifier', False):
-                family_logits = encoder_out.get('family_logits')
-                if family_logits is not None and family_labels is not None:
-                    family_loss_val = F.cross_entropy(family_logits, family_labels)
+                coarse_logits = encoder_out.get('family_coarse_logits')
+                cuprate_sub_logits = encoder_out.get('family_cuprate_sub_logits')
+                iron_sub_logits = encoder_out.get('family_iron_sub_logits')
+
+                if coarse_logits is not None and family_labels is not None and family_lookup_tables is not None:
+                    fine_to_coarse_lut, fine_to_cuprate_sub_lut, fine_to_iron_sub_lut = family_lookup_tables
+                    coarse_labels = fine_to_coarse_lut[family_labels]
+                    cuprate_sub_labels = fine_to_cuprate_sub_lut[family_labels]
+                    iron_sub_labels = fine_to_iron_sub_lut[family_labels]
+
+                    # Level 1: Coarse family (SC samples with valid coarse labels only)
+                    # coarse_labels >= 0 guards against NOT_SC samples that may have
+                    # is_sc=True but family_label=0 (edge cases in dataset)
+                    coarse_loss = torch.tensor(0.0, device=device)
+                    coarse_valid = sc_mask & (coarse_labels >= 0)
+                    if coarse_valid.any():
+                        coarse_loss = F.cross_entropy(coarse_logits[coarse_valid], coarse_labels[coarse_valid])
+
+                    # Level 2a: Cuprate sub-family (cuprate samples only, 6 classes)
+                    cuprate_sub_loss = torch.tensor(0.0, device=device)
+                    cuprate_mask = (coarse_labels == 1) & sc_mask & (cuprate_sub_labels >= 0)
+                    if cuprate_mask.any():
+                        cuprate_sub_loss = F.cross_entropy(
+                            cuprate_sub_logits[cuprate_mask], cuprate_sub_labels[cuprate_mask])
+
+                    # Level 2b: Iron sub-family (iron samples only, 2 classes)
+                    iron_sub_loss = torch.tensor(0.0, device=device)
+                    iron_mask = (coarse_labels == 2) & sc_mask & (iron_sub_labels >= 0)
+                    if iron_mask.any():
+                        iron_sub_loss = F.cross_entropy(
+                            iron_sub_logits[iron_mask], iron_sub_labels[iron_mask])
+
+                    coarse_w = TRAIN_CONFIG.get('family_coarse_weight', 0.6)
+                    cuprate_w = TRAIN_CONFIG.get('family_cuprate_sub_weight', 0.3)
+                    iron_w = TRAIN_CONFIG.get('family_iron_sub_weight', 0.1)
+
+                    family_loss_val = coarse_w * coarse_loss + cuprate_w * cuprate_sub_loss + iron_w * iron_sub_loss
 
             # V12.22: Theory-guided consistency loss (SC samples only)
             theory_loss_val = torch.tensor(0.0, device=device)
@@ -3284,6 +3575,7 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
                     encoder_skip=attended_input,
                     stoich_pred_for_reinforce=stoich_pred,
                     tc_class_logits=tc_class_logits,  # V12.28
+                    n_elements=elem_mask.bool().sum(dim=1),  # V12.34
                 )
                 loss = (loss_dict['total'] + contrastive_weight * contrastive_loss_val
                         + hp_loss_weight * hp_loss_val
@@ -3313,6 +3605,7 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
                     encoder_skip=attended_input,
                     stoich_pred_for_reinforce=None,
                     tc_class_logits=tc_class_logits,  # V12.28
+                    n_elements=elem_mask.bool().sum(dim=1),  # V12.34
                 )
                 # Scale formula loss by non_sc_formula_weight
                 loss = (non_sc_formula_weight * loss_dict['total'] + contrastive_weight * contrastive_loss_val
@@ -3346,6 +3639,7 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
                     encoder_skip=attended_input[sc_mask],
                     stoich_pred_for_reinforce=stoich_pred[sc_mask] if stoich_pred is not None else None,
                     tc_class_logits=tc_class_logits[sc_mask] if tc_class_logits is not None else None,  # V12.28
+                    n_elements=elem_mask[sc_mask].bool().sum(dim=1),  # V12.34
                 )
 
                 # Non-SC portion: formula-only, lower weight
@@ -3367,6 +3661,7 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
                     encoder_skip=attended_input[~sc_mask],
                     stoich_pred_for_reinforce=None,
                     tc_class_logits=tc_class_logits[~sc_mask] if tc_class_logits is not None else None,  # V12.28
+                    n_elements=elem_mask[~sc_mask].bool().sum(dim=1),  # V12.34
                 )
 
                 # Weighted combination: SC at full weight, non-SC at reduced weight
@@ -3709,6 +4004,13 @@ def train():
         tc_bin_weights=TRAIN_CONFIG.get('tc_bin_weights', {}),
         tc_class_weight=TRAIN_CONFIG.get('tc_class_weight', 0.0),
         tc_class_bins=TRAIN_CONFIG.get('tc_class_bins', [0, 10, 50, 100]),
+        # V12.34: Error-driven per-sample formula loss weighting
+        use_length_weighting=TRAIN_CONFIG.get('use_length_weighting', False),
+        length_weight_base=TRAIN_CONFIG.get('length_weight_base', 15.0),
+        length_weight_alpha=TRAIN_CONFIG.get('length_weight_alpha', 1.0),
+        use_element_count_weighting=TRAIN_CONFIG.get('use_element_count_weighting', False),
+        element_count_base=TRAIN_CONFIG.get('element_count_base', 3.0),
+        element_count_beta=TRAIN_CONFIG.get('element_count_beta', 0.5),
     )
 
     # V12.9: Build or load draft model for speculative decoding
@@ -3982,7 +4284,10 @@ def train():
     print(f"  Stoich: {TRAIN_CONFIG['stoich_weight']}")
     print(f"  HP: {TRAIN_CONFIG.get('hp_loss_weight', 0)}")
     print(f"  SC: {TRAIN_CONFIG.get('sc_loss_weight', 0)}")
-    print(f"  Family: {TRAIN_CONFIG.get('family_classifier_weight', 0)}")  # V12.32
+    print(f"  Family: {TRAIN_CONFIG.get('family_classifier_weight', 0)} "  # V12.33
+          f"(coarse={TRAIN_CONFIG.get('family_coarse_weight', 0.6)}, "
+          f"cuprate={TRAIN_CONFIG.get('family_cuprate_sub_weight', 0.3)}, "
+          f"iron={TRAIN_CONFIG.get('family_iron_sub_weight', 0.1)})")
     if TRAIN_CONFIG.get('tc_kelvin_weighting', False):
         print(f"  Tc Kelvin weighting: scale={TRAIN_CONFIG['tc_kelvin_weight_scale']} "
               f"(3x at {2*TRAIN_CONFIG['tc_kelvin_weight_scale']:.0f}K)")
@@ -4116,6 +4421,11 @@ def train():
         decoder.train()
         print("  Warmup complete", flush=True)
 
+    # V12.33: Build family hierarchy lookup tables (once, on GPU)
+    family_lookup_tables = None
+    if TRAIN_CONFIG.get('use_family_classifier', False):
+        family_lookup_tables = build_family_lookup_tensors(device)
+
     # V12.11: Rollback loop detection
     rollback_count = 0
     max_rollbacks = 3  # Stop training if we hit this many rollbacks
@@ -4194,8 +4504,9 @@ def train():
             norm_stats=norm_stats,
             # V12.31: Physics Z supervision
             physics_z_loss_fn=physics_z_loss_fn,
-            # V12.32: Family classification
+            # V12.33: Hierarchical family classification
             family_loss_weight=TRAIN_CONFIG.get('family_classifier_weight', 0.0),
+            family_lookup_tables=family_lookup_tables,
             physics_z_weight=effective_physics_z_weight,
         )
 
@@ -4367,6 +4678,7 @@ def train():
                 encoder, decoder, train_loader, device, max_samples=eval_max,
                 log_errors=True, epoch=epoch,
                 stop_boost=TRAIN_CONFIG.get('stop_boost', 0.0),  # V12.30
+                norm_stats=norm_stats,  # V12.34: Fix Tc range denormalization
             )
             err_dist = true_eval['error_distribution']
             scope = "FULL DATASET" if is_final_epoch else f"{eval_max} samples"

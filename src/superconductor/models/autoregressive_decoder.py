@@ -1328,6 +1328,11 @@ class EnhancedTransformerDecoder(nn.Module):
         n_stoich_tokens: int = 4,  # Number of stoichiometry memory tokens
         # V12.8: Gradient checkpointing for memory optimization
         use_gradient_checkpointing: bool = False,
+        # V12.34: Position-dependent teacher forcing
+        # When TF < 1.0, applies more TF at start of sequence, less at end.
+        # No effect when TF = 1.0 (full teacher forcing).
+        use_position_dependent_tf: bool = False,
+        tf_position_decay: float = 0.5,
     ):
         super().__init__()
 
@@ -1342,6 +1347,8 @@ class EnhancedTransformerDecoder(nn.Module):
         self.use_stoich_conditioning = use_stoich_conditioning
         self.max_elements = max_elements
         self.use_gradient_checkpointing = use_gradient_checkpointing
+        self.use_position_dependent_tf = use_position_dependent_tf
+        self.tf_position_decay = tf_position_decay
 
         # Token embedding
         self.token_embedding = nn.Embedding(
@@ -1626,7 +1633,17 @@ class EnhancedTransformerDecoder(nn.Module):
 
         # ==== Mix predicted tokens with ground truth ====
         # For each position, use ground truth with probability TF, prediction with (1-TF)
-        use_gt_mask = (torch.rand(batch_size, seq_len, device=device) < teacher_forcing_ratio)
+        # V12.34: Position-dependent TF — more TF at start, less at end.
+        # tf(pos) = base_tf * (1 + gamma * (1 - pos/L)), clamped to [0, 1]
+        if self.use_position_dependent_tf and teacher_forcing_ratio < 1.0:
+            positions = torch.arange(seq_len, device=device).float() / max(seq_len - 1, 1)
+            tf_per_position = teacher_forcing_ratio * (
+                1.0 + self.tf_position_decay * (1.0 - positions)
+            )
+            tf_per_position = tf_per_position.clamp(0.0, 1.0)
+            use_gt_mask = (torch.rand(batch_size, seq_len, device=device) < tf_per_position.unsqueeze(0))
+        else:
+            use_gt_mask = (torch.rand(batch_size, seq_len, device=device) < teacher_forcing_ratio)
 
         # Target for position t is at target_tokens[:, t+1] (shifted by 1)
         gt_next_tokens = target_tokens[:, 1:]  # Ground truth targets

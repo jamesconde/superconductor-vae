@@ -4,43 +4,188 @@ Chronological record of training runs, architecture changes, and optimization de
 
 ---
 
-## V12.32: Family Classification Head (2026-02-16)
+## V12.34: Error-Driven Training Refinements A-E + Tc Range Fix (2026-02-16)
 
 ### Problem
 
-The model can classify SC vs non-SC (`sc_head`) and bucket Tc into 5 ranges (`tc_class_head`), but cannot predict which family/class of superconductor a sample belongs to (cuprate, iron-based, BCS conventional, etc.). The infrastructure existed (`SuperconductorFamily` enum, `family_tensor` in dataset at batch index 9, config flags) but the head was never wired into `FullMaterialsVAE`.
+Error analysis of epochs 2764-2812 reveals the model is in a noisy plateau at 60-65% exact match. The bottleneck is the autoregressive decoder, not the latent representation. Five specific error drivers identified:
+
+1. **Sequence length** (r=0.342) -- 50% of errors in final third of sequences
+2. **Z-norm** (r=0.236) -- Q1: 79% exact vs Q4: 43% exact (36pt gap)
+3. **Element count** -- 4+ elements: 9-14 avg errors vs 3-4 for 2-3 elements
+4. **Fraction representation** -- denominator drift, model biases toward "common" denoms
+5. **Error cascade** -- late-position errors compound, causing truncation/overgeneration
+
+Additionally, the Tc range analysis in error reports had a **bug** (comparing normalized values against Kelvin thresholds).
 
 ### Changes
 
 **Modified Files:**
-- `src/superconductor/models/attention_vae.py` -- Added `family_head` (512->256->14), updated `decode()` and `forward()` return dicts
-- `scripts/train_v12_clean.py` -- Enabled config (`use_family_classifier: True`, weight=0.5), added `family_loss_weight` param to `train_epoch()`, cross-entropy loss computation on ALL samples, loss aggregation in all 3 batch-type branches, accumulator, metrics, epoch summary logging
+- `scripts/train_v12_clean.py` -- TRAIN_CONFIG entries (A-E), `canonicalize_fractions()`, `FocalLossWithLabelSmoothing` per-sample reduction, `CombinedLossWithREINFORCE` A/D weighting + C z-norm penalty, Tc range denormalization fix, `evaluate_true_autoregressive()` gets `norm_stats` param
+- `src/superconductor/models/autoregressive_decoder.py` -- `EnhancedTransformerDecoder` position-dependent TF params + use_gt_mask logic
+- `scratch/analyze_error_reports.py` -- Added `analyze_tc_ranges()`, updated trends with Kelvin R², updated summary
+- `docs/TRAINING_RECORDS.md` -- This entry
+
+### Refinement Details
+
+#### A: Sequence-Length Weighted Loss
+- Longer sequences (>15 tokens) get higher formula loss weight
+- `w = 1 + alpha * max(0, (len - base) / base)` where base=15, alpha=1.0
+- len=30 -> w=2.0, len=45 -> w=3.0
+- Targets: 50% of errors concentrated in long sequences
+- Config: `use_length_weighting`, `length_weight_base`, `length_weight_alpha`
+
+#### B: Fraction Canonicalization
+- GCD-reduces all fractions before tokenization (e.g., 6/10 -> 3/5)
+- Eliminates ambiguity when multiple equivalent representations exist
+- Some formulas get shorter token sequences
+- Triggers automatic cache rebuild via `use_canonical_fractions` in cache metadata
+- Config: `use_canonical_fractions`
+
+#### C: Z-Norm Soft Penalty
+- Soft barrier on z-norms above target (current mean ~22)
+- Penalty: `0.001 * mean(clamp(||z|| - 22, min=0)^2)`
+- No effect on z-norms below target; only penalizes Q3-Q4 outliers
+- Complements existing L2/kl_loss (which regularizes all dims uniformly)
+- Config: `use_z_norm_penalty`, `z_norm_target`, `z_norm_penalty_weight`
+
+#### D: Element-Count Weighted Loss
+- Formulas with more elements get higher formula loss weight
+- `w = 1 + beta * max(0, n_elem - base)` where base=3, beta=0.5
+- n=5 -> w=2.0, n=7 -> w=3.0
+- Combined with A (multiplicative) in per-sample formula loss
+- Config: `use_element_count_weighting`, `element_count_base`, `element_count_beta`
+
+#### E: Position-Dependent Teacher Forcing (Infrastructure Only)
+- When TF < 1.0: `tf(pos) = base_tf * (1 + gamma * (1 - pos/L))`
+- Start of sequence gets higher TF, end gets lower TF
+- **Currently has no effect**: TF is always 1.0 (full teacher forcing)
+- Infrastructure ready for when TF is reduced
+- Config: `use_position_dependent_tf`, `tf_position_decay`
+
+#### F: Tc Range Analysis Bug Fix
+- **Bug**: `all_tc_true_np` contained normalized values (log1p + z-score), but Tc range buckets compared against Kelvin thresholds (10, 30, 77...). Only "0-10K" ever matched.
+- **Fix**: Denormalize to Kelvin before bucketing. Added `norm_stats` parameter to `evaluate_true_autoregressive()`.
+- Added per-range R², MAE (Kelvin), and max error to each Tc bucket
+- Added overall `tc_r2_kelvin` and `tc_mae_kelvin_overall` to z_diagnostics
+
+### New TRAIN_CONFIG Keys
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `use_length_weighting` | `True` | A: Enable seq-length weighted formula loss |
+| `length_weight_base` | `15` | A: Seqs <= this get weight 1.0 |
+| `length_weight_alpha` | `1.0` | A: Scale factor for length weight |
+| `use_canonical_fractions` | `True` | B: GCD-reduce fractions before tokenization |
+| `use_z_norm_penalty` | `True` | C: Penalize extreme z-norms |
+| `z_norm_target` | `22.0` | C: Z-norm threshold (current mean) |
+| `z_norm_penalty_weight` | `0.001` | C: Penalty weight (gentle) |
+| `use_element_count_weighting` | `True` | D: Enable element-count weighted loss |
+| `element_count_base` | `3` | D: Formulas <= this get weight 1.0 |
+| `element_count_beta` | `0.5` | D: Scale factor for element count weight |
+| `use_position_dependent_tf` | `True` | E: Position-dependent TF (no effect at TF=1.0) |
+| `tf_position_decay` | `0.5` | E: Decay gamma for position TF |
+
+### Disabling Individual Features
+
+All features are independently togglable. To disable any single feature, set its `use_*` key to `False`:
+```python
+'use_length_weighting': False,     # Disable A
+'use_canonical_fractions': False,  # Disable B (triggers cache rebuild)
+'use_z_norm_penalty': False,       # Disable C
+'use_element_count_weighting': False,  # Disable D
+'use_position_dependent_tf': False,    # Disable E
+```
+
+### Overhead
+
+Total compute overhead: <0.5% of epoch time. No memory overhead. Fraction canonicalization triggers a one-time cache rebuild (~2 min).
+
+---
+
+## V12.33: Hierarchical Family Classification Head (2026-02-16)
+
+### Problem
+
+V12.32's flat 14-class `family_head` had structural issues:
+1. **NOT_SC dominates**: ~23K non-SC samples (50%) compete in the same softmax as 13 SC families
+2. **No hierarchy**: YBCO-vs-LSCO (both cuprates) gets the same penalty as YBCO-vs-NOT_SC
+3. **No conditioning on sc_head**: Family and SC predictions are independent (can predict "CUPRATE_YBCO" while also predicting "not superconductor")
+4. **Rare class suppression**: ORGANIC, HEAVY_FERMION (<100 samples) swamped in 14-way softmax
+
+### Changes
+
+**Modified Files:**
+- `src/superconductor/models/attention_vae.py` -- Added `HierarchicalFamilyHead` class, replaced `family_head` with `hierarchical_family_head`, updated `decode()` to expose `backbone_h` and remove `family_logits`, updated `forward()` to call hierarchical head conditioned on `sc_pred.detach()`
+- `scripts/train_v12_clean.py` -- Added `build_family_lookup_tensors()` helper, updated config with internal weights, replaced flat CE with 3-level hierarchical loss, added `family_lookup_tables` parameter to `train_epoch()`
 - `docs/TRAINING_RECORDS.md` -- This entry
 
 ### Architecture
 
-`family_head` reads from the shared decoder backbone (512-dim), matching the `tc_class_head` pattern:
+Replaced flat `family_head` with `HierarchicalFamilyHead` — a 3-level tree conditioned on `sc_pred`:
 ```
-decoder_backbone(z) → h [512] → family_head → [14] logits
+P(NOT_SC)   = 1 - P(SC)                                    ← from sc_head
+P(BCS)      = P(SC) × P(BCS|SC)                            ← coarse head (7 classes)
+P(YBCO)     = P(SC) × P(Cuprate|SC) × P(YBCO|Cuprate)     ← coarse × cuprate sub-head
+P(PNICTIDE) = P(SC) × P(Iron|SC) × P(Pnictide|Iron)       ← coarse × iron sub-head
 ```
 
-14 classes from `SuperconductorFamily` enum:
-- 0: NOT_SUPERCONDUCTOR, 1: BCS_CONVENTIONAL, 2-7: CUPRATE variants (YBCO, LSCO, BSCCO, TBCCO, HBCCO, OTHER), 8-9: IRON (pnictide, chalcogenide), 10: MGB2_TYPE, 11: HEAVY_FERMION, 12: ORGANIC, 13: OTHER_UNKNOWN
+Each head receives `h(512) + sc_prob(1)` as input (backbone output concatenated with sigmoid of detached sc_pred logit).
+
+```
+Level 1 — Coarse (7 classes, SC samples only):
+  0: BCS_CONVENTIONAL, 1: CUPRATE, 2: IRON, 3: MGB2, 4: HEAVY_FERMION, 5: ORGANIC, 6: OTHER_UNKNOWN
+
+Level 2a — Cuprate sub-family (6 classes):
+  0: YBCO, 1: LSCO, 2: BSCCO, 3: TBCCO, 4: HBCCO, 5: OTHER
+
+Level 2b — Iron sub-family (2 classes):
+  0: PNICTIDE, 1: CHALCOGENIDE
+```
 
 ### Loss
 
-Cross-entropy on ALL samples (non-SC = class 0). Weight = 0.5 (matches `sc_loss_weight`).
+Separate CE at each level on appropriate subsets:
+- Coarse: all SC samples (7-class)
+- Cuprate sub: cuprate samples only (6-class)
+- Iron sub: iron samples only (2-class)
 
-### Checkpoint Compatibility
+Internal weights: coarse 0.6, cuprate 0.3, iron 0.1. Master weight 0.5.
 
-New `family_head` parameters initialize randomly when loading old checkpoints (`strict=False` in `load_state_dict`). They train from scratch while other heads continue from their saved state.
+### Design Decisions
+
+| Decision | Choice | Rationale |
+|----------|--------|-----------|
+| SC conditioning | `sc_pred.detach()` | Prevents gradient entanglement with sc_head |
+| Gating | Soft (multiply by P(SC)) | Preserves differentiability |
+| NOT_SC handling | `1 - P(SC)`, not in softmax | NOT_SC is fundamentally different from "which family" |
+| Loss structure | Separate CE per level | No gradient from irrelevant samples |
 
 ### Parameters
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `use_family_classifier` | True | Enable family classification head |
-| `family_classifier_weight` | 0.5 | Weight for family cross-entropy loss |
+| `use_family_classifier` | True | Enable hierarchical family head |
+| `family_classifier_weight` | 0.5 | Master weight for combined hierarchical loss |
+| `family_coarse_weight` | 0.6 | Internal: 7-class coarse CE weight |
+| `family_cuprate_sub_weight` | 0.3 | Internal: 6-class cuprate sub CE weight |
+| `family_iron_sub_weight` | 0.1 | Internal: 2-class iron sub CE weight |
+
+### Checkpoint Compatibility
+
+Old `family_head` parameters are ignored (absent in new model). New `hierarchical_family_head` initializes randomly when loading old checkpoints (`strict=False`).
+
+### Parameter Count
+
+~272K parameters (was ~135K for flat head) — negligible vs ~30M total model.
+
+---
+
+## V12.32: Family Classification Head (2026-02-16)
+
+*Superseded by V12.33 (hierarchical family head).*
+
+Introduced flat 14-class `family_head` from decoder backbone. Replaced in V12.33 with `HierarchicalFamilyHead` to address NOT_SC dominance, lack of hierarchy, and no sc_head conditioning.
 
 ---
 
