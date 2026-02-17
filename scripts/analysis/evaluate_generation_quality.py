@@ -31,7 +31,7 @@ import torch
 import torch.nn.functional as F
 import numpy as np
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'src'))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / 'src'))
 
 from superconductor.models.attention_vae import FullMaterialsVAE
 from superconductor.models.autoregressive_decoder import (
@@ -40,7 +40,7 @@ from superconductor.models.autoregressive_decoder import (
 )
 from superconductor.data.canonical_ordering import CanonicalOrderer
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
+PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent  # scripts/analysis/ -> scripts/ -> project root
 CACHE_DIR = PROJECT_ROOT / 'data' / 'processed' / 'cache'
 
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -247,10 +247,10 @@ def full_enchilada_batch(encoder, decoder, data, indices, has_numden_head, tempe
         encoder_skip = dec_out['attended_input']
 
         # V12.38: Assemble stoich_pred with numden conditioning
-        fraction_pred = encoder.fraction_head(z)
-        element_count_pred = dec_out.get('element_count_pred')
-        if element_count_pred is None:
-            element_count_pred = encoder.element_count_head(z).squeeze(-1)
+        # fraction_head outputs [batch, max_elements+1] where last dim is element count
+        fraction_output = encoder.fraction_head(z)
+        fraction_pred = fraction_output[:, :encoder.max_elements]  # [batch, 12]
+        element_count_pred = fraction_output[:, -1]                # [batch]
 
         if has_numden_head and hasattr(encoder, 'numden_head'):
             numden_pred = encoder.numden_head(z)  # [batch, 24]
