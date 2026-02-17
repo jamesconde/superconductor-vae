@@ -2886,10 +2886,11 @@ def load_checkpoint(encoder, decoder, checkpoint_path, entropy_manager=None,
 @torch.no_grad()
 def evaluate_true_autoregressive(encoder, decoder, loader, device, max_samples=1000,
                                   log_errors=True, epoch=None, stop_boost=0.0,
-                                  norm_stats=None):
+                                  norm_stats=None, family_lookup_tables=None):
     """
     V12.18: Enhanced evaluation with full Z-space diagnostics and reconstruction metrics.
     V12.34: Added norm_stats for Tc denormalization (fixes Tc range analysis bug).
+    V12.36: Added family_lookup_tables for family prediction tracking in error reports.
 
     Evaluates TRUE autoregressive exact match (no teacher forcing) AND captures
     per-sample Z norms, Tc/Magpie/stoichiometry reconstruction quality to correlate
@@ -2903,6 +2904,8 @@ def evaluate_true_autoregressive(encoder, decoder, loader, device, max_samples=1
         max_samples: Maximum samples to evaluate (for speed)
         log_errors: Whether to log errors to file (default True)
         epoch: Current epoch number for error log filename
+        family_lookup_tables: Optional tuple of (fine_to_coarse, fine_to_cuprate_sub,
+            fine_to_iron_sub) GPU tensors for family prediction (V12.36)
 
     Returns:
         dict with true_exact_match, sample statistics, and Z diagnostics
@@ -2936,6 +2939,16 @@ def evaluate_true_autoregressive(encoder, decoder, loader, device, max_samples=1
     block_ranges = PhysicsZ.get_block_ranges()  # dict of name -> (start, end)
     all_z_block_norms = {name: [] for name in block_ranges}  # Per-sample per-block L2 norms
 
+    # V12.36: Family prediction tracking
+    COARSE_NAMES = ['BCS', 'Cuprate', 'Iron', 'MgB2', 'HeavyFermion', 'Organic', 'Other']
+    FINE_NAMES = ['NOT_SC', 'BCS_CONV', 'CUP_YBCO', 'CUP_LSCO', 'CUP_BSCCO',
+                  'CUP_TBCCO', 'CUP_HBCCO', 'CUP_OTHER', 'IRON_PNIC', 'IRON_CHALC',
+                  'MGB2', 'HEAVY_FERM', 'ORGANIC', 'OTHER']
+    all_family_true = []        # Per-sample true fine family label (0-13)
+    all_family_coarse_pred = [] # Per-sample predicted coarse family (0-6)
+    all_family_coarse_true = [] # Per-sample true coarse family (0-6, -1 for non-SC)
+    has_family = family_lookup_tables is not None
+
     for batch in loader:
         if max_samples > 0 and total_samples >= max_samples:
             break
@@ -2945,6 +2958,8 @@ def evaluate_true_autoregressive(encoder, decoder, loader, device, max_samples=1
         elem_idx, elem_frac, elem_mask, formula_tokens, tc, magpie = batch_tensors[:6]
         # Get is_sc flag if available (for error analysis)
         is_sc = batch_tensors[6] if len(batch_tensors) > 6 else None
+        # V12.36: Get family labels if available (index 9)
+        family_labels_batch = batch_tensors[9] if len(batch_tensors) > 9 else None
 
         batch_size = formula_tokens.size(0)
 
@@ -2995,6 +3010,22 @@ def evaluate_true_autoregressive(encoder, decoder, loader, device, max_samples=1
             all_z_block_norms[block_name].extend(block_norms.cpu().tolist())
         if is_sc is not None:
             all_is_sc.extend(is_sc.cpu().tolist())
+
+        # V12.36: Collect family predictions and true labels
+        if has_family and family_labels_batch is not None:
+            fine_to_coarse = family_lookup_tables[0]
+            coarse_logits = encoder_out.get('family_coarse_logits')
+            # True labels
+            all_family_true.extend(family_labels_batch.cpu().tolist())
+            # Coarse true (map fine -> coarse, -1 for non-SC)
+            coarse_true = fine_to_coarse[family_labels_batch]  # [B]
+            all_family_coarse_true.extend(coarse_true.cpu().tolist())
+            # Coarse predicted (argmax of logits)
+            if coarse_logits is not None:
+                coarse_pred = coarse_logits.argmax(dim=-1)  # [B]
+                all_family_coarse_pred.extend(coarse_pred.cpu().tolist())
+            else:
+                all_family_coarse_pred.extend([-1] * batch_size)
 
         # Generate autoregressively (TRUE inference - no teacher forcing)
         generated_tokens, _, _ = decoder.generate_with_kv_cache(
@@ -3078,6 +3109,11 @@ def evaluate_true_autoregressive(encoder, decoder, loader, device, max_samples=1
                     # V12.35: Per-block Z norms for physics coordinate diagnostics
                     'z_block_norms': {name: round(all_z_block_norms[name][sample_global_idx], 4)
                                       for name in block_ranges},
+                    # V12.36: Family prediction diagnostics
+                    'family_true': FINE_NAMES[all_family_true[sample_global_idx]] if all_family_true else None,
+                    'family_coarse_true': COARSE_NAMES[all_family_coarse_true[sample_global_idx]] if all_family_coarse_true and all_family_coarse_true[sample_global_idx] >= 0 else None,
+                    'family_coarse_pred': COARSE_NAMES[all_family_coarse_pred[sample_global_idx]] if all_family_coarse_pred and all_family_coarse_pred[sample_global_idx] >= 0 else None,
+                    'family_correct': (all_family_coarse_pred[sample_global_idx] == all_family_coarse_true[sample_global_idx]) if all_family_coarse_pred and all_family_coarse_true and all_family_coarse_true[sample_global_idx] >= 0 else None,
                 })
 
         total_samples += batch_size
@@ -3298,6 +3334,42 @@ def evaluate_true_autoregressive(encoder, decoder, loader, device, max_samples=1
         {'block': name, 'corr': round(corr, 4)} for name, corr in block_corr_ranked
     ]
 
+    # V12.36: Family prediction diagnostics (aggregate)
+    if all_family_coarse_true and all_family_coarse_pred:
+        fam_true_np = np.array(all_family_coarse_true[:total_samples])
+        fam_pred_np = np.array(all_family_coarse_pred[:total_samples])
+
+        # Overall coarse accuracy (SC samples only, where coarse_true >= 0)
+        sc_fam_mask = fam_true_np >= 0
+        if sc_fam_mask.any():
+            fam_correct = (fam_pred_np[sc_fam_mask] == fam_true_np[sc_fam_mask])
+            fam_accuracy = float(fam_correct.mean())
+
+            # Per-family accuracy and error rates
+            errors_by_family = {}
+            for ci, cname in enumerate(COARSE_NAMES):
+                cmask = fam_true_np == ci
+                if cmask.any():
+                    fam_acc = float((fam_pred_np[cmask] == ci).mean())
+                    fam_exact = float((all_n_errors_np[cmask] == 0).mean() * 100)
+                    fam_avg_err = float(all_n_errors_np[cmask].mean())
+                    errors_by_family[cname] = {
+                        'n_samples': int(cmask.sum()),
+                        'family_accuracy': round(fam_acc, 4),
+                        'formula_exact_pct': round(fam_exact, 2),
+                        'avg_formula_errors': round(fam_avg_err, 2),
+                    }
+
+            # Correlation: family misclassification vs formula errors (SC only)
+            fam_wrong = (~fam_correct).astype(float)
+            corr_fam_vs_errors = safe_corrcoef(fam_wrong, all_n_errors_np[sc_fam_mask])
+
+            z_diagnostics['family_diagnostics'] = {
+                'coarse_accuracy': round(fam_accuracy, 4),
+                'corr_family_wrong_vs_formula_errors': round(corr_fam_vs_errors, 4),
+                'errors_by_family': errors_by_family,
+            }
+
     # V12.18: Print Z diagnostic summary to console
     zd = z_diagnostics
     z_exact = zd['z_norm_exact']
@@ -3314,6 +3386,12 @@ def evaluate_true_autoregressive(encoder, decoder, loader, device, max_samples=1
     if top_blocks:
         parts = [f"{b['block']}={b['corr']:.3f}" for b in top_blocks]
         print(f"  Z-blocks (top corr→err): {' | '.join(parts)}")
+
+    # V12.36: Print family diagnostics summary
+    fam_diag = zd.get('family_diagnostics')
+    if fam_diag:
+        print(f"  Family: coarse_acc={fam_diag['coarse_accuracy']:.1%} | "
+              f"fam_wrong→err corr={fam_diag['corr_family_wrong_vs_formula_errors']:.3f}")
 
     # V12.15: Write error log to file (V12.18: enriched with Z diagnostics)
     if log_errors:
@@ -4747,6 +4825,7 @@ def train():
                 log_errors=True, epoch=epoch,
                 stop_boost=TRAIN_CONFIG.get('stop_boost', 0.0),  # V12.30
                 norm_stats=norm_stats,  # V12.34: Fix Tc range denormalization
+                family_lookup_tables=family_lookup_tables,  # V12.36: Family diagnostics
             )
             err_dist = true_eval['error_distribution']
             scope = "FULL DATASET" if is_final_epoch else f"{eval_max} samples"

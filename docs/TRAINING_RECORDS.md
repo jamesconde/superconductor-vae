@@ -4,6 +4,50 @@ Chronological record of training runs, architecture changes, and optimization de
 
 ---
 
+## V12.36b: Family Prediction Diagnostics in Error Reports (2026-02-16)
+
+### Problem
+
+Family classification loss was being computed during training (coarse family head), but the error reports contained zero family data — no per-sample family labels, no per-family accuracy breakdown, no correlation between family misclassification and formula errors. This made it impossible to diagnose whether certain superconductor families decode worse than others.
+
+### Changes
+
+**Modified Files:**
+- `scripts/train_v12_clean.py` — Updated `evaluate_true_autoregressive()` to collect family predictions and add them to error reports
+- `scratch/analyze_error_reports.py` — Added `analyze_family_diagnostics()` function
+
+### What's Saved
+
+**Per failed sample** (`error_records[i]`):
+```json
+"family_true": "CUP_YBCO",           // Fine label (14 classes)
+"family_coarse_true": "Cuprate",      // Coarse label (7 classes)
+"family_coarse_pred": "Cuprate",      // Model's coarse prediction
+"family_correct": true                // Whether coarse prediction matches
+```
+
+**Aggregate** (`z_diagnostics.family_diagnostics`):
+```json
+{
+  "coarse_accuracy": 0.8723,
+  "corr_family_wrong_vs_formula_errors": 0.142,
+  "errors_by_family": {
+    "BCS": {"n_samples": 1200, "family_accuracy": 0.95, "formula_exact_pct": 82.1, "avg_formula_errors": 1.2},
+    "Cuprate": {"n_samples": 8000, "family_accuracy": 0.88, "formula_exact_pct": 75.3, "avg_formula_errors": 2.1},
+    ...
+  }
+}
+```
+
+### Console Output
+
+Added to eval summary line:
+```
+Family: coarse_acc=87.2% | fam_wrong→err corr=0.142
+```
+
+---
+
 ## V12.36: Self-Consistency Losses for Unsupervised Z Blocks (2026-02-16)
 
 ### Problem
