@@ -442,6 +442,7 @@ TRAIN_CONFIG = {
     'tc_weight': 20.0,                # V12.26: 10→20, focus gradient on Tc accuracy for generation
     'magpie_weight': 2.0,
     'stoich_weight': 2.0,  # V12.4: Stoichiometry loss weight
+    'numden_weight': 1.0,  # V12.38: Numerator/denominator loss weight
     'kl_weight': 0.0001,  # Now L2 regularization weight on z (deterministic encoder)
     'hp_loss_weight': 0.5,   # V12.26: 0.05→0.5, HP is critical for high-Tc (H3S, LaH10) — model must master this
     'sc_loss_weight': 0.5,   # V12.21: SC/non-SC classification loss weight (BCE, all samples)
@@ -948,6 +949,31 @@ def parse_fraction_formula(formula: str) -> Optional[Dict[str, float]]:
     return result if result else None
 
 
+def parse_numden_from_formula(formula: str) -> Optional[List[Tuple[int, int]]]:
+    """V12.38: Extract raw (numerator, denominator) pairs from formula.
+
+    Returns list of (num, den) tuples in element order.
+    - Fraction: 'La(7/10)' -> (7, 10)
+    - Integer: 'O4' -> (4, 1)
+    - Implicit 1: 'Cu' -> (1, 1)
+    """
+    pattern = r'([A-Z][a-z]?)(?:\((\d+)/(\d+)\)|(\d*\.?\d+))?'
+    matches = re.findall(pattern, formula)
+
+    result = []
+    for match in matches:
+        element = match[0]
+        if not element:
+            continue
+        if match[1] and match[2]:
+            result.append((int(match[1]), int(match[2])))  # fraction: (num, den)
+        elif match[3]:
+            result.append((int(float(match[3])), 1))  # integer: (val, 1)
+        else:
+            result.append((1, 1))  # implicit 1
+    return result if result else None
+
+
 def canonicalize_fractions(formula: str) -> str:
     """Reduce all fractions in a formula to lowest terms via GCD.
 
@@ -1087,6 +1113,11 @@ def _try_load_cache(csv_hash: str, max_formula_len: int):
         if meta.get('normalize_integers_to_fractions', False) != use_int_norm:
             print(f"  Cache stale: normalize_integers_to_fractions changed ({meta.get('normalize_integers_to_fractions', False)} → {use_int_norm})")
             return None
+        # V12.38: Invalidate cache if numden tensors are missing (first run after upgrade)
+        numden_cache_path = cache_dir / 'element_num_log.pt'
+        if not numden_cache_path.exists():
+            print("  Cache stale: element_num_log.pt missing (V12.38 upgrade)")
+            return None
 
         # Load tensors
         tensors = {
@@ -1106,6 +1137,13 @@ def _try_load_cache(csv_hash: str, max_formula_len: int):
         family_cache_path = cache_dir / 'family_tensor.pt'
         if family_cache_path.exists():
             tensors['family_tensor'] = torch.load(family_cache_path, weights_only=True)
+
+        # V12.38: Load numden tensors
+        num_log_path = cache_dir / 'element_num_log.pt'
+        den_log_path = cache_dir / 'element_den_log.pt'
+        if num_log_path.exists() and den_log_path.exists():
+            tensors['element_num_log'] = torch.load(num_log_path, weights_only=True)
+            tensors['element_den_log'] = torch.load(den_log_path, weights_only=True)
 
         # V12.31: Load compositional targets if available
         comp_cache_path = cache_dir / 'comp_targets_tensor.pt'
@@ -1239,6 +1277,16 @@ def load_and_prepare_data():
             # Not in cache — will be recomputed below after dataset creation
             n = tensors['element_indices'].size(0)
             tensor_list.append(torch.zeros(n, dtype=torch.long))
+
+        # V12.38: Numden tensors (indices 10, 11)
+        if 'element_num_log' in tensors and 'element_den_log' in tensors:
+            tensor_list.append(tensors['element_num_log'])
+            tensor_list.append(tensors['element_den_log'])
+        else:
+            # Should not happen (cache invalidation should trigger rebuild)
+            n = tensors['element_indices'].size(0)
+            tensor_list.append(torch.zeros(n, 12, dtype=torch.float32))
+            tensor_list.append(torch.zeros(n, 12, dtype=torch.float32))
 
         # V12.31: Compositional targets tensor (backward compatible)
         if 'comp_targets_tensor' in tensors:
@@ -1430,6 +1478,31 @@ def load_and_prepare_data():
                 except:
                     continue
 
+        # V12.38: Extract raw numerator/denominator pairs for decoder conditioning
+        element_numerators = torch.zeros(len(formulas), MAX_ELEMENTS, dtype=torch.float32)
+        element_denominators = torch.zeros(len(formulas), MAX_ELEMENTS, dtype=torch.float32)
+        for i, formula in enumerate(formulas):
+            # Apply same normalization as tokenization to get consistent numden
+            if use_canonical:
+                formula = canonicalize_fractions(formula)
+            if use_int_norm:
+                formula = normalize_integers_to_fractions(formula)
+            numden = parse_numden_from_formula(formula)
+            if not numden:
+                continue
+            for j, (num, den) in enumerate(numden):
+                if j >= MAX_ELEMENTS:
+                    break
+                if element_mask[i, j]:  # Only where we have valid elements
+                    element_numerators[i, j] = num
+                    element_denominators[i, j] = den
+        # Store in log1p space for range compression (nums/dens range 1-500)
+        element_num_log = torch.log1p(element_numerators)
+        element_den_log = torch.log1p(element_denominators)
+        print(f"  V12.38: Extracted numerator/denominator pairs "
+              f"(num range: {element_numerators[element_mask].min():.0f}-{element_numerators[element_mask].max():.0f}, "
+              f"den range: {element_denominators[element_mask].min():.0f}-{element_denominators[element_mask].max():.0f})")
+
         # Create tensors
         tc_tensor = torch.tensor(tc_normalized, dtype=torch.float32).unsqueeze(1)
         magpie_tensor = torch.tensor(magpie_normalized, dtype=torch.float32)
@@ -1505,6 +1578,8 @@ def load_and_prepare_data():
                 'label_tensor': label_tensor,
                 'hp_tensor': hp_tensor,  # V12.19
                 'family_tensor': family_tensor,  # V12.22
+                'element_num_log': element_num_log,  # V12.38
+                'element_den_log': element_den_log,  # V12.38
         }
         # V12.31: Include compositional targets in cache
         if comp_targets_tensor is not None:
@@ -1518,13 +1593,14 @@ def load_and_prepare_data():
             max_formula_len=max_len,
         )
 
-        # Create dataset (10 or 11 tensors: 6 original + is_sc + label + hp + family [+ comp_targets])
+        # Create dataset (12 or 13 tensors: 6 original + is_sc + label + hp + family + num_log + den_log [+ comp_targets])
         _dataset_tensors = [
             element_indices, element_fractions, element_mask,
             formula_tokens, tc_tensor, magpie_tensor,
             is_sc_tensor, label_tensor, hp_tensor, family_tensor,
+            element_num_log, element_den_log,  # V12.38: indices 10, 11
         ]
-        # V12.31: Append compositional targets as index 10
+        # V12.31: Append compositional targets as index 12 (was 10)
         if comp_targets_tensor is not None:
             _dataset_tensors.append(comp_targets_tensor)
         dataset = TensorDataset(*_dataset_tensors)
@@ -1704,6 +1780,7 @@ class CombinedLossWithREINFORCE(nn.Module):
         magpie_weight: float = 2.0,
         kl_weight: float = 0.0001,
         stoich_weight: float = 2.0,
+        numden_weight: float = 1.0,  # V12.38: Numerator/denominator loss weight
         entropy_weight: float = 0.01,
         n_samples_rloo: int = 2,
         temperature: float = 0.8,
@@ -1740,6 +1817,7 @@ class CombinedLossWithREINFORCE(nn.Module):
         self.magpie_weight = magpie_weight
         self.kl_weight = kl_weight
         self.stoich_weight = stoich_weight
+        self.numden_weight = numden_weight  # V12.38
         self.entropy_weight = entropy_weight
         self.n_samples_rloo = n_samples_rloo
         self.temperature = temperature
@@ -2137,6 +2215,10 @@ class CombinedLossWithREINFORCE(nn.Module):
         tc_class_logits: torch.Tensor = None,
         # V12.34: Element count for per-sample weighting (D)
         n_elements: torch.Tensor = None,
+        # V12.38: Numerator/denominator loss inputs
+        numden_pred: torch.Tensor = None,           # [batch, 24]
+        element_num_log: torch.Tensor = None,       # [batch, 12] log1p(numerator) targets
+        element_den_log: torch.Tensor = None,       # [batch, 12] log1p(denominator) targets
     ) -> Dict[str, torch.Tensor]:
         """Compute combined loss with optional REINFORCE."""
 
@@ -2317,6 +2399,20 @@ class CombinedLossWithREINFORCE(nn.Module):
                 element_count_target = element_mask.sum(dim=1).float()
                 element_count_loss = F.mse_loss(element_count_pred, element_count_target)
 
+        # 6b. V12.38: Numerator/denominator loss (masked MSE in log1p space)
+        numden_loss = torch.tensor(0.0, device=formula_logits.device)
+        if (numden_pred is not None and element_num_log is not None
+                and element_den_log is not None and element_mask is not None):
+            # Split predictions: first 12 = log-numerators, last 12 = log-denominators
+            num_pred = numden_pred[:, :12]
+            den_pred = numden_pred[:, 12:]
+            # Masked MSE
+            elem_mask_float = element_mask.float()
+            num_se = ((num_pred - element_num_log) ** 2) * elem_mask_float
+            den_se = ((den_pred - element_den_log) ** 2) * elem_mask_float
+            n_valid = elem_mask_float.sum(dim=1).clamp(min=1)
+            numden_loss = ((num_se.sum(dim=1) + den_se.sum(dim=1)) / n_valid).mean()
+
         # 7. Combined Loss
         # V12.8: Entropy bonus is now part of REINFORCE reward, NOT subtracted here
         formula_loss = self.ce_weight * formula_ce_loss + self.rl_weight * reinforce_loss
@@ -2326,6 +2422,7 @@ class CombinedLossWithREINFORCE(nn.Module):
             magpie_w * magpie_loss +
             self.kl_weight * kl_loss +
             self.stoich_weight * stoich_loss +
+            self.numden_weight * numden_loss +  # V12.38: Numerator/denominator loss
             0.5 * element_count_loss +
             self.tc_class_weight * tc_class_loss  # V12.28: Tc bucket classification
             # Entropy bonus removed - now in REINFORCE reward signal
@@ -2357,6 +2454,7 @@ class CombinedLossWithREINFORCE(nn.Module):
             'tc_loss': tc_loss,
             'magpie_loss': magpie_loss,
             'stoich_loss': stoich_loss,
+            'numden_loss': numden_loss,  # V12.38
             'kl_loss': kl_loss,
             'tc_class_loss': tc_class_loss,  # V12.28
             'z_norm_penalty': z_norm_penalty,  # V12.34
@@ -2530,10 +2628,24 @@ def cache_z_vectors(encoder, loader, device, epoch, cache_path, dataset_info=Non
                 attended_input = encoder_out.get('attended_input')
                 all_attended_input.append(attended_input.cpu() if attended_input is not None else None)
 
+                # V12.38: Assemble stoich_pred for decoder generation
+                _frac = encoder_out.get('fraction_pred')
+                _ecount = encoder_out.get('element_count_pred')
+                _ndpred = encoder_out.get('numden_pred')
+                if _frac is not None and _ecount is not None:
+                    if _ndpred is not None:
+                        _stoich = torch.cat([_frac, _ndpred, _ecount.unsqueeze(-1)], dim=-1)
+                    else:
+                        _ndpad = torch.zeros(_frac.shape[0], 24, device=_frac.device, dtype=_frac.dtype)
+                        _stoich = torch.cat([_frac, _ndpad, _ecount.unsqueeze(-1)], dim=-1)
+                else:
+                    _stoich = None
+
                 # Generate predictions using decoder
                 if include_log_probs:
                     gen_tokens, log_probs, _, _ = decoder.sample_for_reinforce(
-                        z=z, encoder_skip=attended_input, temperature=0.0,  # Greedy
+                        z=z, encoder_skip=attended_input, stoich_pred=_stoich,  # V12.38
+                        temperature=0.0,  # Greedy
                         max_len=tokens.size(1),
                         stop_boost=stop_boost,  # V12.37: Was missing — caused 1.6% exact match
                         hard_stop_threshold=hard_stop_threshold,
@@ -2541,7 +2653,8 @@ def cache_z_vectors(encoder, loader, device, epoch, cache_path, dataset_info=Non
                     all_log_probs.append(log_probs.cpu())
                 else:
                     gen_tokens = decoder.generate_with_kv_cache(
-                        z=z, encoder_skip=attended_input, temperature=0.0,
+                        z=z, encoder_skip=attended_input, stoich_pred=_stoich,  # V12.38
+                        temperature=0.0,
                         max_len=tokens.size(1), return_log_probs=False, return_entropy=False,
                         stop_boost=stop_boost,  # V12.37: Was missing — caused 1.6% exact match
                         hard_stop_threshold=hard_stop_threshold,
@@ -2745,6 +2858,7 @@ def log_training_metrics(epoch, metrics, log_path, true_eval=None):
         'stoich_loss', 'rl_loss', 'reward', 'entropy', 'entropy_weight',
         'z_norm', 'tf_ratio', 'contrastive_loss', 'hp_loss', 'sc_loss',
         'theory_loss',  # V12.22
+        'numden_loss',  # V12.38
         'true_exact', 'epoch_time', 'timestamp'
     ]
 
@@ -2767,6 +2881,7 @@ def log_training_metrics(epoch, metrics, log_path, true_eval=None):
         'hp_loss': metrics.get('hp_loss', 0),
         'sc_loss': metrics.get('sc_loss', 0),
         'theory_loss': metrics.get('theory_loss', 0),  # V12.22
+        'numden_loss': metrics.get('numden_loss', 0),  # V12.38
         'true_exact': true_eval['true_exact_match'] if true_eval else '',
         'epoch_time': metrics.get('epoch_time', 0),
         'timestamp': datetime.datetime.now().isoformat(),
@@ -2891,6 +3006,34 @@ def load_checkpoint(encoder, decoder, checkpoint_path, entropy_manager=None,
         actual_encoder.upgrade_tc_head_from_checkpoint(enc_state)
         print("  [Checkpoint] Applied Net2Net weight transfer for Tc head upgrade", flush=True)
 
+    # V12.38: Shape-mismatch handling for decoder (stoich_to_memory input dim change 13→37)
+    dec_model_state = decoder.state_dict()
+    for key in list(dec_state.keys()):
+        if key in dec_model_state and dec_state[key].shape != dec_model_state[key].shape:
+            old_shape = dec_state[key].shape
+            new_shape = dec_model_state[key].shape
+            preserved = False
+            if len(old_shape) == 2 and len(new_shape) == 2:
+                min_r, min_c = min(old_shape[0], new_shape[0]), min(old_shape[1], new_shape[1])
+                new_w = torch.zeros(new_shape, dtype=dec_state[key].dtype)
+                new_w[:min_r, :min_c] = dec_state[key][:min_r, :min_c]
+                dec_state[key] = new_w
+                preserved = True
+                print(f"  [Checkpoint] Decoder partial preserve {key}: {old_shape}→{new_shape}, "
+                      f"kept [{min_r},{min_c}]", flush=True)
+            elif len(old_shape) == 1 and len(new_shape) == 1:
+                min_len = min(old_shape[0], new_shape[0])
+                new_b = torch.zeros(new_shape, dtype=dec_state[key].dtype)
+                new_b[:min_len] = dec_state[key][:min_len]
+                dec_state[key] = new_b
+                preserved = True
+                print(f"  [Checkpoint] Decoder partial preserve {key}: {old_shape}→{new_shape}, "
+                      f"kept [{min_len}]", flush=True)
+            if not preserved:
+                print(f"  [Checkpoint] Decoder shape mismatch for {key}: "
+                      f"checkpoint {old_shape} vs model {new_shape}, re-initializing", flush=True)
+                del dec_state[key]
+
     # strict=False: V12.30 adds stop_head, so old checkpoints have missing keys
     dec_missing, dec_unexpected = decoder.load_state_dict(dec_state, strict=False)
     if dec_missing:
@@ -2949,7 +3092,31 @@ def load_checkpoint(encoder, decoder, checkpoint_path, entropy_manager=None,
     if dec_opt is not None and 'dec_optimizer_state_dict' in checkpoint:
         try:
             dec_opt.load_state_dict(checkpoint['dec_optimizer_state_dict'])
-            print(f"  Restored decoder optimizer state", flush=True)
+            # V12.38: Validate optimizer state buffer shapes match parameter shapes
+            # load_state_dict succeeds even when parameter shapes change (e.g., stoich_to_memory
+            # 13→37 cols), but optimizer.step() will crash on shape mismatch in exp_avg/exp_avg_sq.
+            shape_mismatch = False
+            for group_idx, group in enumerate(dec_opt.param_groups):
+                for p_idx, p in enumerate(group['params']):
+                    state = dec_opt.state.get(p, {})
+                    for buf_name in ('exp_avg', 'exp_avg_sq'):
+                        if buf_name in state and state[buf_name].shape != p.shape:
+                            print(f"  [Checkpoint] Decoder optimizer buffer shape mismatch: "
+                                  f"{buf_name} {state[buf_name].shape} vs param {p.shape}", flush=True)
+                            shape_mismatch = True
+                            break
+                    if shape_mismatch:
+                        break
+                if shape_mismatch:
+                    break
+            if shape_mismatch:
+                # Reset optimizer state to avoid crash during step()
+                dec_opt.state.clear()
+                fresh_optimizers = True
+                print(f"  [Checkpoint] Decoder optimizer state cleared due to shape migration, "
+                      f"using fresh state", flush=True)
+            else:
+                print(f"  Restored decoder optimizer state", flush=True)
         except (ValueError, KeyError, RuntimeError) as e:
             fresh_optimizers = True
             print(f"  [Checkpoint] Decoder optimizer state incompatible (param count changed), "
@@ -3087,6 +3254,17 @@ def evaluate_true_autoregressive(encoder, decoder, loader, device, max_samples=1
         fraction_pred = encoder_out.get('fraction_pred')
         element_count_pred = encoder_out.get('element_count_pred')
 
+        # V12.38: Assemble stoich_pred for decoder generation
+        numden_pred_eval = encoder_out.get('numden_pred')
+        if fraction_pred is not None and element_count_pred is not None:
+            if numden_pred_eval is not None:
+                stoich_pred_eval = torch.cat([fraction_pred, numden_pred_eval, element_count_pred.unsqueeze(-1)], dim=-1)
+            else:
+                numden_pad = torch.zeros(batch_size, 24, device=device, dtype=fraction_pred.dtype)
+                stoich_pred_eval = torch.cat([fraction_pred, numden_pad, element_count_pred.unsqueeze(-1)], dim=-1)
+        else:
+            stoich_pred_eval = None
+
         # V12.18: Compute per-sample reconstruction metrics
         z_norms = z.float().norm(dim=1)                       # [B]
         z_max_dim = z.float().abs().max(dim=1).values         # [B]
@@ -3146,6 +3324,7 @@ def evaluate_true_autoregressive(encoder, decoder, loader, device, max_samples=1
         generated_tokens, _, _ = decoder.generate_with_kv_cache(
             z=z,
             encoder_skip=encoder_skip,
+            stoich_pred=stoich_pred_eval,  # V12.38: Include numden conditioning
             temperature=0.001,  # Near-greedy for evaluation
             max_len=decoder.max_len,
             stop_boost=stop_boost,  # V12.30
@@ -3600,6 +3779,7 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
     total_stop_loss = 0  # V12.30
     total_physics_z_loss = 0  # V12.31
     total_family_loss = 0  # V12.32
+    total_numden_loss = 0  # V12.38
     total_sc_exact = 0
     total_non_sc_exact = 0
     total_spec_accept = 0  # V12.9: Speculative decoding acceptance rate
@@ -3627,12 +3807,14 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
         if timing:
             timing.stop('data_load')
 
-        # V12.31: Unpack up to 11 tensors (6 original + is_sc + label + hp + family [+ comp_targets])
+        # V12.38: Unpack up to 13 tensors (6 original + is_sc + label + hp + family + num_log + den_log [+ comp_targets])
         batch_tensors = [b.to(device) for b in batch]
         elem_idx, elem_frac, elem_mask, tokens, tc, magpie, is_sc, labels = batch_tensors[:8]
         hp_labels = batch_tensors[8] if len(batch_tensors) > 8 else torch.zeros_like(is_sc, dtype=torch.float32)
         family_labels = batch_tensors[9] if len(batch_tensors) > 9 else None
-        comp_targets = batch_tensors[10] if len(batch_tensors) > 10 else None  # V12.31
+        elem_num_log_batch = batch_tensors[10] if len(batch_tensors) > 10 else None  # V12.38
+        elem_den_log_batch = batch_tensors[11] if len(batch_tensors) > 11 else None  # V12.38
+        comp_targets = batch_tensors[12] if len(batch_tensors) > 12 else None  # V12.31 (index shifted)
 
         sc_mask = is_sc.bool()  # True = superconductor
 
@@ -3672,8 +3854,17 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
             # Stoichiometry predictions for loss and conditioning
             fraction_pred = encoder_out.get('fraction_pred')
             element_count_pred = encoder_out.get('element_count_pred')
+            numden_pred = encoder_out.get('numden_pred')  # V12.38: [batch, 24]
             if fraction_pred is not None and element_count_pred is not None:
-                stoich_pred = torch.cat([fraction_pred, element_count_pred.unsqueeze(-1)], dim=-1)
+                if numden_pred is not None:
+                    # V12.38: Widen stoich_pred with numden conditioning: [frac(12), numden(24), count(1)] = 37
+                    stoich_pred = torch.cat([fraction_pred, numden_pred, element_count_pred.unsqueeze(-1)], dim=-1)
+                else:
+                    # V12.38 backward compat: pad zeros for missing numden_pred (old checkpoints)
+                    # Decoder stoich_to_memory now expects 37-dim input
+                    numden_pad = torch.zeros(fraction_pred.shape[0], 24,
+                                             device=fraction_pred.device, dtype=fraction_pred.dtype)
+                    stoich_pred = torch.cat([fraction_pred, numden_pad, element_count_pred.unsqueeze(-1)], dim=-1)
             else:
                 stoich_pred = None
 
@@ -3839,6 +4030,9 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
                     stoich_pred_for_reinforce=stoich_pred,
                     tc_class_logits=tc_class_logits,  # V12.28
                     n_elements=elem_mask.bool().sum(dim=1),  # V12.34
+                    numden_pred=numden_pred,  # V12.38
+                    element_num_log=elem_num_log_batch,  # V12.38
+                    element_den_log=elem_den_log_batch,  # V12.38
                 )
                 loss = (loss_dict['total'] + contrastive_weight * contrastive_loss_val
                         + hp_loss_weight * hp_loss_val
@@ -3869,6 +4063,9 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
                     stoich_pred_for_reinforce=None,
                     tc_class_logits=tc_class_logits,  # V12.28
                     n_elements=elem_mask.bool().sum(dim=1),  # V12.34
+                    numden_pred=numden_pred,  # V12.38
+                    element_num_log=elem_num_log_batch,  # V12.38
+                    element_den_log=elem_den_log_batch,  # V12.38
                 )
                 # Scale formula loss by non_sc_formula_weight
                 loss = (non_sc_formula_weight * loss_dict['total'] + contrastive_weight * contrastive_loss_val
@@ -3903,6 +4100,9 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
                     stoich_pred_for_reinforce=stoich_pred[sc_mask] if stoich_pred is not None else None,
                     tc_class_logits=tc_class_logits[sc_mask] if tc_class_logits is not None else None,  # V12.28
                     n_elements=elem_mask[sc_mask].bool().sum(dim=1),  # V12.34
+                    numden_pred=numden_pred[sc_mask] if numden_pred is not None else None,  # V12.38
+                    element_num_log=elem_num_log_batch[sc_mask] if elem_num_log_batch is not None else None,  # V12.38
+                    element_den_log=elem_den_log_batch[sc_mask] if elem_den_log_batch is not None else None,  # V12.38
                 )
 
                 # Non-SC portion: formula-only, lower weight
@@ -3925,6 +4125,9 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
                     stoich_pred_for_reinforce=None,
                     tc_class_logits=tc_class_logits[~sc_mask] if tc_class_logits is not None else None,  # V12.28
                     n_elements=elem_mask[~sc_mask].bool().sum(dim=1),  # V12.34
+                    numden_pred=numden_pred[~sc_mask] if numden_pred is not None else None,  # V12.38
+                    element_num_log=elem_num_log_batch[~sc_mask] if elem_num_log_batch is not None else None,  # V12.38
+                    element_den_log=elem_den_log_batch[~sc_mask] if elem_den_log_batch is not None else None,  # V12.38
                 )
 
                 # Weighted combination: SC at full weight, non-SC at reduced weight
@@ -4047,6 +4250,7 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
         total_stop_loss += stop_loss_val.item() if torch.is_tensor(stop_loss_val) else stop_loss_val  # V12.30
         total_physics_z_loss += physics_z_loss_val.item() if torch.is_tensor(physics_z_loss_val) else physics_z_loss_val  # V12.31
         total_family_loss += family_loss_val.item() if torch.is_tensor(family_loss_val) else family_loss_val  # V12.32
+        total_numden_loss += loss_dict.get('numden_loss', torch.tensor(0.0)).item()  # V12.38
         z_norm_val = z.detach().float().norm(dim=1).mean().item()
         if not math.isnan(z_norm_val):
             total_z_norm += z_norm_val
@@ -4094,6 +4298,7 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
             'stop_loss': 0,  # V12.30
             'physics_z_loss': 0,  # V12.31
             'family_loss': 0,  # V12.32
+            'numden_loss': 0,  # V12.38
             'z_norm': 0, 'n_skipped': n_skipped, 'n_total_batches': 0,
         }
 
@@ -4115,6 +4320,7 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
         'stop_loss': total_stop_loss / n_batches,  # V12.30
         'physics_z_loss': total_physics_z_loss / n_batches,  # V12.31
         'family_loss': total_family_loss / n_batches,  # V12.32
+        'numden_loss': total_numden_loss / n_batches,  # V12.38
         'z_norm': total_z_norm / n_batches,
         'n_skipped': n_skipped,  # V12.12: Selective backprop skips
         'n_total_batches': n_batches,
@@ -4246,6 +4452,7 @@ def train():
         tc_weight=TRAIN_CONFIG['tc_weight'],
         magpie_weight=TRAIN_CONFIG['magpie_weight'],
         stoich_weight=TRAIN_CONFIG['stoich_weight'],
+        numden_weight=TRAIN_CONFIG.get('numden_weight', 1.0),  # V12.38
         kl_weight=TRAIN_CONFIG['kl_weight'],
         entropy_weight=TRAIN_CONFIG.get('entropy_weight', 0.01),
         n_samples_rloo=TRAIN_CONFIG.get('n_samples_rloo', 2),
@@ -4550,6 +4757,7 @@ def train():
           (" [log1p]" if TRAIN_CONFIG.get('tc_log_transform', False) else ""))
     print(f"  Magpie: {TRAIN_CONFIG['magpie_weight']}")
     print(f"  Stoich: {TRAIN_CONFIG['stoich_weight']}")
+    print(f"  NumDen: {TRAIN_CONFIG.get('numden_weight', 1.0)}")  # V12.38
     print(f"  HP: {TRAIN_CONFIG.get('hp_loss_weight', 0)}")
     print(f"  SC: {TRAIN_CONFIG.get('sc_loss_weight', 0)}")
     print(f"  Family: {TRAIN_CONFIG.get('family_classifier_weight', 0)} "  # V12.33
@@ -4864,6 +5072,7 @@ def train():
                     f"Acc: {metrics['accuracy']*100:.1f}% | Exact: {metrics['exact_match']*100:.1f}% | "
                     f"Tc: {metrics['tc_loss']:.4f} | Magpie: {metrics['magpie_loss']:.4f} | "
                     f"Stoich: {metrics['stoich_loss']:.4f} | "
+                    f"ND: {metrics.get('numden_loss', 0):.4f} | "
                     f"zN: {metrics['z_norm']:.1f}")
 
         # V12.8: Add REINFORCE metrics if enabled (includes entropy in reward)

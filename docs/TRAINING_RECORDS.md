@@ -4,6 +4,56 @@ Chronological record of training runs, architecture changes, and optimization de
 
 ---
 
+## V12.38: Numerator/Denominator Conditioning for Decoder (2026-02-17)
+
+### Problem
+
+The decoder receives stoichiometry conditioning as 12 mole fractions + 1 element count (13 dims). Mole fractions are continuous floats that sum to ~1.0 (e.g., 0.5385 for 7/13). The decoder must reverse-engineer the exact digit token sequence `('7', '/', '1', '3')` from this float alone -- no explicit signal tells it the denominator is 13 or the numerator is 7.
+
+### Changes
+
+**Approach: Augment `stoich_pred` from 13 to 37 dims**
+
+Instead of threading a new parameter through all function signatures, we widen the existing `stoich_pred` tensor:
+- **Before**: `stoich_pred = [fraction_pred(12), element_count_pred(1)] = 13 dims`
+- **After**: `stoich_pred = [fraction_pred(12), numden_pred(24), element_count_pred(1)] = 37 dims`
+
+Where `numden_pred` = 12 predicted log1p(numerators) + 12 predicted log1p(denominators).
+
+**Data preprocessing** (`scripts/train_v12_clean.py`):
+- Added `parse_numden_from_formula()` to extract raw (num, den) pairs from formulas
+- Stores numerators/denominators in log1p space for range compression (values range 1-500)
+- Added to tensor cache with invalidation on first run after upgrade
+
+**Encoder** (`src/superconductor/models/attention_vae.py`):
+- Added `numden_head`: z -> Linear(2048,128) -> LN -> GELU -> Dropout -> Linear(128,24)
+- Predicts 12 log-numerators + 12 log-denominators from latent z
+- Old checkpoints: `numden_head.*` keys missing -> `strict=False` -> randomly initialized
+
+**Decoder** (`src/superconductor/models/autoregressive_decoder.py`):
+- Changed `stoich_input_dim` from `max_elements + 1` (13) to `max_elements * 3 + 1` (37)
+- Checkpoint migration: partial weight preservation for `stoich_to_memory.0.weight` (first 13 cols kept, 24 new cols zero-initialized)
+
+**Loss** (`scripts/train_v12_clean.py`):
+- Added `numden_loss`: masked MSE in log1p space between predicted and target numerators/denominators
+- Weight: `numden_weight = 1.0` (configurable via TRAIN_CONFIG)
+- Added to combined total loss alongside stoich_loss
+
+**Modified Files:**
+- `scripts/train_v12_clean.py` -- Parsing, preprocessing, cache, loss, assembly, logging
+- `src/superconductor/models/attention_vae.py` -- numden_head in encoder
+- `src/superconductor/models/autoregressive_decoder.py` -- stoich_input_dim 13->37
+
+### Checkpoint Compatibility
+
+| Component | Old -> New | Handled By |
+|-----------|-----------|------------|
+| `encoder.numden_head.*` | Missing keys | `strict=False` -> randomly initialized |
+| `decoder.stoich_to_memory.0.weight` | `[512, 13]` -> `[512, 37]` | Shape migration (partial preserve first 13 cols) |
+| `decoder.stoich_to_memory.0.bias` | `[512]` -> `[512]` | No change |
+
+---
+
 ## V12.37: Plateau-Breaking Interventions (2026-02-16)
 
 ### Problem

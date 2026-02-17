@@ -1380,16 +1380,16 @@ class EnhancedTransformerDecoder(nn.Module):
         else:
             self.skip_n_tokens = 0
 
-        # V12.4: Stoichiometry conditioning - project fraction predictions to memory tokens
+        # V12.4/V12.38: Stoichiometry conditioning - project fraction + numden predictions to memory tokens
         # This gives the decoder DIRECT visibility into predicted element fractions,
-        # so when generating digits it can "look at" what stoichiometry it should produce.
-        # Input: fraction_pred [batch, max_elements] - predicted fractions for each element
+        # numerators, and denominators, so when generating digits it can "look at" what
+        # stoichiometry it should produce.
+        # Input: stoich_pred [batch, max_elements*3 + 1] — fractions(12) + numden(24) + count(1) = 37
         # Output: stoich_memory [batch, n_stoich_tokens, d_model]
         if use_stoich_conditioning:
             self.stoich_n_tokens = n_stoich_tokens
-            # Project max_elements fractions to memory tokens
-            # Include element count prediction (+1) for richer conditioning
-            stoich_input_dim = max_elements + 1  # fractions + count
+            # Project stoich predictions to memory tokens
+            stoich_input_dim = max_elements * 3 + 1  # V12.38: fractions(12) + numerators(12) + denominators(12) + count(1) = 37
             self.stoich_to_memory = nn.Sequential(
                 nn.Linear(stoich_input_dim, d_model),
                 nn.LayerNorm(d_model),
@@ -1448,7 +1448,7 @@ class EnhancedTransformerDecoder(nn.Module):
         self,
         z: torch.Tensor,
         encoder_skip: Optional[torch.Tensor] = None,
-        stoich_pred: Optional[torch.Tensor] = None,  # V12.4: [batch, max_elements + 1]
+        stoich_pred: Optional[torch.Tensor] = None,  # V12.38: [batch, max_elements*3 + 1] = [batch, 37]
     ) -> torch.Tensor:
         """Create combined memory from latent z, skip connection, and stoichiometry.
 
@@ -1502,7 +1502,7 @@ class EnhancedTransformerDecoder(nn.Module):
         Args:
             z: Latent vectors (batch, latent_dim)
             encoder_skip: Skip connection from encoder (batch, encoder_skip_dim)
-            stoich_pred: Stoichiometry conditioning [batch, max_elements + 1]
+            stoich_pred: Stoichiometry conditioning [batch, max_elements*3 + 1]
 
         Returns:
             memory: Pre-computed memory tensor (batch, n_memory_tokens + extras, d_model)
@@ -1515,7 +1515,7 @@ class EnhancedTransformerDecoder(nn.Module):
         target_tokens: torch.Tensor,
         encoder_skip: Optional[torch.Tensor] = None,
         teacher_forcing_ratio: float = 1.0,
-        stoich_pred: Optional[torch.Tensor] = None,  # V12.4: [batch, max_elements + 1]
+        stoich_pred: Optional[torch.Tensor] = None,  # V12.4: [batch, max_elements*3 + 1]
         cached_memory: Optional[torch.Tensor] = None,  # V12.8: Pre-computed memory
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
@@ -1532,7 +1532,7 @@ class EnhancedTransformerDecoder(nn.Module):
                                    1.0 = always ground truth (efficient parallel forward)
                                    0.0 = always use model predictions (true autoregressive)
                                    0.5 = 50% chance of using model prediction at each step
-            stoich_pred: V12.4 stoichiometry conditioning [batch, max_elements + 1]
+            stoich_pred: V12.4 stoichiometry conditioning [batch, max_elements*3 + 1]
                         Contains predicted element fractions + element count
             cached_memory: V12.8 Pre-computed memory from precompute_memory().
                           If provided, skips memory creation (saves computation).
@@ -1931,7 +1931,7 @@ class EnhancedTransformerDecoder(nn.Module):
         Args:
             z: Latent vectors [batch, latent_dim]
             encoder_skip: Optional skip connection [batch, encoder_skip_dim]
-            stoich_pred: Optional stoichiometry conditioning [batch, max_elements + 1]
+            stoich_pred: Optional stoichiometry conditioning [batch, max_elements*3 + 1]
             temperature: Sampling temperature (lower = more deterministic)
             top_k: If set, only sample from top k tokens
             top_p: If set, use nucleus sampling

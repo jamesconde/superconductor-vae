@@ -894,6 +894,22 @@ class FullMaterialsVAE(nn.Module):
         )
 
         # =====================================================================
+        # NUMERATOR/DENOMINATOR PREDICTION HEAD (V12.38)
+        # =====================================================================
+        # Predicts raw (num, den) values in log1p space for decoder conditioning.
+        # This gives the decoder explicit numerator/denominator signal so it
+        # doesn't have to reverse-engineer the exact fraction from a float.
+        # Output: [max_elements * 2] = 12 log-numerators + 12 log-denominators
+        # =====================================================================
+        self.numden_head = nn.Sequential(
+            nn.Linear(latent_dim, 128),
+            nn.LayerNorm(128),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(128, self.max_elements * 2)  # 12 numerators + 12 denominators
+        )
+
+        # =====================================================================
         # HIGH-PRESSURE PREDICTION HEAD (V12.19)
         # =====================================================================
         # Binary classifier: P(requires_high_pressure | z)
@@ -1095,6 +1111,9 @@ class FullMaterialsVAE(nn.Module):
         fraction_pred = fraction_output[:, :self.max_elements]  # [batch, max_elements]
         element_count_pred = fraction_output[:, -1]  # [batch]
 
+        # V12.38: Numerator/denominator predictions (in log1p space)
+        numden_pred = self.numden_head(enc_out['z'])  # [batch, 24]
+
         # High-pressure prediction (V12.19)
         hp_pred = self.hp_head(enc_out['z']).squeeze(-1)  # [batch] logits
 
@@ -1157,6 +1176,8 @@ class FullMaterialsVAE(nn.Module):
             # Stoichiometry prediction (V12.4)
             'fraction_pred': fraction_pred,
             'element_count_pred': element_count_pred,
+            # Numerator/denominator prediction (V12.38) — log1p space
+            'numden_pred': numden_pred,
             # High-pressure prediction (V12.19) — logits, apply sigmoid for probability
             'hp_pred': hp_pred,
             # SC/non-SC classification (V12.21) — logits, apply sigmoid for probability
