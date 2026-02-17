@@ -3677,6 +3677,14 @@ def evaluate_true_autoregressive(encoder, decoder, loader, device, max_samples=1
     print(f" | err={z_err['mean']:.1f}±{z_err['std']:.1f}" if z_err else " | no error samples", end='')
     tc_sc_str = f", SC={zd['tc_mae_sc_only']:.4f}" if zd.get('tc_mae_sc_only') is not None else ""
     print(f" | Tc MAE={zd['tc_mae_overall']:.4f}{tc_sc_str} (exact={zd['tc_mae_exact']:.4f}, err={zd['tc_mae_errors']:.4f})" if zd['tc_mae_exact'] is not None and zd['tc_mae_errors'] is not None else '')
+    # V12.38: Print Tc R² (overall + per-range)
+    tc_r2_k = zd.get('tc_r2_kelvin')
+    if tc_r2_k is not None:
+        r2_parts = [f"overall={tc_r2_k:.4f}"]
+        for label, info in zd.get('errors_by_tc_range', {}).items():
+            if 'tc_r2' in info:
+                r2_parts.append(f"{label}={info['tc_r2']:.3f}")
+        print(f"  Tc R²: {' | '.join(r2_parts)}")
     print(f"  Correlations: z_norm→err={zd['corr_z_norm_vs_errors']:.3f} | tc_err→err={zd['corr_tc_error_vs_formula_errors']:.3f} | "
           f"magpie→err={zd['corr_magpie_mse_vs_errors']:.3f} | seq_len→err={zd['corr_seq_len_vs_errors']:.3f} | "
           f"n_elem→err={zd['corr_n_elements_vs_errors']:.3f}")
