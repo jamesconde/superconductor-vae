@@ -49,7 +49,8 @@ Z-blocks (top corr→err): discovery=0.231 | thermodynamic=0.187 | compositional
 ### Notes
 
 - Block norms squared sum to total z_norm squared (verified mathematically)
-- Placeholder blocks (unsupervised) are NOT forced to zero — they can learn self-consistent representations and are regularized naturally
+- 6 blocks have active PhysicsZLoss supervision: GL (consistency, w=0.1), BCS (consistency, w=0.1), Compositional (direct MSE, w=1.0), Cobordism (derived from GL, w=0.1), Ratios (cross-block checks, w=0.1), Magpie (learnable projection, w=0.5)
+- 6 blocks are currently unsupervised (only KL/L2 regularized): Eliashberg, Unconventional, Structural, Electronic, Thermodynamic, Discovery. These are NOT forced to zero — they can learn self-consistent representations via formula reconstruction backprop
 - Zero overhead during training; only computed during evaluation
 
 ---
