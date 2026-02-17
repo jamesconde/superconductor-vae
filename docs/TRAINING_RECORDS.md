@@ -4,6 +4,56 @@ Chronological record of training runs, architecture changes, and optimization de
 
 ---
 
+## V12.35: Per-Block Physics Z Diagnostics in Error Reports (2026-02-16)
+
+### Problem
+
+Error reports only saved scalar `z_norm` and `z_max_dim` per sample — no visibility into which of the 12 Physics Z coordinate blocks (GL, BCS, Eliashberg, etc.) are healthy vs degraded. This made it impossible to diagnose whether errors correlate with specific physics domains.
+
+### Changes
+
+**Modified Files:**
+- `scripts/train_v12_clean.py` — Import `PhysicsZ`, compute per-block L2 norms in eval loop, add `z_block_norms` dict to each `error_record`, add aggregate `z_block_diagnostics` and `z_block_corr_ranked` to `z_diagnostics`
+- `scratch/analyze_error_reports.py` — Added `analyze_physics_z_blocks()` function with per-block exact-vs-error comparison table, correlation ranking, worst-error block breakdown, and cross-epoch trend tracking
+
+### What's Saved
+
+**Per failed sample** (`error_records[i]`):
+```json
+"z_block_norms": {
+    "gl": 4.21, "bcs": 5.13, "eliashberg": 3.88,
+    "unconventional": 6.72, "structural": 7.44,
+    "electronic": 6.91, "thermodynamic": 8.12,
+    "compositional": 9.33, "cobordism": 7.01,
+    "ratios": 5.89, "magpie": 8.55, "discovery": 38.2
+}
+```
+
+**Aggregate** (`z_diagnostics.z_block_diagnostics[block_name]`):
+- `overall`: mean/std of block norm across all samples
+- `exact`: mean/std for exact-match samples
+- `error`: mean/std for error samples
+- `exact_error_gap`: error_mean - exact_mean (positive = errors have higher norm)
+- `corr_vs_errors`: Pearson correlation of block norm with number of errors
+
+**Ranked** (`z_diagnostics.z_block_corr_ranked`):
+- Blocks sorted by |correlation| with errors, descending
+
+### Console Output
+
+Top-3 blocks most correlated with errors are printed during eval:
+```
+Z-blocks (top corr→err): discovery=0.231 | thermodynamic=0.187 | compositional=0.142
+```
+
+### Notes
+
+- Block norms squared sum to total z_norm squared (verified mathematically)
+- Placeholder blocks (unsupervised) are NOT forced to zero — they can learn self-consistent representations and are regularized naturally
+- Zero overhead during training; only computed during evaluation
+
+---
+
 ## V12.34: Error-Driven Training Refinements A-E + Tc Range Fix (2026-02-16)
 
 ### Problem
@@ -166,10 +216,22 @@ Internal weights: coarse 0.6, cuprate 0.3, iron 0.1. Master weight 0.5.
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `use_family_classifier` | True | Enable hierarchical family head |
-| `family_classifier_weight` | 0.5 | Master weight for combined hierarchical loss |
+| `family_classifier_weight` | 2.0 | Master weight for combined hierarchical loss (boosted from 0.5) |
 | `family_coarse_weight` | 0.6 | Internal: 7-class coarse CE weight |
 | `family_cuprate_sub_weight` | 0.3 | Internal: 6-class cuprate sub CE weight |
 | `family_iron_sub_weight` | 0.1 | Internal: 2-class iron sub CE weight |
+
+### Gradient Rebalancing (Option 3)
+
+RL loss at `rl_weight=2.5` was consuming ~55% of total gradient budget, drowning auxiliary signals (family, tc_class). After verifying the hierarchical head trains (Fam: 0.9292, below random baseline ~1.78), rebalanced weights to let structural heads learn:
+
+| Weight | Before | After | Rationale |
+|--------|--------|-------|-----------|
+| `rl_weight` | 2.5 | 1.0 | RL has had extensive training; reduce dominance |
+| `family_classifier_weight` | 0.5 | 2.0 | 4x boost to strengthen hierarchical family signal |
+| `tc_class_weight` | 2.0 | 4.0 | 2x boost to strengthen Tc bucket classification |
+
+Rationale: The model has done extensive RL training already. The RL gradient mainly prevents the network from drifting into "out of bounds" regions. Boosting auxiliary weights lets the family and Tc classification heads catch up without RL overwhelming their gradients.
 
 ### Checkpoint Compatibility
 

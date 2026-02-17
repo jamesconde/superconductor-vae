@@ -455,7 +455,7 @@ TRAIN_CONFIG = {
     'tc_relative_weight': 0.5,         # V12.24: Blend weight for relative error (0=pure Huber, 1=pure relative)
 
     # V12.28: Tc prediction improvements
-    'tc_class_weight': 2.0,     # Tc bucket classification loss weight
+    'tc_class_weight': 4.0,     # V12.33: Boosted from 2.0 to strengthen auxiliary signal
     'tc_class_bins': [0, 10, 50, 100],  # Bin edges in Kelvin (creates 5 classes: 0, 0-10, 10-50, 50-100, 100+)
     'tc_bin_weights': {0: 1.0, 10: 1.5, 50: 2.0, 100: 2.5, 150: 3.0},  # Per-bin Tc loss multipliers
     'mc_dropout_samples': 10,   # MC Dropout forward passes at eval time
@@ -487,7 +487,7 @@ TRAIN_CONFIG = {
     #   - Then enable rl_weight=1.0-2.5 for fine-tuning
     #   - Higher n_samples_rloo = lower variance but slower
     # =========================================================================
-    'rl_weight': 2.5,            # Re-enabled: RLOO averaging bug fixed + SCST added
+    'rl_weight': 1.0,            # V12.33: Reduced from 2.5 to rebalance gradient budget (was ~55% of total)
     'ce_weight': 1.0,            # Cross-entropy weight (keep at 1.0)
     'n_samples_rloo': 4,         # Number of samples for RLOO baseline (A100: 4)
     'rl_temperature': 0.5,       # Sampling temperature for RL
@@ -621,7 +621,7 @@ TRAIN_CONFIG = {
     'theory_use_soft_constraints': True,   # V12.22: Soft quadratic penalties (no hard caps)
 
     'use_family_classifier': True,          # V12.33: Hierarchical family classification
-    'family_classifier_weight': 0.5,        # V12.33: Master weight for combined hierarchical loss
+    'family_classifier_weight': 2.0,        # V12.33: Boosted from 0.5 to strengthen hierarchical family signal
     'family_coarse_weight': 0.6,            # V12.33: Internal: 7-class coarse CE (SC only)
     'family_cuprate_sub_weight': 0.3,       # V12.33: Internal: 6-class cuprate sub CE
     'family_iron_sub_weight': 0.1,          # V12.33: Internal: 2-class iron sub CE
@@ -2923,6 +2923,11 @@ def evaluate_true_autoregressive(encoder, decoder, loader, device, max_samples=1
     all_is_sc = []            # Per-sample SC flag
     all_n_elements = []       # Per-sample number of elements (from elem_mask)
 
+    # V12.35: Per-block Z norms for physics coordinate diagnostics
+    from superconductor.models.physics_z import PhysicsZ
+    block_ranges = PhysicsZ.get_block_ranges()  # dict of name -> (start, end)
+    all_z_block_norms = {name: [] for name in block_ranges}  # Per-sample per-block L2 norms
+
     for batch in loader:
         if max_samples > 0 and total_samples >= max_samples:
             break
@@ -2974,6 +2979,12 @@ def evaluate_true_autoregressive(encoder, decoder, loader, device, max_samples=1
         all_magpie_mse.extend(magpie_mse.cpu().tolist())
         all_stoich_mse.extend(stoich_mse_vals.cpu().tolist())
         all_n_elements.extend(n_elements.cpu().tolist())
+
+        # V12.35: Per-block Z norms
+        z_float = z.float()
+        for block_name, (blk_start, blk_end) in block_ranges.items():
+            block_norms = z_float[:, blk_start:blk_end].norm(dim=1)  # [B]
+            all_z_block_norms[block_name].extend(block_norms.cpu().tolist())
         if is_sc is not None:
             all_is_sc.extend(is_sc.cpu().tolist())
 
@@ -3056,6 +3067,9 @@ def evaluate_true_autoregressive(encoder, decoder, loader, device, max_samples=1
                     'magpie_mse': round(magpie_mse[i].item(), 6),
                     'stoich_mse': round(stoich_mse_vals[i].item(), 6),
                     'n_elements': int(n_elements[i].item()),
+                    # V12.35: Per-block Z norms for physics coordinate diagnostics
+                    'z_block_norms': {name: round(all_z_block_norms[name][sample_global_idx], 4)
+                                      for name in block_ranges},
                 })
 
         total_samples += batch_size
@@ -3242,6 +3256,40 @@ def evaluate_true_autoregressive(encoder, decoder, loader, device, max_samples=1
                 'avg_z_norm': float(all_z_norms_np[sl_mask].mean()),
             }
 
+    # V12.35: Per-block Z norm diagnostics
+    # Compute aggregate statistics per physics Z block: mean/std for exact vs error,
+    # correlation with errors, and which blocks diverge most between exact/error samples.
+    z_block_diagnostics = {}
+    for block_name in block_ranges:
+        block_np = np.array(all_z_block_norms[block_name][:total_samples])
+        block_stats = {
+            'overall': {'mean': float(block_np.mean()), 'std': float(block_np.std())},
+        }
+        if exact_mask.any():
+            block_stats['exact'] = {'mean': float(block_np[exact_mask].mean()),
+                                    'std': float(block_np[exact_mask].std())}
+        if error_mask.any():
+            block_stats['error'] = {'mean': float(block_np[error_mask].mean()),
+                                    'std': float(block_np[error_mask].std())}
+        # Divergence: how much do exact vs error samples differ in this block?
+        if exact_mask.any() and error_mask.any():
+            block_stats['exact_error_gap'] = float(
+                block_np[error_mask].mean() - block_np[exact_mask].mean())
+        # Correlation of this block's norm with number of errors
+        block_stats['corr_vs_errors'] = safe_corrcoef(block_np, all_n_errors_np)
+        z_block_diagnostics[block_name] = block_stats
+
+    z_diagnostics['z_block_diagnostics'] = z_block_diagnostics
+
+    # Rank blocks by correlation with errors (descending absolute value)
+    block_corr_ranked = sorted(
+        [(name, stats['corr_vs_errors']) for name, stats in z_block_diagnostics.items()],
+        key=lambda x: abs(x[1]), reverse=True
+    )
+    z_diagnostics['z_block_corr_ranked'] = [
+        {'block': name, 'corr': round(corr, 4)} for name, corr in block_corr_ranked
+    ]
+
     # V12.18: Print Z diagnostic summary to console
     zd = z_diagnostics
     z_exact = zd['z_norm_exact']
@@ -3253,6 +3301,11 @@ def evaluate_true_autoregressive(encoder, decoder, loader, device, max_samples=1
     print(f"  Correlations: z_norm→err={zd['corr_z_norm_vs_errors']:.3f} | tc_err→err={zd['corr_tc_error_vs_formula_errors']:.3f} | "
           f"magpie→err={zd['corr_magpie_mse_vs_errors']:.3f} | seq_len→err={zd['corr_seq_len_vs_errors']:.3f} | "
           f"n_elem→err={zd['corr_n_elements_vs_errors']:.3f}")
+    # V12.35: Print top-3 Z blocks most correlated with errors
+    top_blocks = zd.get('z_block_corr_ranked', [])[:3]
+    if top_blocks:
+        parts = [f"{b['block']}={b['corr']:.3f}" for b in top_blocks]
+        print(f"  Z-blocks (top corr→err): {' | '.join(parts)}")
 
     # V12.15: Write error log to file (V12.18: enriched with Z diagnostics)
     if log_errors:

@@ -415,3 +415,9 @@ All changes were verified through:
 7. **Tc denormalization**: Verified bug reproduction (all in 0-10K) and fix (correct distribution)
 8. **Config keys**: All 12 new TRAIN_CONFIG keys verified present via AST inspection
 9. **Call sites**: All 4 `loss_fn()` calls have `n_elements` correctly wired (including SC/non-SC masked variants)
+
+---
+
+## 14. Follow-Up: V12.35 Per-Block Physics Z Diagnostics (2026-02-16)
+
+Added per-block Z norm tracking to error reports. Each of the 12 Physics Z blocks (GL, BCS, Eliashberg, Unconventional, Structural, Electronic, Thermodynamic, Compositional, Cobordism, Ratios, Magpie, Discovery) now has its L2 norm computed per sample during evaluation. This enables diagnosing which physics coordinate blocks correlate with reconstruction errors and tracking block health over training. See `docs/TRAINING_RECORDS.md` V12.35 entry for details.
