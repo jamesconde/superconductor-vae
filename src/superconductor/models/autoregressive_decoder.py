@@ -1723,7 +1723,13 @@ class EnhancedTransformerDecoder(nn.Module):
                 # V12.30: Boost END logit based on stop head prediction
                 if stop_boost > 0:
                     stop_logit = self.stop_head(output[:, -1, :]).squeeze(-1)  # [batch]
-                    logits[:, END_IDX] = logits[:, END_IDX] + stop_boost * torch.sigmoid(stop_logit)
+                    stop_prob = torch.sigmoid(stop_logit)
+                    logits[:, END_IDX] = logits[:, END_IDX] + stop_boost * stop_prob
+
+                    # V12.37: Length-conditional stop boost (normalized by max_len)
+                    if step > 10:
+                        length_boost = 10.0 * (step - 10) / max(max_len - 10, 1)
+                        logits[:, END_IDX] = logits[:, END_IDX] + length_boost
 
                 if temperature != 1.0:
                     logits = logits / temperature
@@ -1915,6 +1921,7 @@ class EnhancedTransformerDecoder(nn.Module):
         return_entropy: bool = False,  # V12.8: Return proper entropy from full distribution
         cached_memory: Optional[torch.Tensor] = None,  # V12.8: Pre-computed memory
         stop_boost: float = 0.0,  # V12.30: Additive END logit boost from stop head
+        hard_stop_threshold: float = 0.0,  # V12.37: Force END when sigmoid(stop_logit) > threshold
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
         """
         Generate token sequences with KV caching for O(n) complexity.
@@ -1976,8 +1983,24 @@ class EnhancedTransformerDecoder(nn.Module):
                 # V12.30: Boost END logit based on stop head prediction
                 if stop_boost > 0:
                     stop_logit = self.stop_head(output).squeeze(1).squeeze(-1)  # [batch]
-                    # Sigmoid > 0.5 means logit > 0; scale proportionally
-                    logits[:, END_IDX] = logits[:, END_IDX] + stop_boost * torch.sigmoid(stop_logit)
+                    stop_prob = torch.sigmoid(stop_logit)
+                    logits[:, END_IDX] = logits[:, END_IDX] + stop_boost * stop_prob
+
+                    # V12.37: Hard stop threshold — force END when stop head is highly confident
+                    if hard_stop_threshold > 0:
+                        force_end = (stop_prob > hard_stop_threshold) & ~finished
+                        if force_end.any():
+                            logits[force_end, :] = float('-inf')
+                            logits[force_end, END_IDX] = 100.0  # Force END token
+
+                    # V12.37: Length-conditional stop boost — linearly increase END boost
+                    # past the typical formula length to prevent runaway generation.
+                    # Normalized by max_len so boost represents fraction of generation
+                    # budget consumed and auto-adjusts if max_len changes.
+                    # With max_len=60, scale=10: pos 20 → +2.0, pos 30 → +4.0, pos 40 → +6.0
+                    if position > 10:
+                        length_boost = 10.0 * (position - 10) / max(max_len - 10, 1)
+                        logits[:, END_IDX] = logits[:, END_IDX] + length_boost
 
                 # V12.8: Compute proper entropy BEFORE temperature/filtering
                 # H(p) = -sum(p * log(p)) over vocabulary
@@ -2053,6 +2076,7 @@ class EnhancedTransformerDecoder(nn.Module):
         max_len: Optional[int] = None,
         cached_memory: Optional[torch.Tensor] = None,  # V12.8: Pre-computed memory
         stop_boost: float = 0.0,  # V12.30: Additive END logit boost from stop head
+        hard_stop_threshold: float = 0.0,  # V12.37: Force END when sigmoid(stop_logit) > threshold
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Sample sequences for REINFORCE training with KV caching.
@@ -2088,6 +2112,7 @@ class EnhancedTransformerDecoder(nn.Module):
             return_entropy=True,  # V12.8: Get proper entropy
             cached_memory=cached_memory,  # V12.8: Pass through cached memory
             stop_boost=stop_boost,  # V12.30: Pass through stop boost
+            hard_stop_threshold=hard_stop_threshold,  # V12.37: Pass through hard stop threshold
         )
 
         # Create mask: 1 for valid tokens, 0 after END

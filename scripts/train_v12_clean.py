@@ -634,7 +634,9 @@ TRAIN_CONFIG = {
     # At inference, boosts END_IDX logit by stop_boost * sigmoid(stop_logit).
     # =========================================================================
     'stop_loss_weight': 5.0,   # Weight for stop-prediction BCE loss (high due to 1:14 class imbalance)
-    'stop_boost': 4.0,        # Additive END logit boost from stop head at inference (0 = disabled)
+    'stop_boost': 10.0,       # V12.37: Increased from 4.0 — stop head needs stronger boost to compete with 150+ element tokens
+    'hard_stop_threshold': 0.8,  # V12.37: Force END when sigmoid(stop_logit) > threshold (0 = disabled)
+    'stop_end_position_weight': 10.0,  # V12.37: Extra weight on END positions in stop loss (addresses 1:14 imbalance)
 
     # =========================================================================
     # V12.31: Physics-Supervised Z Coordinates
@@ -700,6 +702,20 @@ TRAIN_CONFIG = {
     'use_position_dependent_tf': True,
     'tf_position_decay': 0.5,     # gamma: tf(pos) = base_tf * (1 + gamma*(1 - pos/L))
                                   # Start of seq: 1.5x base TF, end: 1.0x base TF
+
+    # =========================================================================
+    # V12.37: Plateau-Breaking Interventions
+    # =========================================================================
+    # Based on plateau analysis of epochs 2764-2812 (stuck at ~61-65% exact match).
+    # Three root causes: extra-append (12.75%), fraction cascades, RL reward blindness.
+    # =========================================================================
+
+    # Intervention 3: Hard sequence oversampling
+    'oversample_hard_sequences': True,    # Upweight long/complex formulas in sampler
+    'oversample_length_base': 15,         # Sequences > this get progressively upweighted
+
+    # Intervention 4: Integer-to-fraction normalization
+    'normalize_integers_to_fractions': True,  # Convert integer subscripts to fraction format
 }
 
 CONTRASTIVE_DATA_PATH = PROJECT_ROOT / 'data/processed/supercon_fractions_contrastive.csv'
@@ -948,6 +964,44 @@ def canonicalize_fractions(formula: str) -> str:
     return re.sub(r'(\d+)/(\d+)', reduce_match, formula)
 
 
+def normalize_integers_to_fractions(formula: str) -> str:
+    """V12.37: Convert integer subscripts to mole-fraction format.
+
+    Converts formulas like 'Ba8Cu12O28PrY3' to fraction format
+    'Ba(8/52)Cu(12/52)O(28/52)Pr(1/52)Y(3/52)' so the decoder only needs
+    to learn one representation format.
+
+    Only applies to formulas that have NO existing fractions (pure integer format).
+    Formulas already in fraction format are returned unchanged.
+    """
+    # Skip if formula already has fractions
+    if '/' in formula or '(' in formula:
+        return formula
+
+    # Parse integer subscripts
+    parsed = parse_fraction_formula(formula)
+    if not parsed or len(parsed) < 2:
+        return formula
+
+    total = sum(parsed.values())
+    if total <= 0:
+        return formula
+
+    # Convert to fractions
+    parts = []
+    for element, count in parsed.items():
+        num = int(round(count))
+        den = int(round(total))
+        g = math.gcd(num, den)
+        num, den = num // g, den // g
+        if den == 1:
+            parts.append(f"{element}{num}" if num > 1 else element)
+        else:
+            parts.append(f"{element}({num}/{den})")
+
+    return ''.join(parts)
+
+
 def load_holdout_indices(holdout_path: Path, formulas: list) -> set:
     """Load holdout sample indices by matching formulas (robust to row reordering).
 
@@ -1025,6 +1079,11 @@ def _try_load_cache(csv_hash: str, max_formula_len: int):
         if meta.get('use_canonical_fractions', False) != use_canonical:
             print(f"  Cache stale: use_canonical_fractions changed ({meta.get('use_canonical_fractions', False)} → {use_canonical})")
             return None
+        # V12.37: Invalidate cache if integer normalization setting changed
+        use_int_norm = TRAIN_CONFIG.get('normalize_integers_to_fractions', False)
+        if meta.get('normalize_integers_to_fractions', False) != use_int_norm:
+            print(f"  Cache stale: normalize_integers_to_fractions changed ({meta.get('normalize_integers_to_fractions', False)} → {use_int_norm})")
+            return None
 
         # Load tensors
         tensors = {
@@ -1099,6 +1158,8 @@ def _save_cache(tensors: dict, norm_stats: dict, n_magpie_cols: int,
         'magpie_skewed_indices': norm_stats.get('magpie_skewed_indices', []),
         # V12.34: Fraction canonicalization for cache invalidation
         'use_canonical_fractions': TRAIN_CONFIG.get('use_canonical_fractions', False),
+        # V12.37: Integer normalization for cache invalidation
+        'normalize_integers_to_fractions': TRAIN_CONFIG.get('normalize_integers_to_fractions', False),
     }
     with open(cache_dir / 'cache_meta.json', 'w') as f:
         json.dump(meta, f)
@@ -1195,6 +1256,9 @@ def load_and_prepare_data():
         is_sc_train = is_sc_tensor[train_indices]
         n_sc_train = int(is_sc_train.sum().item())
         n_non_sc_train = len(train_indices) - n_sc_train
+        # V12.37: Extract for hard sequence oversampling (sampler needs these)
+        formula_tokens = tensors['formula_tokens']
+        element_mask = tensors['element_mask']
         print(f"Training samples: {len(train_indices)} (from cache)")
 
     else:
@@ -1305,24 +1369,39 @@ def load_and_prepare_data():
 
         # Tokenize formulas
         # V12.34: Optionally canonicalize fractions (GCD-reduce) before tokenization
+        # V12.37: Optionally normalize integer subscripts to fraction format
         use_canonical = TRAIN_CONFIG.get('use_canonical_fractions', False)
-        if use_canonical:
-            print("Tokenizing formulas (with fraction canonicalization)...")
+        use_int_norm = TRAIN_CONFIG.get('normalize_integers_to_fractions', False)
+        if use_canonical or use_int_norm:
+            parts = []
+            if use_canonical:
+                parts.append("fraction canonicalization")
+            if use_int_norm:
+                parts.append("integer normalization")
+            print(f"Tokenizing formulas (with {' + '.join(parts)})...")
         else:
             print("Tokenizing formulas...")
         all_tokens = []
         n_canonicalized = 0
+        n_int_normalized = 0
         for formula in formulas:
             if use_canonical:
                 canon = canonicalize_fractions(formula)
                 if canon != formula:
                     n_canonicalized += 1
                 formula = canon
+            if use_int_norm:
+                normalized = normalize_integers_to_fractions(formula)
+                if normalized != formula:
+                    n_int_normalized += 1
+                formula = normalized
             tokens = tokenize_formula(formula)
             indices = tokens_to_indices(tokens, max_len=max_len)
             all_tokens.append(indices)
         if use_canonical:
             print(f"  Canonicalized {n_canonicalized}/{len(formulas)} formulas")
+        if use_int_norm:
+            print(f"  Integer-normalized {n_int_normalized}/{len(formulas)} formulas")
         formula_tokens = torch.stack(all_tokens)
 
         # Parse element compositions
@@ -1487,6 +1566,26 @@ def load_and_prepare_data():
         sc_weight = 1.0 / max(n_sc_train, 1)
         non_sc_weight = 1.0 / max(n_non_sc_train, 1)
         sample_weights = np.where(is_sc_train_arr == 1, sc_weight, non_sc_weight)
+
+        # V12.37: Oversample hard sequences (long formulas, more elements)
+        if TRAIN_CONFIG.get('oversample_hard_sequences', False):
+            # Compute sequence lengths from tokenized data (PAD_IDX = 0)
+            train_formula_tokens = formula_tokens[train_indices]
+            seq_lengths = (train_formula_tokens != PAD_IDX).sum(dim=1).float().numpy()
+            train_element_mask = element_mask[train_indices]
+            n_elements_arr = train_element_mask.sum(dim=1).float().numpy()
+
+            # Upweight: sequences longer than base get progressive weight boost
+            length_base = TRAIN_CONFIG.get('oversample_length_base', 15)
+            length_boost = 1.0 + np.clip((seq_lengths - length_base) / length_base, 0, 3.0)
+
+            # Also upweight by element count (4+ elements get 1.5x, 5+ get 2x)
+            elem_boost = 1.0 + 0.5 * np.clip(n_elements_arr - 3, 0, 4.0)
+
+            sample_weights = sample_weights * length_boost * elem_boost
+            print(f"  Hard sequence oversampling: length_base={length_base}, "
+                  f"mean_length_boost={length_boost.mean():.2f}, mean_elem_boost={elem_boost.mean():.2f}")
+
         sampler = WeightedRandomSampler(
             weights=torch.from_numpy(sample_weights).double(),
             num_samples=len(train_indices),
@@ -1667,6 +1766,7 @@ class CombinedLossWithREINFORCE(nn.Module):
         self._decoder = None
         self._max_len = 60
         self._stop_boost = 0.0  # V12.30: Set via set_decoder()
+        self._hard_stop_threshold = 0.0  # V12.37: Set via set_decoder()
 
         # GPU-native reward config
         self.gpu_reward_config = get_default_gpu_reward_config()
@@ -1682,7 +1782,8 @@ class CombinedLossWithREINFORCE(nn.Module):
         else:
             self.ce_loss = nn.CrossEntropyLoss(reduction='none', ignore_index=PAD_IDX)
 
-    def set_decoder(self, decoder, max_len: int = 60, draft_model=None, stop_boost: float = 0.0):
+    def set_decoder(self, decoder, max_len: int = 60, draft_model=None, stop_boost: float = 0.0,
+                    hard_stop_threshold: float = 0.0):
         """Set decoder for autoregressive REINFORCE sampling (V12.8).
 
         Args:
@@ -1690,11 +1791,13 @@ class CombinedLossWithREINFORCE(nn.Module):
             max_len: Maximum sequence length
             draft_model: Optional HybridDraft for speculative decoding (V12.9)
             stop_boost: V12.30 Additive END logit boost from stop head
+            hard_stop_threshold: V12.37 Force END when sigmoid(stop_logit) > threshold
         """
         self._decoder = decoder
         self._max_len = max_len
         self._draft_model = draft_model
         self._stop_boost = stop_boost  # V12.30
+        self._hard_stop_threshold = hard_stop_threshold  # V12.37
 
     def set_draft_model(self, draft_model):
         """Set draft model for speculative decoding (V12.9)."""
@@ -1762,6 +1865,7 @@ class CombinedLossWithREINFORCE(nn.Module):
                 temperature=self.temperature,
                 max_len=self._max_len,
                 stop_boost=self._stop_boost,  # V12.30
+                hard_stop_threshold=self._hard_stop_threshold,  # V12.37
             )
             self._last_spec_stats = None
 
@@ -1930,6 +2034,7 @@ class CombinedLossWithREINFORCE(nn.Module):
                 return_log_probs=False,
                 cached_memory=cached_memory,
                 stop_boost=self._stop_boost,  # V12.30
+                hard_stop_threshold=self._hard_stop_threshold,  # V12.37
             )
 
             # Pad/truncate greedy tokens to match target length for reward computation
@@ -1966,6 +2071,7 @@ class CombinedLossWithREINFORCE(nn.Module):
             max_len=self._max_len,
             cached_memory=cached_memory,
             stop_boost=self._stop_boost,  # V12.30
+            hard_stop_threshold=self._hard_stop_threshold,  # V12.37
         )
 
         # Pad/truncate sampled tokens to match target length
@@ -2886,6 +2992,7 @@ def load_checkpoint(encoder, decoder, checkpoint_path, entropy_manager=None,
 @torch.no_grad()
 def evaluate_true_autoregressive(encoder, decoder, loader, device, max_samples=1000,
                                   log_errors=True, epoch=None, stop_boost=0.0,
+                                  hard_stop_threshold=0.0,
                                   norm_stats=None, family_lookup_tables=None):
     """
     V12.18: Enhanced evaluation with full Z-space diagnostics and reconstruction metrics.
@@ -3034,6 +3141,7 @@ def evaluate_true_autoregressive(encoder, decoder, loader, device, max_samples=1
             temperature=0.001,  # Near-greedy for evaluation
             max_len=decoder.max_len,
             stop_boost=stop_boost,  # V12.30
+            hard_stop_threshold=hard_stop_threshold,  # V12.37
         )
 
         # Compare with targets (excluding START token from targets)
@@ -3587,6 +3695,13 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
                 stop_bce = F.binary_cross_entropy_with_logits(
                     stop_logits, stop_targets, reduction='none'
                 )
+                # V12.37: Position-aware stop loss weighting — 10x weight at END positions
+                # Addresses 1:14 class imbalance (only 1 END per ~14 non-END positions)
+                stop_end_position_weight = TRAIN_CONFIG.get('stop_end_position_weight', 1.0)
+                if stop_end_position_weight > 1.0:
+                    is_end_position = (formula_targets == END_IDX).float()
+                    position_weights = torch.where(is_end_position > 0, stop_end_position_weight, 1.0)
+                    stop_bce = stop_bce * position_weights
                 # Apply mask and average
                 stop_loss_val = (stop_bce * stop_mask).sum() / stop_mask.sum().clamp(min=1)
 
@@ -4185,7 +4300,8 @@ def train():
     # Wire up decoder for autoregressive REINFORCE/SCST sampling
     if TRAIN_CONFIG.get('rl_weight', 0.0) > 0 and TRAIN_CONFIG.get('use_autoregressive_reinforce', True):
         loss_fn.set_decoder(decoder, max_len=TRAIN_CONFIG['max_formula_len'], draft_model=draft_model,
-                            stop_boost=TRAIN_CONFIG.get('stop_boost', 0.0))  # V12.30
+                            stop_boost=TRAIN_CONFIG.get('stop_boost', 0.0),
+                            hard_stop_threshold=TRAIN_CONFIG.get('hard_stop_threshold', 0.0))  # V12.37
         rl_method = TRAIN_CONFIG.get('rl_method', 'scst')
         method_name = 'SCST (Self-Critical)' if rl_method == 'scst' else 'RLOO (Leave-One-Out)'
         print(f"RL: {method_name}, rl_weight={TRAIN_CONFIG['rl_weight']}, "
@@ -4545,7 +4661,8 @@ def train():
         _shutdown_state['encoder'] = encoder
         # V12.15: Preserve draft_model when updating decoder reference after compile
         loss_fn.set_decoder(decoder, max_len=TRAIN_CONFIG['max_formula_len'], draft_model=draft_model,
-                            stop_boost=TRAIN_CONFIG.get('stop_boost', 0.0))  # V12.30
+                            stop_boost=TRAIN_CONFIG.get('stop_boost', 0.0),
+                            hard_stop_threshold=TRAIN_CONFIG.get('hard_stop_threshold', 0.0))  # V12.37
         print("  Encoder and decoder.transformer_decoder compiled")
 
         # Warmup pass: initialize CUDA graphs with a real batch to prevent NaN on first epoch
@@ -4824,6 +4941,7 @@ def train():
                 encoder, decoder, train_loader, device, max_samples=eval_max,
                 log_errors=True, epoch=epoch,
                 stop_boost=TRAIN_CONFIG.get('stop_boost', 0.0),  # V12.30
+                hard_stop_threshold=TRAIN_CONFIG.get('hard_stop_threshold', 0.0),  # V12.37
                 norm_stats=norm_stats,  # V12.34: Fix Tc range denormalization
                 family_lookup_tables=family_lookup_tables,  # V12.36: Family diagnostics
             )

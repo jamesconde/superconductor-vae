@@ -56,6 +56,14 @@ class GPURewardConfig:
     use_semantic_digit_penalty: bool = True
     semantic_digit_scale: float = 2.0  # Multiplier for digit difference scaling
 
+    # V12.37: Length-only error reward (perfect formula prefix, just too long)
+    # Addresses extra-append failure (12.75% of errors): model outputs correct formula
+    # then appends extra tokens instead of stopping. Give high reward to encourage
+    # learning to stop earlier.
+    length_only_base_reward: float = 50.0   # Base reward for length-only errors
+    length_only_per_extra: float = 5.0      # Penalty per extra token beyond END
+    length_only_floor: float = 10.0         # Minimum reward for length-only errors
+
 
 def get_default_gpu_reward_config() -> GPURewardConfig:
     """Get default GPU-native reward config."""
@@ -302,24 +310,45 @@ def compute_reward_gpu_native(
                           torch.full_like(rewards, config.exact_match),
                           rewards)
 
-    # Near-exact bonuses (only if not exact)
+    # V12.37: Length-only error detection — "perfect formula, just too long"
+    # All tokens up to target END are correct, but sampled sequence continues past END.
+    # This is the #1 non-exact error type (12.75% of dataset). Give high reward
+    # to provide gradient signal to "just stop one token earlier."
+    not_exact = ~exact_match
+    target_end_col = target_end_pos.unsqueeze(1).long()  # [batch, 1]
+    seq_len = sampled_tokens.size(1)
+    positions = torch.arange(seq_len, device=device).unsqueeze(0)  # [1, seq_len]
+    before_target_end = positions < target_end_col  # [batch, seq_len]
+    # Check if all tokens before target END match
+    prefix_correct = ((sampled_tokens == target_tokens) | ~before_target_end | ~mask).all(dim=1)
+    too_long = sampled_end_pos > target_end_pos
+    length_only_error = prefix_correct & too_long & not_exact
+
+    # Reward: high base minus mild penalty per extra token, with a floor
+    extra_tokens = (sampled_end_pos - target_end_pos).clamp(min=0)
+    length_only_reward = config.length_only_base_reward - extra_tokens * config.length_only_per_extra
+    length_only_reward = length_only_reward.clamp(min=config.length_only_floor)
+
+    rewards = torch.where(length_only_error, length_only_reward, rewards)
+
+    # Near-exact bonuses (only if not exact and not length-only)
     # V12.5: Apply semantic fraction penalty to near-exact cases too!
     # V12.30: Apply length_mismatch_penalty to near-exact tiers (previously only applied to partial_credit).
     # This prevents RL from rewarding "perfect formula + extra token" with full near_exact bonus.
-    not_exact = ~exact_match
+    not_handled = not_exact & ~length_only_error  # V12.37: Skip length-only errors (already rewarded)
     length_penalty = length_diff * config.length_mismatch_penalty
-    rewards = torch.where(not_exact & near_exact_1,
+    rewards = torch.where(not_handled & near_exact_1,
                           torch.full_like(rewards, config.near_exact_1) + fraction_penalty + length_penalty,
                           rewards)
-    rewards = torch.where(not_exact & near_exact_2,
+    rewards = torch.where(not_handled & near_exact_2,
                           torch.full_like(rewards, config.near_exact_2) + fraction_penalty + length_penalty,
                           rewards)
-    rewards = torch.where(not_exact & near_exact_3,
+    rewards = torch.where(not_handled & near_exact_3,
                           torch.full_like(rewards, config.near_exact_3) + fraction_penalty + length_penalty,
                           rewards)
 
     # For samples with 4+ mismatches, use token-level partial credit
-    partial_credit_mask = not_exact & (n_mismatches > 3)
+    partial_credit_mask = not_exact & ~length_only_error & (n_mismatches > 3)
     token_reward = n_matches * config.token_correct + n_mismatches * config.token_penalty
     token_reward = token_reward + length_diff * config.length_mismatch_penalty
 

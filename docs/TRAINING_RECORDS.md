@@ -4,6 +4,48 @@ Chronological record of training runs, architecture changes, and optimization de
 
 ---
 
+## V12.37: Plateau-Breaking Interventions (2026-02-16)
+
+### Problem
+
+Model stuck at ~61-65% exact match (epochs 2764-2812). Plateau analysis identified three root causes:
+1. **Extra-append failure** (257 samples, 12.75%): Model outputs correct formula then appends extra tokens instead of stopping. Fixing this alone: 63.69% → 76.44%.
+2. **Fraction cascade errors** (177 samples): One wrong digit cascades through all subsequent tokens.
+3. **RL reward blindness**: Sample with 39/40 correct tokens gets low reward — no gradient signal to "just stop one token earlier."
+
+### Changes
+
+**Intervention 1: Aggressive Stop Token Training**
+- `stop_boost`: 4.0 → 10.0 (stronger END logit boost from stop head)
+- `hard_stop_threshold`: 0.8 (force END when sigmoid(stop_logit) > 0.8)
+- `stop_end_position_weight`: 10.0 (10x weight on END positions in stop BCE loss, addresses 1:14 class imbalance)
+- Length-conditional stop boost: after position 10, adds `stop_boost * 0.1 * (position - 10)` to END logit
+
+**Intervention 2: Near-Miss Reward Shaping**
+- Length-only error detection in `reward_gpu_native.py`: detects "perfect prefix, just too long" samples
+- New `GPURewardConfig` fields: `length_only_base_reward=50.0`, `length_only_per_extra=5.0`, `length_only_floor=10.0`
+- These samples get high reward (50 - 5*extra_tokens, min 10) instead of being penalized
+
+**Intervention 3: Hard Sequence Oversampling**
+- `oversample_hard_sequences`: True (upweight long/complex formulas in sampler)
+- `oversample_length_base`: 15 (sequences > 15 tokens get progressively upweighted)
+- Also upweights by element count (4+ elements get 1.5x, 5+ get 2x)
+
+**Intervention 4: Integer-to-Fraction Normalization**
+- `normalize_integers_to_fractions`: True (convert `Ba8Cu12O28PrY3` → fraction format)
+- Reduces decoder vocabulary ambiguity — only one representation format to learn
+- Triggers cache rebuild (new cache invalidation key)
+
+**Modified Files:**
+- `scripts/train_v12_clean.py` — Config, position-weighted stop loss, integer normalization, oversampling
+- `src/superconductor/models/autoregressive_decoder.py` — Hard stop threshold, length-conditional boost
+- `src/superconductor/losses/reward_gpu_native.py` — Length-only error detection + reward shaping
+
+**Deferred to V12.38+:**
+- Fraction pre-tokenization (atomic fraction tokens, +5-10% potential but requires vocabulary redesign and full retrain)
+
+---
+
 ## V12.36b: Family Prediction Diagnostics in Error Reports (2026-02-16)
 
 ### Problem
