@@ -549,6 +549,145 @@ def create_attention_vae(
 
 
 # ============================================================================
+# V12.33: HIERARCHICAL FAMILY CLASSIFICATION HEAD
+# ============================================================================
+
+class HierarchicalFamilyHead(nn.Module):
+    """
+    V12.33: 3-level hierarchical family classification conditioned on sc_pred.
+
+    Replaces the flat 14-class family_head with a tree structure:
+        Level 0: NOT_SC = 1 - P(SC)                     (from sc_head, not learned here)
+        Level 1: Coarse family (7 classes, SC samples only)
+            0: BCS_CONVENTIONAL  (fine class 1)
+            1: CUPRATE           (fine classes 2-7)
+            2: IRON              (fine classes 8-9)
+            3: MGB2              (fine class 10)
+            4: HEAVY_FERMION     (fine class 11)
+            5: ORGANIC           (fine class 12)
+            6: OTHER_UNKNOWN     (fine class 13)
+        Level 2a: Cuprate sub-family (6 classes, cuprate samples only)
+            0: YBCO(2), 1: LSCO(3), 2: BSCCO(4), 3: TBCCO(5), 4: HBCCO(6), 5: OTHER(7)
+        Level 2b: Iron sub-family (2 classes, iron samples only)
+            0: PNICTIDE(8), 1: CHALCOGENIDE(9)
+
+    Composed 14-class probability:
+        P(NOT_SC)   = 1 - P(SC)
+        P(BCS)      = P(SC) * P(BCS|SC)
+        P(YBCO)     = P(SC) * P(Cuprate|SC) * P(YBCO|Cuprate)
+        P(PNICTIDE) = P(SC) * P(Iron|SC)    * P(Pnictide|Iron)
+        etc.
+    """
+
+    def __init__(self, backbone_dim: int = 512, dropout: float = 0.1):
+        super().__init__()
+
+        # Coarse head: h(backbone_dim) + sc_prob(1) → 256 → 128 → 7
+        self.coarse_head = nn.Sequential(
+            nn.Linear(backbone_dim + 1, 256),
+            nn.LayerNorm(256),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(256, 128),
+            nn.GELU(),
+            nn.Linear(128, 7),
+        )
+
+        # Cuprate sub-head: h(backbone_dim) + sc_prob(1) → 128 → 64 → 6
+        self.cuprate_sub_head = nn.Sequential(
+            nn.Linear(backbone_dim + 1, 128),
+            nn.LayerNorm(128),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(128, 64),
+            nn.GELU(),
+            nn.Linear(64, 6),
+        )
+
+        # Iron sub-head: h(backbone_dim) + sc_prob(1) → 64 → 2
+        self.iron_sub_head = nn.Sequential(
+            nn.Linear(backbone_dim + 1, 64),
+            nn.LayerNorm(64),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(64, 2),
+        )
+
+    def forward(
+        self,
+        h: torch.Tensor,
+        sc_pred_detached: torch.Tensor,
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Hierarchical family classification conditioned on sc_pred.
+
+        Args:
+            h: [batch, backbone_dim] decoder backbone output
+            sc_pred_detached: [batch] sc_head logits (DETACHED — no gradient to sc_head)
+
+        Returns:
+            Dict with coarse_logits [batch, 7], cuprate_sub_logits [batch, 6],
+            iron_sub_logits [batch, 2], composed_14 [batch, 14] probabilities.
+        """
+        batch_size = h.shape[0]
+        device = h.device
+
+        # Condition on sc_pred probability (sigmoid of detached logit)
+        sc_prob = torch.sigmoid(sc_pred_detached).unsqueeze(-1)  # [batch, 1]
+        conditioned = torch.cat([h, sc_prob], dim=-1)  # [batch, backbone_dim + 1]
+
+        # Level 1: Coarse family logits (7 classes, for SC samples)
+        coarse_logits = self.coarse_head(conditioned)  # [batch, 7]
+
+        # Level 2a: Cuprate sub-family logits (6 classes)
+        cuprate_sub_logits = self.cuprate_sub_head(conditioned)  # [batch, 6]
+
+        # Level 2b: Iron sub-family logits (2 classes)
+        iron_sub_logits = self.iron_sub_head(conditioned)  # [batch, 2]
+
+        # Compose 14-class probability distribution
+        coarse_probs = F.softmax(coarse_logits, dim=-1)  # [batch, 7]
+        cuprate_sub_probs = F.softmax(cuprate_sub_logits, dim=-1)  # [batch, 6]
+        iron_sub_probs = F.softmax(iron_sub_logits, dim=-1)  # [batch, 2]
+
+        composed = torch.zeros(batch_size, 14, device=device)
+        sc_prob_squeezed = sc_prob.squeeze(-1)  # [batch]
+
+        # Class 0: NOT_SC = 1 - P(SC)
+        composed[:, 0] = 1.0 - sc_prob_squeezed
+
+        # Class 1: BCS_CONVENTIONAL = P(SC) * P(BCS|SC)
+        composed[:, 1] = sc_prob_squeezed * coarse_probs[:, 0]
+
+        # Classes 2-7: Cuprate sub-families = P(SC) * P(Cuprate|SC) * P(sub|Cuprate)
+        cuprate_prob = sc_prob_squeezed * coarse_probs[:, 1]  # [batch]
+        composed[:, 2:8] = cuprate_prob.unsqueeze(-1) * cuprate_sub_probs  # [batch, 6]
+
+        # Classes 8-9: Iron sub-families = P(SC) * P(Iron|SC) * P(sub|Iron)
+        iron_prob = sc_prob_squeezed * coarse_probs[:, 2]  # [batch]
+        composed[:, 8:10] = iron_prob.unsqueeze(-1) * iron_sub_probs  # [batch, 2]
+
+        # Class 10: MGB2 = P(SC) * P(MGB2|SC)
+        composed[:, 10] = sc_prob_squeezed * coarse_probs[:, 3]
+
+        # Class 11: HEAVY_FERMION = P(SC) * P(HF|SC)
+        composed[:, 11] = sc_prob_squeezed * coarse_probs[:, 4]
+
+        # Class 12: ORGANIC = P(SC) * P(Organic|SC)
+        composed[:, 12] = sc_prob_squeezed * coarse_probs[:, 5]
+
+        # Class 13: OTHER_UNKNOWN = P(SC) * P(Other|SC)
+        composed[:, 13] = sc_prob_squeezed * coarse_probs[:, 6]
+
+        return {
+            'coarse_logits': coarse_logits,
+            'cuprate_sub_logits': cuprate_sub_logits,
+            'iron_sub_logits': iron_sub_logits,
+            'composed_14': composed,
+        }
+
+
+# ============================================================================
 # V12: FULL MATERIALS VAE - Encodes entire supercon dataset
 # ============================================================================
 
@@ -811,17 +950,15 @@ class FullMaterialsVAE(nn.Module):
         )
 
         # =====================================================================
-        # FAMILY CLASSIFICATION HEAD (V12.32)
+        # HIERARCHICAL FAMILY CLASSIFICATION HEAD (V12.33)
         # =====================================================================
-        # Predicts superconductor family (14 classes) from decoder backbone.
-        # Classes defined in SuperconductorFamily enum (family_classifier.py).
-        # Loss: cross-entropy on ALL samples (non-SC = class 0).
+        # Replaces flat 14-class family_head with 3-level hierarchical tree:
+        #   sc_pred → coarse (7 SC families) → sub-family (cuprate: 6, iron: 2)
+        # Conditioned on sc_pred.detach() so P(NOT_SC) = 1 - P(SC).
+        # Loss: separate CE at each level on appropriate subsets.
         # =====================================================================
-        self.family_head = nn.Sequential(
-            nn.Linear(prev_dim, 256),   # prev_dim = 512 (decoder backbone output)
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(256, 14),  # 14 family classes
+        self.hierarchical_family_head = HierarchicalFamilyHead(
+            backbone_dim=prev_dim, dropout=dropout
         )
 
     def get_config(self) -> Dict:
@@ -919,15 +1056,12 @@ class FullMaterialsVAE(nn.Module):
         # V12.28: Tc bucket classification
         tc_class_logits = self.tc_class_head(h)
 
-        # V12.32: Family classification
-        family_logits = self.family_head(h)
-
         return {
             'tc_pred': tc_pred,
             'magpie_pred': magpie_pred,
             'attended_input': attended_input,
             'tc_class_logits': tc_class_logits,
-            'family_logits': family_logits,  # V12.32
+            'backbone_h': h,  # V12.33: Exposed for hierarchical family head
         }
 
     def forward(
@@ -983,6 +1117,10 @@ class FullMaterialsVAE(nn.Module):
         ], dim=-1)
         sc_pred = self.sc_head(sc_input).squeeze(-1)  # [batch] logits
 
+        # V12.33: Hierarchical family classification (conditioned on sc_pred)
+        # sc_pred.detach() prevents family gradients from flowing back through sc_head
+        family_out = self.hierarchical_family_head(dec_out['backbone_h'], sc_pred.detach())
+
         # Latent regularization: L2 on z (deterministic mode) or KL (VAE mode)
         # IMPORTANT (2026-02-02): 'kl_loss' key is INTENTIONALLY reused for L2 reg.
         # The entire downstream pipeline (CombinedLossWithREINFORCE, train_v12_clean.py,
@@ -1026,8 +1164,11 @@ class FullMaterialsVAE(nn.Module):
             'sc_pred': sc_pred,
             # Tc bucket classification (V12.28) — 5 classes, cross-entropy loss
             'tc_class_logits': tc_class_logits,
-            # Family classification (V12.32) — 14 classes, cross-entropy loss
-            'family_logits': dec_out.get('family_logits'),
+            # V12.33: Hierarchical family classification (replaces flat family_logits)
+            'family_coarse_logits': family_out['coarse_logits'],        # [batch, 7]
+            'family_cuprate_sub_logits': family_out['cuprate_sub_logits'],  # [batch, 6]
+            'family_iron_sub_logits': family_out['iron_sub_logits'],    # [batch, 2]
+            'family_composed_14': family_out['composed_14'],            # [batch, 14] probs
         }
 
     def predict_tc_mc(self, z: torch.Tensor, n_samples: int = 10) -> Tuple[torch.Tensor, torch.Tensor]:
