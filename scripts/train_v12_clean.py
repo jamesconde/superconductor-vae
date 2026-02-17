@@ -652,6 +652,14 @@ TRAIN_CONFIG = {
     'physics_z_warmup_epochs': 20,            # Ramp up physics Z losses
     'physics_z_data_path': None,              # Path to optional physics data CSV
 
+    # V12.36: Extended consistency losses for previously unsupervised blocks
+    # Thermodynamic (Block 7): z[TC] ≈ Tc input, ordering, Delta_Tc identity
+    # Structural (Block 5): Volume ∝ a*b*c
+    # Electronic (Block 6): Drude weight ∝ plasma_freq²
+    # Weight is deliberately lower than existing consistency (0.1) to avoid
+    # over-constraining; these blocks have no external supervision data.
+    'physics_z_new_consistency_weight': 0.05,
+
     # =========================================================================
     # V12.34: Error-Driven Training Refinements
     # =========================================================================
@@ -3600,6 +3608,7 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
                     comp_targets=comp_targets,
                     magpie_features=magpie,
                     physics_targets=None,  # Placeholder until external data exists
+                    tc_normalized=tc,      # V12.36: For thermodynamic consistency
                 )
                 physics_z_loss_val = pz_result['total'] * physics_z_weight
 
@@ -4168,12 +4177,16 @@ def train():
             'magpie_enc_weight': TRAIN_CONFIG.get('physics_z_magpie_weight', 0.5),
             'consistency_weight': TRAIN_CONFIG.get('physics_z_consistency_weight', 0.1),
             'direct_weight': TRAIN_CONFIG.get('physics_z_direct_weight', 0.0),
+            'new_consistency_weight': TRAIN_CONFIG.get('physics_z_new_consistency_weight', 0.05),  # V12.36
+            'magpie_dim': magpie_dim,  # V12.33: Pass actual Magpie feature count (145 or 151)
         }
         physics_z_loss_fn = PhysicsZLoss(physics_z_config).to(device)
         n_pz_params = sum(p.numel() for p in physics_z_loss_fn.parameters())
+        new_w = physics_z_config['new_consistency_weight']
         print(f"Physics Z Loss: V12.31 (comp={physics_z_config['comp_weight']}, "
               f"magpie={physics_z_config['magpie_enc_weight']}, "
               f"consistency={physics_z_config['consistency_weight']}, "
+              f"new_consistency={new_w}, "  # V12.36
               f"warmup={TRAIN_CONFIG.get('physics_z_warmup_epochs', 20)} epochs, "
               f"params={n_pz_params:,})")
 

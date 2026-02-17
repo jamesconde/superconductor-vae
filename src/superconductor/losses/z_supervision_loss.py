@@ -227,6 +227,112 @@ class DimensionlessRatioConsistencyLoss(nn.Module):
         return loss_tc_theta + loss_xi_l
 
 
+class ThermodynamicConsistencyLoss(nn.Module):
+    """Block 7 consistency: enforce thermodynamic relationships in Z.
+
+    V12.36: Three constraints, all definitionally true:
+
+    1. z[TC] ≈ tc_normalized  (direct supervision — we have Tc for every sample)
+       The encoder already predicts Tc via a separate head, but nothing forces the
+       DESIGNATED Tc coordinate (z[210]) to hold that value. Currently z[210] only
+       correlates r=0.49 with actual Tc while a random discovery coord hits r=0.87.
+
+    2. z[TC_ONSET] >= z[TC_MIDPOINT] >= z[TC_ZERO]  (ordering)
+       By definition, the onset temperature is always >= midpoint >= zero-resistance.
+       Uses hinge loss: only penalizes violations, no effect when ordering holds.
+
+    3. z[DELTA_TC] ≈ z[TC_ONSET] - z[TC_ZERO]  (mathematical identity)
+       Transition width is defined as onset minus zero-resistance Tc.
+
+    Uses SmoothL1Loss for numerical stability and gentle gradients.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.huber = nn.SmoothL1Loss()
+
+    def forward(self, z: torch.Tensor, tc_normalized: Optional[torch.Tensor] = None) -> torch.Tensor:
+        tc_coord = z[:, PhysicsZ.TC]
+        tc_onset = z[:, PhysicsZ.TC_ONSET]
+        tc_mid = z[:, PhysicsZ.TC_MIDPOINT]
+        tc_zero = z[:, PhysicsZ.TC_ZERO]
+        delta_tc = z[:, PhysicsZ.DELTA_TC]
+
+        loss = torch.tensor(0.0, device=z.device)
+
+        # 1. z[TC] should match the actual normalized Tc input
+        if tc_normalized is not None:
+            tc_target = tc_normalized.squeeze()
+            loss = loss + self.huber(tc_coord, tc_target)
+
+        # 2. Soft ordering: onset >= midpoint >= zero (hinge loss on violations)
+        # Only penalize when ordering is violated; no gradient when correct
+        loss = loss + F.relu(tc_mid - tc_onset).mean()    # penalize mid > onset
+        loss = loss + F.relu(tc_zero - tc_mid).mean()     # penalize zero > mid
+
+        # 3. Delta_Tc = Tc_onset - Tc_zero (mathematical identity)
+        delta_target = (tc_onset.detach() - tc_zero.detach())
+        loss = loss + self.huber(delta_tc, delta_target)
+
+        return loss
+
+
+class StructuralConsistencyLoss(nn.Module):
+    """Block 5 consistency: enforce structural relationships in Z.
+
+    V12.36: One constraint (mathematical identity):
+
+    z[VOLUME] ∝ z[LATTICE_A] * z[LATTICE_B] * z[LATTICE_C]
+
+    Unit cell volume is proportional to the product of lattice parameters.
+    Exact for orthogonal systems (cubic, tetragonal, orthorhombic),
+    approximate for others (off by sin(angle) factors).
+
+    Uses SmoothL1Loss with clamped targets to prevent gradient explosions.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.huber = nn.SmoothL1Loss()
+
+    def forward(self, z: torch.Tensor) -> torch.Tensor:
+        a = z[:, PhysicsZ.LATTICE_A].clamp(min=0.01)
+        b = z[:, PhysicsZ.LATTICE_B].clamp(min=0.01)
+        c = z[:, PhysicsZ.LATTICE_C].clamp(min=0.01)
+        vol = z[:, PhysicsZ.VOLUME]
+
+        # Volume proportional to a * b * c
+        vol_target = (a * b * c).clamp(-100, 100)
+        return self.huber(vol, vol_target)
+
+
+class ElectronicConsistencyLoss(nn.Module):
+    """Block 6 consistency: enforce electronic relationships in Z.
+
+    V12.36: One constraint (Drude model, well-established):
+
+    z[DRUDE_WEIGHT] ∝ z[PLASMA_FREQ]^2
+
+    The Drude weight (optical spectral weight) is proportional to the square
+    of the plasma frequency. This is a standard result in condensed matter
+    physics, valid for all metals.
+
+    Uses SmoothL1Loss with clamped targets to prevent gradient explosions.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.huber = nn.SmoothL1Loss()
+
+    def forward(self, z: torch.Tensor) -> torch.Tensor:
+        plasma = z[:, PhysicsZ.PLASMA_FREQ]
+        drude = z[:, PhysicsZ.DRUDE_WEIGHT]
+
+        # Drude weight proportional to plasma_freq^2
+        drude_target = plasma.detach().pow(2).clamp(-100, 100)
+        return self.huber(drude, drude_target)
+
+
 class DirectSupervisionLoss(nn.Module):
     """Supervise Z coordinates against ground-truth physics data.
 
@@ -268,12 +374,16 @@ class PhysicsZLoss(nn.Module):
         super().__init__()
         self.config = config
         self.comp_loss = CompositionalSupervisionLoss()
-        self.magpie_loss = MagpieEncodingLoss()
+        self.magpie_loss = MagpieEncodingLoss(magpie_dim=config.get('magpie_dim', 145))
         self.gl_loss = GLConsistencyLoss()
         self.bcs_loss = BCSConsistencyLoss()
         self.cobordism_loss = CobordismConsistencyLoss()
         self.ratio_loss = DimensionlessRatioConsistencyLoss()
         self.direct_loss = DirectSupervisionLoss()
+        # V12.36: New consistency losses for previously unsupervised blocks
+        self.thermo_loss = ThermodynamicConsistencyLoss()
+        self.structural_loss = StructuralConsistencyLoss()
+        self.electronic_loss = ElectronicConsistencyLoss()
 
     def forward(
         self,
@@ -281,6 +391,7 @@ class PhysicsZLoss(nn.Module):
         comp_targets: torch.Tensor,
         magpie_features: torch.Tensor,
         physics_targets: Optional[Dict[str, tuple]] = None,
+        tc_normalized: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         """Compute all physics Z losses.
 
@@ -289,6 +400,7 @@ class PhysicsZLoss(nn.Module):
             comp_targets: [batch, 15] normalized compositional targets
             magpie_features: [batch, 145] normalized Magpie features
             physics_targets: optional dict of external physics data
+            tc_normalized: [batch] or [batch, 1] normalized Tc values (V12.36)
 
         Returns:
             dict with individual loss components and 'total'
@@ -301,11 +413,18 @@ class PhysicsZLoss(nn.Module):
         losses['cobordism'] = self.cobordism_loss(z)
         losses['ratios'] = self.ratio_loss(z)
         losses['direct'] = self.direct_loss(z, physics_targets)
+        # V12.36: New consistency losses
+        losses['thermo_consistency'] = self.thermo_loss(z, tc_normalized)
+        losses['structural_consistency'] = self.structural_loss(z)
+        losses['electronic_consistency'] = self.electronic_loss(z)
 
         comp_w = self.config.get('comp_weight', 1.0)
         magpie_w = self.config.get('magpie_enc_weight', 0.5)
         consistency_w = self.config.get('consistency_weight', 0.1)
         direct_w = self.config.get('direct_weight', 0.0)
+        # V12.36: Separate weight for new block consistency (default lower than
+        # existing consistency to avoid over-constraining during introduction)
+        new_consistency_w = self.config.get('new_consistency_weight', 0.05)
 
         total = (
             comp_w * losses['comp']
@@ -317,6 +436,11 @@ class PhysicsZLoss(nn.Module):
                 + losses['ratios']
             )
             + direct_w * losses['direct']
+            + new_consistency_w * (
+                losses['thermo_consistency']
+                + losses['structural_consistency']
+                + losses['electronic_consistency']
+            )
         )
         losses['total'] = total
         return losses

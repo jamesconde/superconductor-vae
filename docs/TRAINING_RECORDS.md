@@ -4,6 +4,58 @@ Chronological record of training runs, architecture changes, and optimization de
 
 ---
 
+## V12.36: Self-Consistency Losses for Unsupervised Z Blocks (2026-02-16)
+
+### Problem
+
+Analysis of the trained latent space revealed that the 6 unsupervised physics Z blocks (Eliashberg, Unconventional, Structural, Electronic, Thermodynamic, Discovery) encode active, material-discriminative information — but with no physics guardrails. For example:
+- z[TC] (coord 210, designated Tc coordinate) only correlates r=0.49 with actual Tc, while a random discovery coord hits r=0.87
+- Tc ordering (onset >= midpoint >= zero) holds only 42% of the time
+- Structural coords (volume, lattice params) have no consistency enforcement
+
+The encoder puts information wherever reconstruction is easiest, not where physics says it should be.
+
+### Changes
+
+**Modified Files:**
+- `src/superconductor/losses/z_supervision_loss.py` — Added 3 new loss classes: `ThermodynamicConsistencyLoss`, `StructuralConsistencyLoss`, `ElectronicConsistencyLoss`. Updated `PhysicsZLoss` to include them with `new_consistency_weight` config.
+- `scripts/train_v12_clean.py` — Added `physics_z_new_consistency_weight` TRAIN_CONFIG entry (default 0.05). Passes `tc_normalized=tc` to PhysicsZLoss.
+
+### Constraint Details
+
+All constraints are **soft** (penalties, not hard clamps) and use SmoothL1Loss (Huber) for numerical stability. Only mathematical identities and well-established physics are enforced.
+
+#### Thermodynamic Block (Block 7, coords 210-269)
+- **z[TC] ≈ tc_normalized**: Direct supervision from the Tc input we already have. Forces the designated TC coordinate to actually hold Tc information.
+- **Ordering**: Hinge loss on violations of Tc_onset >= Tc_midpoint >= Tc_zero. No gradient when ordering holds (zero penalty for correct samples).
+- **Delta_Tc = Tc_onset - Tc_zero**: Mathematical identity — transition width is defined as the difference.
+
+#### Structural Block (Block 5, coords 110-159)
+- **Volume ∝ a * b * c**: Unit cell volume is proportional to lattice parameter product. Exact for orthogonal crystal systems, approximate for others.
+
+#### Electronic Block (Block 6, coords 160-209)
+- **Drude weight ∝ plasma_freq²**: Standard Drude model result, valid for all metals.
+
+### What Was NOT Constrained (and why)
+
+| Block | Why Skipped |
+|-------|-------------|
+| **Unconventional** (70-109) | Gap symmetry, spin fractions, doping — too model-dependent (assumes specific pairing mechanisms). Would penalize unconventional superconductors. |
+| **Eliashberg** (50-69) | Coupling relationships overlap with BCS block constraints — risk of double-constraining. Spectral function parameters too esoteric without external data. |
+| **Discovery** (512-2047) | Intentionally unsupervised. The whole point is free representation learning. |
+
+### New TRAIN_CONFIG Key
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `physics_z_new_consistency_weight` | `0.05` | Weight for V12.36 consistency losses (thermo + structural + electronic). Deliberately lower than existing consistency weight (0.1) to avoid over-constraining. |
+
+### Design Philosophy
+
+These constraints are **safeguards**, not supervision. They ensure the Z coordinates aren't nonsensical without pigeon-holing the network into specific physical models. The weight (0.05) is gentle — strong enough to impose basic consistency, weak enough that the encoder can deviate if reconstruction demands it.
+
+---
+
 ## V12.35: Per-Block Physics Z Diagnostics in Error Reports (2026-02-16)
 
 ### Problem
