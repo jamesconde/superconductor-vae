@@ -1,21 +1,22 @@
 #!/usr/bin/env python3
 """
-Holdout Tc/Magpie Validation — "The Full Enchilada"
-=====================================================
+Holdout Full Enchilada Validation
+==================================
 
-For each of the 45 holdout materials:
-1. Encode the actual holdout sample through the encoder → Z
-2. encoder.decode(Z) → tc_pred, magpie_pred, attended_input
-3. decoder.generate(Z, skip, stoich) → formula string
-4. Compare: tc_pred vs true Tc, magpie_pred vs true Magpie, formula vs original
+For each of the 45 holdout materials, evaluates EVERY model capability:
+1. Formula generation (encode → Z → decode → token sequence)
+2. Tc prediction (regression, continuous Kelvin)
+3. Tc classification (5-bucket: non-SC, 0-10K, 10-50K, 50-100K, 100K+)
+4. Magpie feature reconstruction (145-dim compositional descriptors)
+5. SC classification (binary: is this a superconductor?)
+6. Family classification (14-class hierarchical: coarse family → sub-family)
+7. High-pressure prediction (binary: requires high pressure?)
 
-This proves that Z encodes the complete material information, and
-manipulating Z gives us formula + Tc + Magpie simultaneously.
+V12.40: Uses encoder.forward() to get all heads in one pass.
 
 Usage:
     cd /home/james/superconductor-vae
-    PYTHONPATH=src python -u scripts/analysis/holdout_tc_validation.py
-    PYTHONPATH=src python -u scripts/analysis/holdout_tc_validation.py --checkpoint outputs/best_checkpoints/checkpoint_best_V12.38_colab.pt
+    PYTHONPATH=src python -u scripts/holdout/holdout_tc_validation.py
 """
 
 import argparse
@@ -32,7 +33,7 @@ import torch
 import torch.nn.functional as F
 import numpy as np
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / 'src'))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'src'))
 
 from superconductor.models.attention_vae import FullMaterialsVAE
 from superconductor.models.autoregressive_decoder import (
@@ -40,8 +41,24 @@ from superconductor.models.autoregressive_decoder import (
     PAD_IDX, START_IDX, END_IDX,
 )
 from superconductor.data.canonical_ordering import CanonicalOrderer
+from superconductor.models.family_classifier import SuperconductorFamily
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent  # scripts/analysis/ -> scripts/ -> project root
+PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+
+parser = argparse.ArgumentParser(description='Holdout validation for superconductor VAE')
+parser.add_argument('--checkpoint', type=str, default=None,
+                    help='Path to checkpoint file (default: outputs/checkpoint_best.pt)')
+args, _ = parser.parse_known_args()
+
+if args.checkpoint:
+    CHECKPOINT_PATH = Path(args.checkpoint)
+else:
+    CHECKPOINT_PATH = PROJECT_ROOT / 'outputs' / 'checkpoint_best.pt'
+
+# Build output filename from checkpoint name
+ckpt_stem = CHECKPOINT_PATH.stem  # e.g. 'checkpoint_best_V12.38_colab'
+OUTPUT_PATH = PROJECT_ROOT / 'outputs' / f'holdout_tc_validation_{ckpt_stem}.json'
+
 HOLDOUT_PATH = PROJECT_ROOT / 'data' / 'GENERATIVE_HOLDOUT_DO_NOT_TRAIN.json'
 CACHE_DIR = PROJECT_ROOT / 'data' / 'processed' / 'cache'
 
@@ -112,9 +129,9 @@ def element_similarity(gen_formula, target_formula):
     return 0.4 * jaccard + 0.6 * frac_sim
 
 
-def load_models(checkpoint_path):
-    print(f"Loading checkpoint: {checkpoint_path}")
-    checkpoint = torch.load(checkpoint_path, map_location=DEVICE, weights_only=False)
+def load_models():
+    print(f"Loading checkpoint: {CHECKPOINT_PATH}")
+    checkpoint = torch.load(CHECKPOINT_PATH, map_location=DEVICE, weights_only=False)
 
     enc_state_raw = checkpoint.get('encoder_state_dict', {})
     magpie_dim = 145
@@ -122,12 +139,9 @@ def load_models(checkpoint_path):
         if 'magpie_encoder' in k and k.endswith('.weight') and v.dim() == 2:
             magpie_dim = v.shape[1]
             break
+    print(f"  magpie_dim={magpie_dim}")
 
     enc_state = {k.replace('_orig_mod.', ''): v for k, v in enc_state_raw.items()}
-
-    # Detect V12.38+ numden_head
-    has_numden_head = any('numden_head.' in k for k in enc_state)
-
     encoder = FullMaterialsVAE(
         n_elements=118, element_embed_dim=128, n_attention_heads=8,
         magpie_dim=magpie_dim, fusion_dim=256, encoder_hidden=[512, 256],
@@ -145,33 +159,20 @@ def load_models(checkpoint_path):
 
     dec_state_raw = checkpoint.get('decoder_state_dict', {})
     dec_state = {k.replace('_orig_mod.', ''): v for k, v in dec_state_raw.items()}
-
-    # Detect stoich_input_dim from checkpoint weights
-    stoich_weight_key = 'stoich_to_memory.0.weight'
-    if stoich_weight_key in dec_state:
-        stoich_dim = dec_state[stoich_weight_key].shape[1]
-        if stoich_dim == 37:
-            max_elements = 12  # V12.38: 12*3+1=37
-        else:
-            max_elements = stoich_dim - 1  # Pre-V12.38: 12+1=13, so max_elements=12
-    else:
-        max_elements = 12
-
     decoder = EnhancedTransformerDecoder(
         latent_dim=2048, d_model=512, nhead=8, num_layers=12,
         dim_feedforward=2048, dropout=0.1, max_len=60,
         n_memory_tokens=16, encoder_skip_dim=256,
         use_skip_connection=True, use_stoich_conditioning=True,
-        max_elements=max_elements, n_stoich_tokens=4,
+        max_elements=12, n_stoich_tokens=4,
     ).to(DEVICE)
     decoder.load_state_dict(dec_state, strict=False)
 
     encoder.eval()
     decoder.eval()
     epoch = checkpoint.get('epoch', '?')
-    print(f"  Loaded epoch {epoch}, magpie_dim={magpie_dim}, numden_head={has_numden_head}")
-    print(f"  Decoder stoich_input_dim={decoder.stoich_to_memory[0].in_features}")
-    return encoder, decoder, magpie_dim, has_numden_head
+    print(f"  Loaded epoch {epoch}")
+    return encoder, decoder, magpie_dim
 
 
 def load_data(magpie_dim):
@@ -190,88 +191,105 @@ def load_data(magpie_dim):
 
 
 @torch.no_grad()
-def full_decode(encoder, decoder, z, has_numden_head=False, temperature=0.01):
-    """Decode Z → formula + Tc + Magpie + stoichiometry (the full enchilada).
+def full_forward(encoder, decoder, elem_idx, elem_frac, elem_mask, magpie, tc, temperature=0.01):
+    """Run encoder.forward() to get ALL head predictions, then formula decoder.
 
-    Returns dict with all predictions the model makes from a Z vector.
+    V12.40: Uses forward() instead of separate encode/decode to capture
+    sc_pred, family classification, and hp_pred.
+
+    Returns dict with every prediction the model makes.
     """
-    z_dev = z.to(DEVICE)
-    if z_dev.dim() == 1:
-        z_dev = z_dev.unsqueeze(0)
+    # Full forward pass through encoder — runs ALL heads
+    enc_out = encoder(
+        elem_idx.to(DEVICE),
+        elem_frac.to(DEVICE),
+        elem_mask.to(DEVICE),
+        magpie.to(DEVICE),
+        tc.to(DEVICE),
+    )
 
-    # encoder.decode gives us Tc and Magpie predictions from Z
-    dec_out = encoder.decode(z_dev)
-    tc_pred = dec_out['tc_pred'][0].item()
-    magpie_pred = dec_out['magpie_pred'][0].cpu()
-    tc_class_logits = dec_out.get('tc_class_logits', None)
+    z = enc_out['z']
+    tc_pred_norm = enc_out['tc_pred'][0].item()
+    magpie_pred = enc_out['magpie_pred'][0].cpu()
 
-    # V12.38: Assemble stoich_pred with numden conditioning
-    fraction_output = encoder.fraction_head(z_dev)
-    fraction_pred = fraction_output[:, :encoder.max_elements]  # [batch, 12]
-    element_count_pred = fraction_output[:, -1]                # [batch]
+    # Stoichiometry for decoder conditioning
+    fraction_pred = enc_out['fraction_pred']
+    element_count_pred = enc_out['element_count_pred']
+    numden_pred = enc_out.get('numden_pred')
 
-    if has_numden_head and hasattr(encoder, 'numden_head'):
-        numden_pred = encoder.numden_head(z_dev)  # [batch, 24]
+    # Assemble stoich_pred matching train_v12_clean.py logic
+    if numden_pred is not None:
         stoich_pred = torch.cat([fraction_pred, numden_pred, element_count_pred.unsqueeze(-1)], dim=-1)
     else:
         stoich_pred = torch.cat([fraction_pred, element_count_pred.unsqueeze(-1)], dim=-1)
 
-    stoich_pred_cpu = stoich_pred[0].cpu()
-
     # Skip connection for formula decoder
-    encoder_skip = dec_out['attended_input']
+    encoder_skip = enc_out['attended_input']
 
     # Formula generation
     generated, log_probs, entropy = decoder.generate_with_kv_cache(
-        z=z_dev, encoder_skip=encoder_skip, stoich_pred=stoich_pred,
+        z=z, encoder_skip=encoder_skip, stoich_pred=stoich_pred,
         temperature=temperature,
     )
     formula = tokens_to_formula(generated[0])
 
-    # Denormalize Tc from z-score log1p space to Kelvin
-    tc_kelvin = denormalize_tc(tc_pred)
+    # Denormalize Tc
+    tc_kelvin = denormalize_tc(tc_pred_norm)
 
     result = {
         'formula': formula,
-        'tc_pred_norm': tc_pred,
+        'tc_pred_norm': tc_pred_norm,
         'tc_pred_kelvin': tc_kelvin,
         'magpie_pred': magpie_pred,
-        'stoich_pred': stoich_pred_cpu,
+        'stoich_pred': stoich_pred[0].cpu(),
         'log_prob': log_probs[0].sum().item() if log_probs is not None else None,
     }
+
+    # Tc classification (5 buckets)
+    tc_class_logits = enc_out.get('tc_class_logits')
     if tc_class_logits is not None:
         probs = torch.softmax(tc_class_logits[0].cpu(), dim=-1)
         result['tc_class_probs'] = probs
         result['tc_class'] = probs.argmax().item()
+
+    # SC classification (binary, sigmoid of logit)
+    sc_pred = enc_out.get('sc_pred')
+    if sc_pred is not None:
+        sc_logit = sc_pred[0].item()
+        sc_prob = torch.sigmoid(sc_pred[0]).item()
+        result['sc_logit'] = sc_logit
+        result['sc_prob'] = sc_prob
+        result['sc_pred'] = sc_prob > 0.5  # True = superconductor
+
+    # Family classification (14-class hierarchical)
+    family_composed = enc_out.get('family_composed_14')
+    if family_composed is not None:
+        family_probs = family_composed[0].cpu()
+        result['family_probs_14'] = family_probs
+        result['family_pred_14'] = family_probs.argmax().item()
+        # Also extract coarse family
+        coarse_logits = enc_out.get('family_coarse_logits')
+        if coarse_logits is not None:
+            result['family_coarse_probs'] = torch.softmax(coarse_logits[0].cpu(), dim=-1)
+
+    # High-pressure prediction (binary, sigmoid of logit)
+    hp_pred = enc_out.get('hp_pred')
+    if hp_pred is not None:
+        hp_prob = torch.sigmoid(hp_pred[0]).item()
+        result['hp_prob'] = hp_prob
+        result['hp_pred'] = hp_prob > 0.5  # True = high-pressure
+
     return result
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Holdout Tc/Magpie Validation')
-    parser.add_argument('--checkpoint', type=str,
-                        default=str(PROJECT_ROOT / 'outputs' / 'checkpoint_best.pt'),
-                        help='Path to checkpoint file')
-    args = parser.parse_args()
-
-    checkpoint_path = Path(args.checkpoint)
-    if not checkpoint_path.is_absolute():
-        checkpoint_path = PROJECT_ROOT / checkpoint_path
-    if not checkpoint_path.exists():
-        print(f"ERROR: Checkpoint not found: {checkpoint_path}")
-        sys.exit(1)
-
-    # Output path named after checkpoint
-    ckpt_stem = checkpoint_path.stem
-    output_path = PROJECT_ROOT / 'outputs' / f'holdout_tc_validation_{ckpt_stem}.json'
-
     print("=" * 70)
     print("HOLDOUT FULL ENCHILADA VALIDATION")
     print("(Formula + Tc + Magpie from Z)")
     print("=" * 70)
     print(f"Device: {DEVICE}")
-    print(f"Checkpoint: {checkpoint_path}")
 
-    encoder, decoder, magpie_dim, has_numden_head = load_models(checkpoint_path)
+    encoder, decoder, magpie_dim = load_models()
     data = load_data(magpie_dim)
 
     with open(HOLDOUT_PATH) as f:
@@ -295,21 +313,61 @@ def main():
     print("Each holdout: encode(formula,Tc,Magpie) → Z → decode(Z) → formula+Tc+Magpie")
     print()
 
-    tc_class_names = ['0-20K', '20-40K', '40-77K', '77K+']
+    # V12.40: Correct Tc classification bins matching training config
+    # tc_class_bins: [0, 10, 50, 100] → 5 classes
+    tc_class_names = ['non-SC (0K)', '0-10K', '10-50K', '50-100K', '100K+']
+    tc_class_bins = [0, 10, 50, 100]  # Must match TRAIN_CONFIG['tc_class_bins']
     def true_tc_class(tc):
-        if tc < 20: return 0
-        elif tc < 40: return 1
-        elif tc < 77: return 2
-        else: return 3
+        """Assign Tc bucket matching training script logic."""
+        bucket = 0
+        for i, edge in enumerate(tc_class_bins):
+            if tc > edge:
+                bucket = i + 1
+        return bucket
+
+    # V12.40: Family name mapping (14-class hierarchical)
+    FAMILY_14_NAMES = [
+        'NOT_SC',           # 0
+        'BCS_CONVENTIONAL', # 1
+        'CUPRATE_YBCO',     # 2
+        'CUPRATE_LSCO',     # 3
+        'CUPRATE_BSCCO',    # 4
+        'CUPRATE_TBCCO',    # 5
+        'CUPRATE_HBCCO',    # 6
+        'CUPRATE_OTHER',    # 7
+        'IRON_PNICTIDE',    # 8
+        'IRON_CHALCOGENIDE',# 9
+        'MGB2_TYPE',        # 10
+        'HEAVY_FERMION',    # 11
+        'ORGANIC',          # 12
+        'OTHER_UNKNOWN',    # 13
+    ]
+    # Map holdout family strings to expected 14-class indices
+    HOLDOUT_FAMILY_TO_14 = {
+        'YBCO': 2,
+        'LSCO': 3,
+        'Hg-cuprate': 6,
+        'Tl-cuprate': 5,
+        'Bi-cuprate': 4,
+        'Iron-based': 8,
+        'MgB2': 10,
+        'Conventional': 1,
+        'Other': 13,
+    }
 
     results = []
     tc_errors = []
     magpie_mses = []
     formula_sims = []
 
-    header = f"{'Family':<14s} {'True Tc':>8s} {'Pred Tc':>9s} {'Err':>7s} {'%Err':>6s} {'MagMSE':>8s} {'Sim':>5s} | Formula"
+    header = f"{'Family':<14s} {'True Tc':>8s} {'Pred Tc':>9s} {'Err':>7s} {'%Err':>6s} {'MagMSE':>8s} {'Sim':>5s} {'SC?':>4s} {'FamPred':<16s} | Formula"
     print(header)
     print("-" * len(header) + "-" * 40)
+
+    sc_correct = 0
+    sc_total = 0
+    family_correct = 0
+    family_total = 0
 
     for sample in holdout_samples:
         formula = sample['formula']
@@ -321,19 +379,17 @@ def main():
             print(f"  [{family:<12s}] SKIP — no original_index for {formula}")
             continue
 
-        # Encode the holdout sample
+        # V12.40: Full forward pass — runs ALL heads (sc, family, hp, tc_class, etc.)
         idx_t = torch.tensor([orig_idx], dtype=torch.long)
-        enc_out = encoder.encode(
-            data['elem_idx'][idx_t].to(DEVICE),
-            data['elem_frac'][idx_t].to(DEVICE),
-            data['elem_mask'][idx_t].to(DEVICE),
-            data['magpie'][idx_t].to(DEVICE),
-            data['tc'][idx_t].to(DEVICE),
+        decoded = full_forward(
+            encoder, decoder,
+            data['elem_idx'][idx_t],
+            data['elem_frac'][idx_t],
+            data['elem_mask'][idx_t],
+            data['magpie'][idx_t],
+            data['tc'][idx_t],
+            temperature=0.01,
         )
-        z = enc_out['z']  # [1, 2048]
-
-        # Decode EVERYTHING from Z
-        decoded = full_decode(encoder, decoder, z, has_numden_head=has_numden_head, temperature=0.01)
 
         # Compare
         pred_tc = decoded['tc_pred_kelvin']
@@ -357,11 +413,43 @@ def main():
 
         exact = gen_formula.strip() == formula.strip()
 
-        print(f"  [{family:<12s}] {true_tc:8.1f} {pred_tc:9.1f} {tc_err:+7.1f} {pct_err:5.1f}% {mag_mse:8.4f} {sim:5.3f} | {formula}")
+        # SC classification
+        sc_str = ''
+        if 'sc_pred' in decoded:
+            sc_pred_bool = decoded['sc_pred']
+            sc_prob = decoded['sc_prob']
+            sc_str = f"{sc_prob:.2f}"
+            sc_total += 1
+            if sc_pred_bool:  # All holdout samples ARE superconductors
+                sc_correct += 1
+
+        # Family classification
+        family_pred_str = ''
+        if 'family_pred_14' in decoded:
+            pred_family_idx = decoded['family_pred_14']
+            pred_family_name = FAMILY_14_NAMES[pred_family_idx] if pred_family_idx < len(FAMILY_14_NAMES) else f'?{pred_family_idx}'
+            true_family_idx = HOLDOUT_FAMILY_TO_14.get(family, -1)
+            family_match = pred_family_idx == true_family_idx
+            family_pred_str = pred_family_name
+            if family_match:
+                family_pred_str += ' [OK]'
+                family_correct += 1
+            else:
+                family_pred_str += ' [X]'
+            family_total += 1
+
+        # HP prediction
+        hp_str = ''
+        if 'hp_pred' in decoded:
+            hp_str = f"HP={decoded['hp_prob']:.2f}" if decoded['hp_prob'] > 0.1 else ''
+
+        print(f"  [{family:<12s}] {true_tc:8.1f} {pred_tc:9.1f} {tc_err:+7.1f} {pct_err:5.1f}% {mag_mse:8.4f} {sim:5.3f} {sc_str:>4s} {family_pred_str:<16s} | {formula}")
         if not exact:
             print(f"     → Generated: {gen_formula}")
         else:
             print(f"     → Generated: {gen_formula} [EXACT MATCH]")
+        if hp_str:
+            print(f"     → {hp_str}")
 
         result_entry = {
             'formula': formula,
@@ -377,11 +465,27 @@ def main():
             'family': family,
             'stoich_pred': decoded['stoich_pred'].tolist(),
         }
+        # Tc classification
         if 'tc_class' in decoded:
             result_entry['tc_class_pred'] = decoded['tc_class']
             result_entry['tc_class_true'] = true_tc_class(true_tc)
             result_entry['tc_class_pred_from_tc'] = true_tc_class(pred_tc)
             result_entry['tc_class_probs'] = decoded['tc_class_probs'].tolist()
+        # SC classification
+        if 'sc_pred' in decoded:
+            result_entry['sc_pred'] = bool(decoded['sc_pred'])
+            result_entry['sc_prob'] = decoded['sc_prob']
+            result_entry['sc_logit'] = decoded['sc_logit']
+        # Family classification
+        if 'family_pred_14' in decoded:
+            result_entry['family_pred_14'] = decoded['family_pred_14']
+            result_entry['family_pred_name'] = FAMILY_14_NAMES[decoded['family_pred_14']]
+            result_entry['family_true_14'] = HOLDOUT_FAMILY_TO_14.get(family, -1)
+            result_entry['family_probs_14'] = decoded['family_probs_14'].tolist()
+        # HP prediction
+        if 'hp_pred' in decoded:
+            result_entry['hp_pred'] = bool(decoded['hp_pred'])
+            result_entry['hp_prob'] = decoded['hp_prob']
         results.append(result_entry)
 
     # ===================================================================
@@ -429,25 +533,17 @@ def main():
             # Get Tc predictions for all 20
             dec_out = encoder.decode(z_perturbed)
             tc_preds_norm = dec_out['tc_pred'].detach().cpu().numpy()
-            # Denormalize to Kelvin
             tc_preds_K = np.array([denormalize_tc(t) for t in tc_preds_norm])
 
             tc_mean = tc_preds_K.mean()
             tc_std_val = tc_preds_K.std()
 
-            # Decode a couple to see formulas
-            sample_formulas = []
-            for zi in range(min(3, len(z_perturbed))):
-                decoded = full_decode(encoder, decoder, z_perturbed[zi:zi+1], has_numden_head=has_numden_head)
-                sample_formulas.append(decoded['formula'])
-
             print(f"    noise={scale:.2f}: Tc={tc_mean:.1f}±{tc_std_val:.1f}K "
-                  f"(err={abs(tc_mean-true_tc):.1f}K) | {sample_formulas[0]}")
+                  f"(err={abs(tc_mean-true_tc):.1f}K)")
 
             perturbation_results.append({
                 'formula': formula, 'true_tc': true_tc, 'noise_scale': scale,
                 'tc_mean_K': float(tc_mean), 'tc_std_K': float(tc_std_val),
-                'sample_formulas': sample_formulas,
             })
 
     # ===================================================================
@@ -483,12 +579,41 @@ def main():
     class_correct = sum(1 for r in results if r.get('tc_class_pred') == r.get('tc_class_true'))
     class_total = sum(1 for r in results if 'tc_class_pred' in r)
     if class_total > 0:
-        print(f"\nTc Class Accuracy: {class_correct}/{class_total} ({class_correct/class_total*100:.1f}%)")
+        print(f"\nTc Classification (5 buckets: {', '.join(tc_class_names)}):")
+        print(f"  Accuracy: {class_correct}/{class_total} ({class_correct/class_total*100:.1f}%)")
+        # Show per-bucket breakdown
+        for bucket in range(5):
+            in_bucket = [r for r in results if r.get('tc_class_true') == bucket]
+            if in_bucket:
+                correct = sum(1 for r in in_bucket if r.get('tc_class_pred') == bucket)
+                print(f"  {tc_class_names[bucket]:>12s}: {correct}/{len(in_bucket)} correct")
+
+    # SC classification accuracy
+    if sc_total > 0:
+        print(f"\nSC Classification (all holdout samples are superconductors):")
+        print(f"  Correctly classified as SC: {sc_correct}/{sc_total} ({sc_correct/sc_total*100:.1f}%)")
+        sc_probs = [r['sc_prob'] for r in results if 'sc_prob' in r]
+        if sc_probs:
+            print(f"  SC probability: mean={np.mean(sc_probs):.3f}, min={np.min(sc_probs):.3f}, max={np.max(sc_probs):.3f}")
+
+    # Family classification accuracy
+    if family_total > 0:
+        print(f"\nFamily Classification (14-class hierarchical):")
+        print(f"  Accuracy: {family_correct}/{family_total} ({family_correct/family_total*100:.1f}%)")
+        # Per-family breakdown
+        for fam_name in ['YBCO', 'LSCO', 'Hg-cuprate', 'Tl-cuprate', 'Bi-cuprate',
+                         'Iron-based', 'MgB2', 'Conventional', 'Other']:
+            fam_results = [r for r in results if r.get('family') == fam_name and 'family_pred_14' in r]
+            if fam_results:
+                true_idx = HOLDOUT_FAMILY_TO_14.get(fam_name, -1)
+                correct = sum(1 for r in fam_results if r['family_pred_14'] == true_idx)
+                preds = [FAMILY_14_NAMES[r['family_pred_14']] for r in fam_results]
+                print(f"  {fam_name:>14s}: {correct}/{len(fam_results)} | predictions: {', '.join(preds)}")
 
     # Save
     output = {
         'timestamp': time.strftime('%Y-%m-%dT%H:%M:%S'),
-        'checkpoint': str(checkpoint_path),
+        'checkpoint': str(CHECKPOINT_PATH),
         'roundtrip_results': results,
         'perturbation_results': perturbation_results,
         'summary': {
@@ -498,11 +623,13 @@ def main():
             'formula_mean_sim': float(sim_arr.mean()),
             'n_exact_roundtrip': int((sim_arr >= 0.999).sum()),
             'tc_class_accuracy': class_correct / class_total if class_total > 0 else None,
+            'sc_accuracy': sc_correct / sc_total if sc_total > 0 else None,
+            'family_accuracy': family_correct / family_total if family_total > 0 else None,
         }
     }
-    with open(output_path, 'w') as f:
+    with open(OUTPUT_PATH, 'w') as f:
         json.dump(output, f, indent=2, default=str)
-    print(f"\nResults saved to: {output_path}")
+    print(f"\nResults saved to: {OUTPUT_PATH}")
 
 
 if __name__ == '__main__':

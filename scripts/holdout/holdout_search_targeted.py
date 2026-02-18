@@ -9,11 +9,17 @@ elements, encode those as seeds, and explore that specific Z neighborhood.
 Uses PCA walks along principal components of neighbor Z-vectors to
 generate candidates, plus perturbation and interpolation strategies.
 
+Outputs:
+    - JSON file: holdout_search_targeted_{ckpt}.json — per-target results with
+      all unique candidate formulas, counts, similarities, Z norms and spreads
+    - PT file: holdout_search_targeted_{ckpt}_z_maps.pt — Z centroid (2048-dim)
+      for each unique generated formula, keyed by target formula
+
 Usage:
     cd /home/james/superconductor-vae
-    PYTHONPATH=src python -u scripts/analysis/holdout_search_targeted.py
-    PYTHONPATH=src python -u scripts/analysis/holdout_search_targeted.py --checkpoint outputs/best_checkpoints/checkpoint_best_V12.38_colab.pt
-    PYTHONPATH=src python -u scripts/analysis/holdout_search_targeted.py --checkpoint outputs/best_checkpoints/checkpoint_best_V12.38_colab.pt --all
+    PYTHONPATH=src python -u scripts/holdout/holdout_search_targeted.py --all --targets 1
+    PYTHONPATH=src python -u scripts/holdout/holdout_search_targeted.py --checkpoint outputs/best_checkpoints/checkpoint_best_V12.38_colab.pt
+    PYTHONPATH=src python -u scripts/holdout/holdout_search_targeted.py --checkpoint outputs/best_checkpoints/checkpoint_best_V12.38_colab.pt --all
 """
 
 import argparse
@@ -357,7 +363,13 @@ def search_single_target(encoder, decoder, data, target_formula, target_tc, targ
 
     if len(neighbor_indices) < 3:
         print(f"    ERROR: Only {len(neighbor_indices)} element neighbors found")
-        return {'target': target_formula, 'best_sim': 0.0, 'best_gen': '', 'n_unique': 0}
+        return {
+            'target': target_formula, 'target_tc': target_tc, 'target_family': target_family,
+            'best_sim': 0.0, 'best_gen': '', 'n_unique': 0, 'n_total': 0,
+            'n_neighbors': len(neighbor_indices), 'exact': False,
+            'top_matches': [], 'top_frequent': [],
+            'all_candidates': [], 'formula_to_z': {},
+        }
 
     # Step 2: Encode neighbors
     print(f"    Encoding {len(neighbor_indices)} element neighbors...")
@@ -424,30 +436,67 @@ def search_single_target(encoder, decoder, data, target_formula, target_tc, targ
     greedy_formulas = decode_z_batch(encoder, decoder, all_z, has_numden_head=has_numden_head, temperature=0.01)
     print(f"    Greedy decoded in {time.time()-t0:.1f}s")
 
-    # Step 5: Temperature sampling from seeds
+    # Step 5: Temperature sampling from seeds (track Z vectors too)
+    temp_z_list = []
     temp_formulas = []
     for temp in TEMPERATURES:
         for z_idx in range(min(len(z_seeds), 15)):
-            z = z_seeds[z_idx].unsqueeze(0).repeat(N_TEMPERATURE_SAMPLES, 1)
-            temp_formulas.extend(decode_z_batch(encoder, decoder, z, has_numden_head=has_numden_head, temperature=temp))
+            z_repeated = z_seeds[z_idx].unsqueeze(0).repeat(N_TEMPERATURE_SAMPLES, 1)
+            temp_z_list.append(z_repeated)
+            temp_formulas.extend(decode_z_batch(encoder, decoder, z_repeated, has_numden_head=has_numden_head, temperature=temp))
+    temp_z = torch.cat(temp_z_list, dim=0)
 
+    # Combined Z vectors and formulas (greedy + temperature)
+    total_z = torch.cat([all_z, temp_z], dim=0)
     all_generated = greedy_formulas + temp_formulas
     unique_formulas = set(f for f in all_generated if f and len(f) > 1)
     print(f"    Total: {len(all_generated)}, unique: {len(unique_formulas)}")
 
-    # Step 6: Find best match
+    # Step 6: Build per-formula Z mapping (running sum to save memory)
+    formula_z_data = defaultdict(lambda: {'count': 0, 'z_sum': None, 'z_sq_sum': None})
+    for i, formula in enumerate(all_generated):
+        if not formula or len(formula) <= 1:
+            continue
+        entry = formula_z_data[formula]
+        entry['count'] += 1
+        z_i = total_z[i]
+        if entry['z_sum'] is None:
+            entry['z_sum'] = z_i.clone()
+            entry['z_sq_sum'] = (z_i ** 2).clone()
+        else:
+            entry['z_sum'] += z_i
+            entry['z_sq_sum'] += z_i ** 2
+
+    # Compute centroids, spread, and similarity for each unique formula
+    formula_to_z = {}
+    all_candidates = []
     best_sim = 0.0
     best_gen = ''
     top_matches = []
 
-    for formula in unique_formulas:
+    for formula, info in formula_z_data.items():
+        z_centroid = info['z_sum'] / info['count']
+        z_var = info['z_sq_sum'] / info['count'] - z_centroid ** 2
+        z_std_mean = z_var.clamp(min=0).sqrt().mean().item()
         sim = element_similarity(formula, target_formula)
+
+        formula_to_z[formula] = z_centroid  # 2048-dim tensor
+
+        all_candidates.append({
+            'formula': formula,
+            'count': info['count'],
+            'similarity': float(sim),
+            'z_norm': float(z_centroid.norm()),
+            'z_spread': float(z_std_mean),
+        })
+
         if sim > best_sim:
             best_sim = sim
             best_gen = formula
         if sim >= 0.8:
             top_matches.append((formula, sim))
 
+    all_candidates.sort(key=lambda x: -x['similarity'])
     top_matches.sort(key=lambda x: -x[1])
 
     # Check exact
@@ -461,11 +510,7 @@ def search_single_target(encoder, decoder, data, target_formula, target_tc, targ
             print(f"      {s:.4f}: {f}")
 
     # Top generated formulas by frequency
-    formula_counts = defaultdict(int)
-    for f in all_generated:
-        if f and len(f) > 1:
-            formula_counts[f] += 1
-    top_freq = sorted(formula_counts.items(), key=lambda x: -x[1])[:10]
+    top_freq = sorted([(c['formula'], c['count']) for c in all_candidates], key=lambda x: -x[1])[:10]
     print(f"    Most frequent:")
     for f, c in top_freq:
         sim = element_similarity(f, target_formula)
@@ -483,6 +528,8 @@ def search_single_target(encoder, decoder, data, target_formula, target_tc, targ
         'n_neighbors': len(neighbor_indices),
         'top_matches': [(f, float(s)) for f, s in top_matches[:10]],
         'top_frequent': [(f, c) for f, c in top_freq],
+        'all_candidates': all_candidates,
+        'formula_to_z': formula_to_z,
     }
 
 
@@ -493,6 +540,8 @@ def main():
                         help='Path to checkpoint file')
     parser.add_argument('--all', action='store_true',
                         help='Search all 45 holdouts (not just previous failures)')
+    parser.add_argument('--targets', type=int, default=0,
+                        help='Only search first N targets (0=all)')
     args = parser.parse_args()
 
     checkpoint_path = Path(args.checkpoint)
@@ -558,6 +607,11 @@ def main():
 
         print(f"\nTargets below {REDO_THRESHOLD} threshold: {len(targets_to_search)}/45")
 
+    # Limit number of targets if --targets N specified
+    if args.targets > 0:
+        targets_to_search = targets_to_search[:args.targets]
+        print(f"\n  --targets {args.targets}: limiting to first {len(targets_to_search)} targets")
+
     for t in targets_to_search:
         print(f"  [{t['family']:12s}] prev={t['prev_best']:.3f} | {t['formula']}")
 
@@ -597,7 +651,12 @@ def main():
         found = sum(1 for r in results if r['best_sim'] >= thresh)
         print(f"  >= {thresh:.2f}: {found}/{len(results)} ({found/len(results)*100:.1f}%)")
 
-    # Save
+    # Extract Z maps from results before JSON serialization
+    z_maps = {}
+    for result in results:
+        z_maps[result['target']] = result.pop('formula_to_z')
+
+    # Save JSON (without Z tensors — they're too large for JSON)
     output = {
         'timestamp': time.strftime('%Y-%m-%dT%H:%M:%S'),
         'checkpoint': str(checkpoint_path),
@@ -610,6 +669,11 @@ def main():
     with open(output_path, 'w') as f:
         json.dump(output, f, indent=2, default=str)
     print(f"\nResults saved to: {output_path}")
+
+    # Save Z centroid maps as companion .pt file
+    z_map_path = output_path.with_name(output_path.stem + '_z_maps.pt')
+    torch.save(z_maps, z_map_path)
+    print(f"Z maps saved to: {z_map_path}")
 
 
 if __name__ == '__main__':

@@ -512,11 +512,11 @@ TRAIN_CONFIG = {
         # converge_threshold: loss value below which this loss is considered converged
         # spike_delta: absolute increase above converged baseline that triggers resume
         # --- Inside CombinedLossWithREINFORCE ---
-        'reinforce_loss':  (1.0,   0.5),   # RL raw ~18.6 (weighted 0.93) — THE big compute saver
-        'tc_loss':         (0.5,   0.1),   # Tc MSE ~0.43 at epoch 3056
+        'reinforce_loss':  (1.0,   0.5),   # RL weighted ~0.5 (raw*0.05) — THE big compute saver
+        # tc_loss: NEVER skip — core prediction capability
         'magpie_loss':     (0.1,   0.1),   # Magpie MSE ~0.06
-        'stoich_loss':     (0.01,  0.05),  # Stoich MSE ~0.001
-        'numden_loss':     (3.0,   0.5),   # NumDen MSE ~2.96
+        # stoich_loss: NEVER skip — directly feeds decoder conditioning
+        # numden_loss: NEVER skip — key improvement area for formula generation
         'tc_class_loss':   (0.5,   0.2),   # Tc bucket classification (CE, V12.28)
         # --- External losses (computed in train_epoch) ---
         'physics_z_loss':  (0.5,   0.2),   # PhysZ ~0.32 at epoch 3056
@@ -5062,9 +5062,8 @@ def train():
         epoch_family_loss_weight = TRAIN_CONFIG.get('family_classifier_weight', 0.0)
 
         # V12.40: Zero local-var weights for skipped losses (must be AFTER warmup computations)
+        # Note: tc_loss, stoich_loss, numden_loss are NEVER skipped (removed from schedule)
         if loss_skip_enabled and losses_skipped_this_epoch:
-            if 'tc_loss' in losses_skipped_this_epoch:
-                tc_weight = 0.0
             if 'magpie_loss' in losses_skipped_this_epoch:
                 magpie_weight = 0.0
             if 'physics_z_loss' in losses_skipped_this_epoch:
@@ -5198,19 +5197,25 @@ def train():
                     # This loss was skipped — metric is 0, don't use it for convergence check
                     continue
 
+                # V12.40 fix: Compare WEIGHTED loss value against threshold
+                # Thresholds represent actual contribution to total loss, not raw values
+                weight = state['base_weight']
+                weighted_val = current_val * weight
+
                 if not state['converged']:
                     # Check if this loss should enter converged state
-                    if current_val < thresh:
+                    if weighted_val < thresh:
                         state['converged'] = True
                         state['baseline'] = current_val
-                        print(f"  [LossSkip] {key} converged: {current_val:.4f} < {thresh} — "
+                        print(f"  [LossSkip] {key} converged: {current_val:.4f}*{weight:.3f}={weighted_val:.4f} < {thresh} — "
                               f"skipping every {loss_skip_freq-1}/{loss_skip_freq} epochs", flush=True)
                 else:
                     # Already converged — check for spike on check epochs
-                    if current_val > state['baseline'] + delta:
+                    weighted_baseline = state['baseline'] * weight
+                    if weighted_val > weighted_baseline + delta:
                         state['converged'] = False
-                        print(f"  [LossSkip] {key} spiked: {current_val:.4f} > "
-                              f"{state['baseline']:.4f} + {delta} — resuming every-epoch", flush=True)
+                        print(f"  [LossSkip] {key} spiked: {weighted_val:.4f} > "
+                              f"{weighted_baseline:.4f} + {delta} — resuming every-epoch", flush=True)
                     else:
                         # Still converged — update baseline to track drift downward
                         state['baseline'] = min(state['baseline'], current_val)
