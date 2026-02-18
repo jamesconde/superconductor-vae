@@ -4,6 +4,288 @@ Chronological record of training runs, architecture changes, and optimization de
 
 ---
 
+## V12.42: Net2Net 2x Wider Decoder Expansion (2026-02-18)
+
+### Problem
+
+Decoder `d_model=512` is a bottleneck for multi-digit number generation. Fraction denominators like "1000" require 4 separate tokens (`['1','0','0','0']`), and the decoder must maintain a coherent "plan" across these steps. Error analysis (epochs 3216-3292) shows performance flat at ~88.5% TRUE AR exact match, with 78% of "catastrophic" errors being fraction representation mismatches — correct material, different denominator encoding.
+
+### Changes
+
+**Architecture expansion (decoder only, encoder unchanged):**
+- `d_model`: 512 -> **1024** (2x wider, 128 dims/head — GPT-2 medium scale)
+- `dim_feedforward`: 2048 -> **4096** (4x d_model)
+- All other dimensions unchanged (latent_dim=2048, nhead=8, num_layers=12)
+- Training target: A100 40GB (effective batch ~504 with bfloat16)
+
+**Expansion method:** Net2Net weight transfer (`scripts/migrate_checkpoint_v1242_wider.py`)
+- Old weights copied into overlapping region of new wider layers
+- New dimensions initialized with small noise (std=0.01) for approximate function preservation
+- Sinusoidal positional encoding recomputed (deterministic, no transfer needed)
+- Optimizer/scheduler state RESET (param shapes changed)
+
+**Component-by-component transfer:**
+
+| Component | Old Shape | New Shape | Method |
+|-----------|-----------|-----------|--------|
+| token_embedding | (148, 512) | (148, 1024) | expand_embedding |
+| pos_encoding.pe | [1, 60, 512] | [1, 60, 1024] | recomputed |
+| latent_to_memory[0] | Lin(2048, 4096) | Lin(2048, 8192) | _expand_linear_both_dims |
+| latent_to_memory[2] | Lin(4096, 8192) | Lin(8192, 16384) | _expand_linear_both_dims |
+| skip_to_memory[0] | Lin(256, 2048) | Lin(256, 4096) | _expand_linear_both_dims |
+| skip_to_memory[2] | Lin(2048, 4096) | Lin(4096, 8192) | _expand_linear_both_dims |
+| stoich_to_memory[0] | Lin(37, 512) | Lin(37, 1024) | _expand_linear_both_dims |
+| stoich_to_memory[1] | LN(512) | LN(1024) | expand_layernorm |
+| stoich_to_memory[3] | Lin(512, 2048) | Lin(1024, 4096) | _expand_linear_both_dims |
+| 12x transformer layers | d=512, ff=2048 | d=1024, ff=4096 | expand_transformer_decoder_layer |
+| output_proj[0] | LN(512) | LN(1024) | expand_layernorm |
+| output_proj[1] | Lin(512, 512) | Lin(1024, 1024) | _expand_linear_both_dims |
+| output_proj[4] | Lin(512, 148) | Lin(1024, 148) | _expand_linear_both_dims |
+| stop_head[0] | Lin(512, 128) | Lin(1024, 256) | _expand_linear_both_dims |
+| stop_head[2] | Lin(128, 1) | Lin(256, 1) | _expand_linear_both_dims |
+
+**Net2Net primitives added to `net2net_expansion.py`:**
+- `expand_layernorm()` — copy old gamma/beta, init new dims with gamma=1.0+noise, beta=0.0
+- `_expand_linear_both_dims()` — expand both input and output dims simultaneously
+- Fixed `in_proj_bias` bug in `expand_multihead_attention()` (was missing bias copy)
+- Rewrote `expand_transformer_decoder_layer()` to handle dimension changes (previously only copied weights when dims were unchanged)
+
+### Migration
+
+```bash
+python scripts/migrate_checkpoint_v1242_wider.py
+# or for dry-run:
+python scripts/migrate_checkpoint_v1242_wider.py --dry-run
+```
+
+**Training config adjustments for 4x wider decoder:**
+- `lr_warmup_epochs`: **20** (NEW) — linear warmup 0→3e-5 over 20 epochs (fresh optimizer after Net2Net has no Adam momentum history)
+- Decoder grad clip: **1.0→2.0** — 4x more params produce larger gradient norms; 1.0 was too aggressive
+- A100 batch multiplier: **12→6** (effective batch 504→252) — 4x wider decoder uses ~4x more activation memory
+- `start_factor=1e-3` for warmup — starts at 3e-8, ramps linearly to 3e-5
+
+### Expected Impact
+- 2x hidden state capacity for multi-digit token planning (128 dims/head vs 64)
+- Should significantly help with fraction denominator encoding (the dominant error mode)
+- ~280% decoder parameter increase (~103M -> ~393M)
+- A100 40GB has ample headroom for this model size with bfloat16
+
+### Risk
+- Temporary accuracy regression as the model adapts to the wider dimensions
+- LR warmup should prevent gradient spikes from fresh optimizer + noise-initialized dimensions
+
+---
+
+## Generative Holdout Search Results (2026-02-17)
+
+### Setup
+- **Checkpoint**: `checkpoint_best.pt` (epoch 3032, V12.40)
+- **Script**: `scripts/holdout/holdout_search_targeted.py --all`
+- **Method**: For each of the 45 holdout formulas, find 100 element-matched training neighbors, encode as Z seeds, then explore Z-space via perturbation (8 noise scales × 100 samples × 30 seeds), pairwise interpolation (linear + slerp, 100 pairs × 15 steps), PCA walks (20 components × 20 alpha steps), centroid random directions, and temperature sampling (8 temperatures × 15 seeds × 30 samples). ~31K candidate formulas generated per target.
+- **New in this run**: Full Z→formula mapping saved. Per unique formula: Z centroid (2048-dim), Z spread (std across generating Z vectors), count, and similarity. Companion `.pt` file with Z centroids for Z-space analysis.
+
+### Results Summary
+
+| Threshold | Found | Percentage |
+|-----------|-------|------------|
+| >= 1.00 (exact sim) | 16/45 | 35.6% |
+| >= 0.99 | 38/45 | 84.4% |
+| >= 0.98 | 40/45 | 88.9% |
+| >= 0.95 | 41/45 | 91.1% |
+| >= 0.90 | 45/45 | **100.0%** |
+
+**12 exact string matches**, **16 sim=1.000** (includes element-reordered matches like `CrCuO2` = `Cu1Cr1O2`).
+
+### Exact Matches by Family
+
+| Family | Formula | Tc (K) |
+|--------|---------|--------|
+| YBCO | Tl2Ba2Ca(19/20)Y(1/20)Cu2O8 | 106.5 |
+| YBCO | Y(1/5)Eu(4/5)Ba2Cu3O7 | 93.8 |
+| LSCO | Bi2Sr(19/10)La(1/10)Ca1Cu2OY | 81.0 |
+| Hg-cuprate | Hg(9/10)Au(1/10)Ba2Ca2Cu3O | 133.0 |
+| Tl-cuprate | Tl2Ba2Ca2Cd(1/10)Cu3O | 123.5 |
+| Bi-cuprate | Bi(17/10)Pb(3/10)Sr2Ca2Cu3O | 110.2 |
+| Iron-based | Nd1Fe1As1O(17/20) | 53.0 |
+| Iron-based | Dy1Fe1As1O(17/20) | 30.0 |
+| MgB2 | Mg(97/100)Na(3/100)B2 | 38.0 |
+| MgB2 | Mg(9/10)Li(1/10)B2 | 36.9 |
+| MgB2 | Mg(17/20)Li(3/20)B2 | 36.6 |
+| MgB2 | Mg(49/50)Cr(1/50)B2 | 38.0 |
+
+### Near-Misses (>= 0.99 but not exact)
+
+Most near-misses are **fraction precision issues** — correct elements and ratios, but expressed with slightly different denominators. Examples:
+- Target `Y3Ba5Cu8O18` → best `Y(11/10)Ba(19/10)Cu3O(341/50)` (sim=0.998) — same compound, different normalization
+- Target `Hg(17/20)Re(3/20)Ba(83/50)Sr(17/50)Ca2Cu3O8` → best `Hg(17/20)Re(3/20)Ba(17/10)Sr(3/10)Ca2Cu3O8` (sim=0.999) — Ba/Sr ratio slightly off
+- Target `Nb3Al(71/100)Ge(29/100)` → best `Nb(3/4)Al(89/500)Ge(9/125)` (sim=1.000) — equivalent fractions, different form
+
+### Hardest Targets (< 0.95)
+
+| Family | Formula | Best Sim | Issue |
+|--------|---------|----------|-------|
+| LSCO | La(1/2)Gd(1/2)Ba2Cu3O | 0.925 | Gd substitution confuses model |
+| LSCO | Hg1Sr2La(3/10)Ca(1/2)Ce(1/5)Cu2O6 | 0.944 | 7-element formula, Ce not well-represented |
+| Conventional | Gd1Pb1Sr2Ca3Cu4O | 0.947 | Unusual Gd-Pb combination |
+| Tl-cuprate | Tl(1/2)Pb(1/2)Sr2Ca2Cu3Li(1/5)O | 0.918 | Li dopant not generated (see analysis below) |
+
+### Error Analysis: All Errors Are Chemically Sensible
+
+**44 out of 45** best matches have the **exact same element set** as the target. The remaining errors break down as:
+
+| Error Category | Count | Description |
+|----------------|-------|-------------|
+| Exact match (sim=1.0) | 16 | Perfect formula recovery |
+| Fraction precision only (sim >= 0.97) | 24 | Right elements, fractions off by ~1/20 |
+| Minor stoichiometry (sim 0.93-0.97) | 3 | Right elements, moderate ratio differences |
+| Missing trace element | 1 | Li(1/5) dopant not generated |
+| Completely wrong chemistry | **0** | None |
+
+**Zero targets produced wrong chemistry.** The fraction precision errors represent the same chemical neighborhood — differences within experimental measurement uncertainty (e.g., `O(161/25)` = 6.44 target vs `O(321/50)` = 6.42 generated).
+
+### Deep Dive: The Missing Li(1/5) Dopant
+
+The sole element-set error is target `Tl(1/2)Pb(1/2)Sr2Ca2Cu3Li(1/5)O` (Tc=117K). The model generates `Tl(1/2)Pb(1/2)Sr2Ca2Cu3O` (Tc=119K) — the **undoped parent compound**, which is a real superconductor present in the training set.
+
+**This is NOT a consistency error.** The generated formula is a real, known superconductor at a similar Tc. The model produces the right material family, just without the trace Li dopant.
+
+**Why Li is missed — data sparsity:**
+- Li (Z=3) appears in only **1,420 / 50,958** training samples (2.8%)
+- Only **24 training samples** contain both Tl and Li (0.047% of training data)
+- Those 24 mostly follow a `Tl(1/4)Li(1/4)` substitution pattern (Li *replaces* Tl), not Li as an independent minor dopant alongside Tl-Pb
+- In the holdout search, only **28 / 3,631** unique candidates (0.77%) contained Li at all
+- When Li does appear, the model substitutes it for Pb rather than adding it as an independent dopant
+- This result is **identical across all three checkpoint searches** (V12.38 colab, V12.40 original, V12.40 current) — the ceiling is 0.918 every time
+
+This represents a genuine **representational limit**: with only 24 examples of Tl+Li co-occurrence, the model cannot learn that Li(1/5) can appear as an independent trace dopant in a Tl-Pb cuprate. The model correctly learns the dominant Tl-Pb cuprate chemistry from ~1,500 Tl-containing samples but has insufficient signal for the rare Li-doped variant. No amount of training epochs will fix this — the data simply doesn't contain enough examples of this pattern. Data augmentation or targeted collection of Tl-Li cuprate entries would be needed.
+
+**For contrast**: MgB2-family Li targets (`Mg(9/10)Li(1/10)B2`, `Mg(17/20)Li(3/20)B2`) achieve perfect exact matches because Li-doped MgB2 is well-represented in the training data with simpler 3-element structures.
+
+### Output Files
+- **JSON** (30 MB): `outputs/holdout_search_targeted_checkpoint_best.json` — all unique candidates per target with count, similarity, z_norm, z_spread
+- **Z maps** (1.2 GB): `outputs/holdout_search_targeted_checkpoint_best_z_maps.pt` — Z centroid (2048-dim) per unique formula per target, for Z-space analysis
+
+### Key Observations
+1. **MgB2 family dominates**: 5/5 exact matches (simpler 3-element formulas, well-represented in training data)
+2. **Iron-based strong**: 2/5 exact, all >= 0.988 — consistent 5-element template (RE-Fe-As-O)
+3. **Cuprates are harder**: Complex 6-8 element formulas with many doping sites. Most near-misses are fraction precision
+4. **100% at >= 0.90**: The model finds the right chemical neighborhood for every holdout target — the remaining gap is fraction precision, not chemistry understanding
+5. **Mode attractors visible**: Most frequent generated formulas (1000-3000x) are common training compounds near the target's Z neighborhood, not the target itself. The exact matches come from rarer Z perturbations
+6. **No consistency errors in top matches**: The best-match formula for every target is a chemically sensible superconductor. The model never generates nonsense for its top candidates.
+
+### Full Consistency Check: 133,979 Candidates vs Training Data
+
+Cross-referencing ALL unique generated candidates across all 45 targets against the full dataset:
+
+| Metric | Value |
+|--------|-------|
+| Unique formulas generated (all targets) | 133,979 |
+| Match a known dataset entry | 1,977 (1.5%) |
+| Of matches: Superconductors (is_sc=1) | 1,906 (96.4%) |
+| Of matches: Non-superconductors (is_sc=0) | 71 (3.6%) |
+| Novel formulas (not in dataset) | 132,002 (98.5%) |
+
+**98.5% of generated formulas are novel** — not memorized from training. Of the 1.5% that match known compounds, **96.4% are superconductors**.
+
+#### Non-SC Contamination by Family
+
+The 71 non-SC matches are not uniformly distributed — they cluster in specific chemical families with physical ambiguity:
+
+**Cu1Cr1O2 (Other family) — worst offender:**
+24 non-SC formulas generated, many at high count. The Cr-Cu-O chemical space contains delafossites, spinels, and garnets that span both SC and non-SC regimes. The latent space has not separated them:
+- `Cr(197/200)CuMg(3/200)O2` — 1,764x generated, non-SC thermoelectric
+- `Cr(4/5)CuFe(6/5)O4` — 1,482x generated, non-SC anisotropy material
+- `BrCrCu6O8` — 1,046x generated, non-SC Materials Project entry
+
+**MgB2 targets — mild leakage:**
+`B4Mg` (non-SC) appears as a mode attractor across all 5 MgB2 targets. Chemically adjacent boride, structurally distinct from MgB2.
+
+**Iron-based targets — parent compound leakage:**
+Undoped pnictides (`AsFeGdO`, `AsCeFeO`) with Tc=0 appear because they are chemically identical to the doped SC variants, just missing the doping that triggers superconductivity. This is physically meaningful.
+
+**YBCO-Eu boundary compositions:**
+`Ba2Cu3Eu(1/5)O7Y(4/5)` and `Ba2Cu3Eu(3/5)O7Y(2/5)` generated at ~800x count with 0.97-0.99 similarity, catalogued as non-SC. These sit at the critical Eu doping threshold where SC turns on/off.
+
+#### Clean families (zero non-SC contamination):
+- All 5 Hg-cuprate targets
+- All 5 Bi-cuprate targets
+- 4 of 5 Tl-cuprate targets
+- Top-20 candidates for all 4 hardest targets
+
+#### Interpretation
+
+Non-SC contamination reflects **real physical ambiguity at compositional boundaries**, not model failure. Cr-Cu oxides, undoped pnictides, and boundary-doping cuprates are genuinely close in composition space. The contrastive learning successfully separates most SC from non-SC but struggles at these physically ambiguous boundaries. Cu1Cr1O2 is the clearest latent space separation failure and warrants further investigation.
+
+### Z→Output Self-Consistency Check: All Heads Agreement
+
+Fed all 148,823 unique Z centroids back through every model head (Tc regression, Tc bucket, SC classifier, family head) and checked for internal contradictions.
+
+#### Internal Consistency (model agrees with itself)
+
+| Check | Mismatches | Rate | Notes |
+|-------|-----------|------|-------|
+| SC↔Tc (non-SC but Tc>5K, or SC but Tc≤0) | 206 | **99.86%** consistent | Near-perfect |
+| SC↔Family (non-SC but SC family, or SC but NOT_SC) | 0 | **100.0%** consistent | Perfect |
+| Tc↔Bucket (regression vs classifier >1 bucket off) | 330 | **99.78%** consistent | Near-perfect |
+
+**The model is internally self-consistent across all heads.** When it predicts SC, the Tc is positive, the family is an SC family, and the Tc bucket matches the regression value. When it predicts non-SC, Tc≈0 and family=NOT_SC.
+
+#### Best-Match Tc Predictions (predicted Tc for closest generated formula to each holdout target)
+
+| Family | Target | Target Tc | Pred Tc | Error | SC Prob | Family Pred |
+|--------|--------|-----------|---------|-------|---------|-------------|
+| MgB2 | Mg(17/20)Li(3/20)B2 | 36.6K | 32.6K | 4.0K | 1.000 | MGB2 |
+| MgB2 | Mg(17/20)Na(3/20)B2 | 38.0K | 37.8K | 0.2K | 1.000 | MGB2 |
+| MgB2 | Mg(49/50)Cr(1/50)B2 | 35.3K | 35.0K | 0.3K | 1.000 | MGB2 |
+| MgB2 | Mg(9/10)Li(1/10)B2 | 36.9K | 35.5K | 1.4K | 1.000 | MGB2 |
+| MgB2 | Mg(97/100)Na(3/100)B2 | 38.0K | 38.5K | 0.5K | 1.000 | MGB2 |
+| Conventional | Nb3Al(19/25)Ge(6/25) | 20.4K | 20.3K | 0.1K | 1.000 | BCS_CONVENTIONAL |
+| Conventional | Nb3Al(71/100)Ge(29/100) | 20.7K | 20.0K | 0.7K | 1.000 | BCS_CONVENTIONAL |
+| Iron-based | Dy1Fe1As1O(17/20) | 51.0K | 47.5K | 3.5K | 1.000 | PNICTIDE |
+| Iron-based | Nd1Fe1As1O(17/20) | 51.5K | 48.1K | 3.4K | 1.000 | PNICTIDE |
+| Iron-based | Sm(13/20)Th(7/20)Fe1As1O1 | 53.0K | 48.6K | 4.4K | 1.000 | PNICTIDE |
+| Iron-based | Sm(9/10)U(1/10)Fe1As1O1 | 47.0K | 46.6K | 0.4K | 1.000 | PNICTIDE |
+| Hg-cuprate | Hg(17/20)Re(3/20)Ba(36/25)Sr(14/25)Ca2Cu3O8 | 128.7K | 132.7K | 4.0K | 1.000 | HBCCO |
+| Hg-cuprate | Hg(17/20)Re(3/20)Ba(83/50)Sr(17/50)Ca2Cu3O8 | 131.3K | 130.2K | 1.1K | 1.000 | HBCCO |
+| Bi-cuprate | Bi(8/5)Pb(2/5)Sr2Ca3Cu(97/25)Si(3/25)O12 | 110.0K | 110.3K | 0.3K | 1.000 | BSCCO |
+| YBCO | Y(1/5)Eu(4/5)Ba2Cu3O7 | 93.8K | 92.3K | 1.5K | 1.000 | YBCO |
+| YBCO | Y(4/5)Ba2Cu3O(161/25) | 96.0K | 93.6K | 2.4K | 1.000 | YBCO |
+| Other | Cu1Cr1O2 | 132.0K | **-0.0K** | **132.0K** | **0.000** | **NOT_SC** |
+
+**Key takeaway**: Tc predictions are accurate to within a few K for simple formulas (MgB2, Nb-based) and within 5-25K for complex cuprates. All family assignments are correct except Cu1Cr1O2 (predicted non-SC). The model's Tc errors are well-correlated with the chemical complexity of the target.
+
+**Cu1Cr1O2 remains the sole self-consistency "success but science failure"** — the model is internally consistent (non-SC → Tc=0 → NOT_SC family) but factually wrong about this material being a superconductor.
+
+### Z-Space Granularity & SC/non-SC Separation (PCA Analysis)
+
+Analysis of how many Z vectors produce identical formulas, and how far apart SC and non-SC formulas are in latent space.
+
+#### Z-Space Granularity
+
+| Metric | Value |
+|--------|-------|
+| Formulas from single Z vector | 80.8% |
+| Formulas from 2-5 Z vectors | 14.2% |
+| Formulas from 6-100 Z vectors | 4.1% |
+| Mode attractors (>1000 Z vectors) | 0.9% |
+| Z-spread for mode attractors | ~0.15 (0.6% of Z-norm) |
+
+The latent space is **highly fine-grained**: 80.8% of unique formulas are generated by exactly one Z vector. Mode attractors (formulas generated >1000 times like `Tl1Ba2Ca(4/5)Y(1/5)Cu2O7`) occupy tight Z-space basins with spread ~0.15 vs Z-norm ~25, meaning the basin covers only 0.6% of the Z magnitude.
+
+#### Cu1Cr1O2: SC vs Non-SC Separation
+
+PCA analysis of Z centroids for the Cu1Cr1O2 target neighborhood:
+- **SC formulas**: PC1 centroid = +6.74 (1738 formulas)
+- **Non-SC formulas**: PC1 centroid = -4.53 (2919 formulas)
+- **PC1 separation**: 11.27 (std: 4.48 SC, 4.48 non-SC)
+- **Separation ratio**: 1.257 (gap / mean_std)
+
+The SC and non-SC regions ARE separated in PC1 of Z-space, but the separation ratio of 1.257 is marginal — the distributions overlap significantly. This confirms that Cu1Cr1O2's chemical neighborhood (delafossites, spinels, garnets) creates a genuine latent space boundary challenge. A stronger contrastive margin may be needed for this specific chemical regime.
+
+**Script**: `scratch/z_self_consistency_check.py`, `scratch/z_space_pca_analysis.py`
+
+---
+
 ## V12.41: Expanded NumDen Head + Stoich Conditioning Teacher Forcing (2026-02-17)
 
 ### Problems
@@ -64,11 +346,11 @@ Chronological record of training runs, architecture changes, and optimization de
 'loss_skip_frequency': 4,          # Compute skipped losses every N epochs
 'loss_skip_schedule': {
     # metric_key: (converge_threshold, spike_delta)
-    'reinforce_loss':  (1.0,   0.5),  # RL raw ~18.6 — THE big compute saver
-    'tc_loss':         (0.5,   0.1),  # Tc MSE ~0.43
+    'reinforce_loss':  (1.0,   0.5),  # RL weighted ~0.5 (raw*0.05) — THE big compute saver
+    # tc_loss: NEVER skip — core prediction capability
     'magpie_loss':     (0.1,   0.1),  # Magpie MSE ~0.06
-    'stoich_loss':     (0.01,  0.05), # Stoich MSE ~0.001
-    'numden_loss':     (3.0,   0.5),  # NumDen MSE ~2.96
+    # stoich_loss: NEVER skip — directly feeds decoder conditioning
+    # numden_loss: NEVER skip — key improvement area for formula generation
     'tc_class_loss':   (0.5,   0.2),  # Tc bucket classification
     'physics_z_loss':  (0.5,   0.2),  # PhysZ ~0.32
     'hp_loss':         (0.3,   0.1),  # High-pressure BCE
@@ -77,6 +359,10 @@ Chronological record of training runs, architecture changes, and optimization de
     'family_loss':     (0.5,   0.2),  # Hierarchical family classifier
 },
 ```
+
+### V12.40 Fix: Loss Skip Threshold Comparison (2026-02-17)
+- **Removed tc_loss, stoich_loss, numden_loss from skip schedule** — these are core signals that should never be skipped (Tc prediction, decoder conditioning, fraction generation)
+- **Fixed threshold comparison to use weighted values**: Convergence thresholds now compare `loss_value * weight` instead of raw loss value. This prevents losses with small weights from appearing "converged" when their raw value is actually still high. Spike detection similarly compares weighted baseline + delta.
 
 ### Log Output
 - Skipped RL shows `RL: [skip]` in epoch line

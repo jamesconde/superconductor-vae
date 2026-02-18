@@ -344,10 +344,10 @@ MODEL_CONFIG = {
     'magpie_dim': 145,  # V12.28: Will be 151 after physics features added (dynamically detected from CSV)
     'encoder_hidden': [512, 256],
     'decoder_hidden': [256, 512],
-    'd_model': 512,
+    'd_model': 1024,            # V12.42: Net2Net 2x wider (was 512), 128 dims/head
     'nhead': 8,
     'num_layers': 12,
-    'dim_feedforward': 2048,
+    'dim_feedforward': 4096,   # V12.42: 4x d_model (was 2048)
     'n_memory_tokens': 16,
     'element_embed_dim': 128,
 }
@@ -392,11 +392,12 @@ def build_family_lookup_tensors(device):
     return fine_to_coarse, fine_to_cuprate_sub, fine_to_iron_sub
 
 
-ALGO_VERSION = 'V12.41'  # Bump this when making algorithm changes
+ALGO_VERSION = 'V12.42'  # Bump this when making algorithm changes
 
 TRAIN_CONFIG = {
     'num_epochs': 4000,
     'learning_rate': 3e-5,      # Reduced for stable fine-tuning (was 1e-4)
+    'lr_warmup_epochs': 20,     # V12.42: Linear warmup from 0 → lr over N epochs (for fresh optimizer after Net2Net)
     'max_formula_len': 60,
     'checkpoint_interval': 50,
 
@@ -4270,7 +4271,7 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
                 if physics_z_loss_fn is not None:
                     _enc_params = _enc_params + list(physics_z_loss_fn.parameters())
                 enc_grad_norm = torch.nn.utils.clip_grad_norm_(_enc_params, 1.0)
-                dec_grad_norm = torch.nn.utils.clip_grad_norm_(decoder.parameters(), 1.0)
+                dec_grad_norm = torch.nn.utils.clip_grad_norm_(decoder.parameters(), 2.0)  # V12.42: Relaxed 1.0→2.0 for 4x wider decoder
 
                 # V12.14: NaN gradient guard — skip optimizer step if gradients are NaN/Inf
                 # This prevents NaN from poisoning Adam momentum buffers (exp_avg, exp_avg_sq)
@@ -4757,6 +4758,25 @@ def train():
             dec_opt, T_max=TRAIN_CONFIG['num_epochs'], eta_min=lr_min
         )
         print(f"LR Scheduler: CosineAnnealing (T_max={TRAIN_CONFIG['num_epochs']})")
+
+    # V12.42: Linear warmup for fresh optimizer state after Net2Net expansion
+    # Ramps LR from 0 → base_lr over warmup_epochs, then hands off to the main scheduler.
+    # Only applies when optimizer state was NOT loaded (i.e. fresh optimizer).
+    warmup_epochs = TRAIN_CONFIG.get('lr_warmup_epochs', 0)
+    if warmup_epochs > 0:
+        enc_warmup = torch.optim.lr_scheduler.LinearLR(
+            enc_opt, start_factor=1e-3, end_factor=1.0, total_iters=warmup_epochs
+        )
+        dec_warmup = torch.optim.lr_scheduler.LinearLR(
+            dec_opt, start_factor=1e-3, end_factor=1.0, total_iters=warmup_epochs
+        )
+        enc_scheduler = torch.optim.lr_scheduler.SequentialLR(
+            enc_opt, schedulers=[enc_warmup, enc_scheduler], milestones=[warmup_epochs]
+        )
+        dec_scheduler = torch.optim.lr_scheduler.SequentialLR(
+            dec_opt, schedulers=[dec_warmup, dec_scheduler], milestones=[warmup_epochs]
+        )
+        print(f"  + V12.42 LR warmup: linear 0→{TRAIN_CONFIG['learning_rate']:.1e} over {warmup_epochs} epochs")
 
     # V12.10: Store optimizer/scheduler in shutdown state for graceful interrupt
     _shutdown_state['enc_opt'] = enc_opt

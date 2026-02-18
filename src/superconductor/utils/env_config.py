@@ -132,13 +132,13 @@ def detect_environment() -> dict:
     elif runtime == "colab":
         if gpu["class"] == "large":
             # A100 / H100 (38GB+)
-            # Measured: batch=504 uses ~19.4GB on A100-40GB (48%).
-            # With n_samples_rloo=4, REINFORCE pass doubles → ~30-32GB (75-80%).
+            # V12.42: With d_model=1024, batch=252 estimated ~20-25GB on A100-40GB.
+            # With n_samples_rloo=4, REINFORCE pass adds ~8-10GB extra.
             num_workers = min(8, cpus - 1) if cpus > 1 else 0
             pin_memory = True
             persistent_workers = True
             prefetch_factor = 3
-            batch_size_multiplier = 12.0  # 42 * 12 = 504
+            batch_size_multiplier = 6.0  # V12.42: 42 * 6 = 252 (reduced for 4x wider decoder d_model=1024)
             accumulation_steps = 1        # No accumulation needed with large batch
             n_samples_rloo = 4            # 2→4: better RLOO baseline, uses ~16GB extra VRAM
             selective_backprop = False     # All samples get full gradients (no skipping)
