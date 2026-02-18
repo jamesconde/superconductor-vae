@@ -4,6 +4,48 @@ Chronological record of training runs, architecture changes, and optimization de
 
 ---
 
+## V12.41: Expanded NumDen Head + Stoich Conditioning Teacher Forcing (2026-02-17)
+
+### Problems
+1. **ND loss plateau at ~2.7**: The `numden_head` (z→128→24) was too small — only ~5 effective dims per output. Despite ND being ~77% of total loss, the 128-dim bottleneck couldn't reduce the error further. More gradient weight wouldn't help (already dominant).
+2. **Decoder ignoring stoich conditioning tokens**: Because the numden_head predictions were noisy (RMSE≈1.16 in log1p space), the decoder's 4 stoich memory tokens carried near-garbage. Over 3000+ epochs the decoder learned to ignore them entirely, relying only on 16 latent + 8 skip tokens. This created a vicious cycle: decoder ignores noisy tokens → no gradient flows back → head stays bad → tokens stay noisy.
+3. **Teacher-forced vs autoregressive exact gap**: TF exact ~60% vs TRUE AR ~89%. The 60% is expected for 97.5% per-token accuracy at seq length ~20 (0.975^20≈0.60), but fraction tokens are the hardest part and need better decoder conditioning.
+
+### Changes
+
+**1. Expanded numden_head** (`attention_vae.py`)
+- Old: `z(2048) → 128 → LayerNorm → GELU → Dropout → 24`
+- New: `z(2048) → 512 → LayerNorm → GELU → Dropout → 256 → LayerNorm → GELU → Dropout → 24`
+- ~21x more capacity per output dimension
+- Checkpoint loading handles shape mismatch via partial preserve (existing mechanism)
+
+**2. Stoich conditioning teacher forcing** (`train_v12_clean.py`)
+- New config: `stoich_cond_tf: 1.0` (always use ground truth stoich during training)
+- During training: `stoich_pred = tf * gt_stoich + (1-tf) * pred_stoich`
+- Ground truth stoich = `[elem_frac, elem_num_log, elem_den_log, elem_count]` (37 dims)
+- Evaluation/inference: always uses predicted stoich (no GT available)
+- Breaks the vicious cycle: decoder now sees perfect stoich → learns to attend to those 4 tokens → when numden_head improves, seamless transition
+
+### New Config Keys
+```python
+'stoich_cond_tf': 1.0,  # 1.0=always GT, 0.0=always predicted, can anneal later
+```
+
+### Log Output
+- New `sTF: 1.0` field in epoch log line (between ND and zN)
+
+### Expected Impact
+- ND loss should decrease as expanded numden_head has capacity to learn the mapping
+- Decoder should start attending to stoich memory tokens (visible if exact match improves)
+- Once numden_head converges, `stoich_cond_tf` can be annealed toward 0.0 so the model transitions to using predicted conditioning at inference
+- The ND loss contribution to total loss may drop significantly, allowing formula CE to get more gradient share
+
+### Risk
+- numden_head re-initialized from scratch (shape mismatch) — expect ND to spike initially before converging below 2.7
+- Decoder was trained for 3000+ epochs without reliable stoich signal — may take time to learn to use it
+
+---
+
 ## V12.40: RL Temperature Reduction + Smart Per-Loss Skip Scheduling (2026-02-17)
 
 ### Problems

@@ -894,19 +894,25 @@ class FullMaterialsVAE(nn.Module):
         )
 
         # =====================================================================
-        # NUMERATOR/DENOMINATOR PREDICTION HEAD (V12.38)
+        # NUMERATOR/DENOMINATOR PREDICTION HEAD (V12.38, expanded V12.41)
         # =====================================================================
         # Predicts raw (num, den) values in log1p space for decoder conditioning.
         # This gives the decoder explicit numerator/denominator signal so it
         # doesn't have to reverse-engineer the exact fraction from a float.
         # Output: [max_elements * 2] = 12 log-numerators + 12 log-denominators
+        # V12.41: Expanded from z→128→24 to z→512→256→24. Old 128-dim bottleneck
+        # had ~5 effective dims per output, causing ND loss plateau at ~2.7.
         # =====================================================================
         self.numden_head = nn.Sequential(
-            nn.Linear(latent_dim, 128),
-            nn.LayerNorm(128),
+            nn.Linear(latent_dim, 512),
+            nn.LayerNorm(512),
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(128, self.max_elements * 2)  # 12 numerators + 12 denominators
+            nn.Linear(512, 256),
+            nn.LayerNorm(256),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(256, self.max_elements * 2)  # 12 numerators + 12 denominators
         )
 
         # =====================================================================

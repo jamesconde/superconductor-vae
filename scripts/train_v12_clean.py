@@ -392,7 +392,7 @@ def build_family_lookup_tensors(device):
     return fine_to_coarse, fine_to_cuprate_sub, fine_to_iron_sub
 
 
-ALGO_VERSION = 'V12.40'  # Bump this when making algorithm changes
+ALGO_VERSION = 'V12.41'  # Bump this when making algorithm changes
 
 TRAIN_CONFIG = {
     'num_epochs': 4000,
@@ -445,6 +445,10 @@ TRAIN_CONFIG = {
     'magpie_weight': 2.0,
     'stoich_weight': 2.0,  # V12.4: Stoichiometry loss weight
     'numden_weight': 1.0,  # V12.38: Numerator/denominator loss weight
+    # V12.41: Stoich conditioning teacher forcing — feed GT fractions/numden to decoder
+    # Breaks the vicious cycle: decoder ignored noisy stoich tokens → no gradient → head stays bad
+    # 1.0 = always GT (decoder learns to use stoich tokens), 0.0 = always predicted
+    'stoich_cond_tf': 1.0,  # Always use ground truth stoich conditioning during training
     'kl_weight': 0.0001,  # Now L2 regularization weight on z (deterministic encoder)
     'hp_loss_weight': 0.5,   # V12.26: 0.05→0.5, HP is critical for high-Tc (H3S, LaH10) — model must master this
     'sc_loss_weight': 0.5,   # V12.21: SC/non-SC classification loss weight (BCE, all samples)
@@ -3777,7 +3781,8 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
                 theory_loss_fn=None, theory_weight=0.0, norm_stats=None,
                 physics_z_loss_fn=None, physics_z_weight=1.0,
                 family_loss_weight=0.0, family_lookup_tables=None,
-                stop_loss_weight=None):  # V12.40: Pass as param for skip scheduling
+                stop_loss_weight=None,  # V12.40: Pass as param for skip scheduling
+                stoich_cond_tf=1.0):  # V12.41: Stoich conditioning teacher forcing ratio
     """Train for one epoch with curriculum weights and teacher forcing.
 
     V12.8: Added amp_dtype for configurable mixed precision (bfloat16/float16)
@@ -3791,6 +3796,7 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
     V12.22: Added theory_loss_fn, theory_weight, norm_stats for theory-guided consistency
     V12.31: Added physics_z_loss_fn, physics_z_weight for physics Z supervision
     V12.33: Added family_loss_weight + family_lookup_tables for hierarchical family head
+    V12.41: Added stoich_cond_tf for stoich conditioning teacher forcing
     """
     global _timing_stats
 
@@ -3904,13 +3910,25 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
             if fraction_pred is not None and element_count_pred is not None:
                 if numden_pred is not None:
                     # V12.38: Widen stoich_pred with numden conditioning: [frac(12), numden(24), count(1)] = 37
-                    stoich_pred = torch.cat([fraction_pred, numden_pred, element_count_pred.unsqueeze(-1)], dim=-1)
+                    pred_stoich = torch.cat([fraction_pred, numden_pred, element_count_pred.unsqueeze(-1)], dim=-1)
                 else:
                     # V12.38 backward compat: pad zeros for missing numden_pred (old checkpoints)
                     # Decoder stoich_to_memory now expects 37-dim input
                     numden_pad = torch.zeros(fraction_pred.shape[0], 24,
                                              device=fraction_pred.device, dtype=fraction_pred.dtype)
-                    stoich_pred = torch.cat([fraction_pred, numden_pad, element_count_pred.unsqueeze(-1)], dim=-1)
+                    pred_stoich = torch.cat([fraction_pred, numden_pad, element_count_pred.unsqueeze(-1)], dim=-1)
+
+                # V12.41: Stoich conditioning teacher forcing — mix GT into decoder conditioning
+                # When stoich_cond_tf=1.0, decoder sees perfect stoich → learns to USE those tokens
+                # ND loss still trains numden_head on predictions vs GT (unchanged)
+                # At eval/inference, stoich_pred uses predictions only (no GT available)
+                if stoich_cond_tf > 0 and elem_num_log_batch is not None and elem_den_log_batch is not None:
+                    gt_numden = torch.cat([elem_num_log_batch, elem_den_log_batch], dim=-1)  # [batch, 24]
+                    gt_count = elem_mask.sum(dim=1).float()  # [batch]
+                    gt_stoich = torch.cat([elem_frac, gt_numden, gt_count.unsqueeze(-1)], dim=-1)  # [batch, 37]
+                    stoich_pred = stoich_cond_tf * gt_stoich + (1.0 - stoich_cond_tf) * pred_stoich
+                else:
+                    stoich_pred = pred_stoich
             else:
                 stoich_pred = None
 
@@ -5108,6 +5126,7 @@ def train():
             family_lookup_tables=family_lookup_tables,
             physics_z_weight=effective_physics_z_weight,
             stop_loss_weight=epoch_stop_loss_weight,  # V12.40: For skip scheduling
+            stoich_cond_tf=TRAIN_CONFIG.get('stoich_cond_tf', 1.0),  # V12.41: Stoich conditioning TF
         )
 
         # V12.11: Catastrophic drop detection - rollback to best checkpoint and halve LR
@@ -5230,6 +5249,7 @@ def train():
                     f"Tc: {metrics['tc_loss']:.4f} | Magpie: {metrics['magpie_loss']:.4f} | "
                     f"Stoich: {metrics['stoich_loss']:.4f} | "
                     f"ND: {metrics.get('numden_loss', 0):.4f} | "
+                    f"sTF: {TRAIN_CONFIG.get('stoich_cond_tf', 1.0):.1f} | "
                     f"zN: {metrics['z_norm']:.1f}")
 
         # V12.8: Add REINFORCE metrics if enabled (includes entropy in reward)
