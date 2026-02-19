@@ -4204,6 +4204,11 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
         timing.start('data_load')
 
     for batch_idx, batch in enumerate(loader):
+        # Debug: max_batches_per_epoch for quick testing
+        _max_batches = TRAIN_CONFIG.get('max_batches_per_epoch', 0)
+        if _max_batches > 0 and batch_idx >= _max_batches:
+            break
+
         # V12.15: Stop data load timing, start batch processing
         if timing:
             timing.stop('data_load')
