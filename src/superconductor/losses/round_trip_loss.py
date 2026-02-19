@@ -56,7 +56,8 @@ def _ensure_imports():
                 if not element:
                     continue
                 if match[1] and match[2]:
-                    result[element] = float(match[1]) / float(match[2])
+                    den = float(match[2])
+                    result[element] = float(match[1]) / den if den > 0 else 1.0
                 elif match[3]:
                     result[element] = float(match[3])
                 else:
