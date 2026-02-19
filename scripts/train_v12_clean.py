@@ -506,13 +506,27 @@ TRAIN_CONFIG = {
     #   - Then enable rl_weight=1.0-2.5 for fine-tuning
     #   - Higher n_samples_rloo = lower variance but slower
     # =========================================================================
-    'rl_weight': 0.05,           # V12.39: Aggressive reduction 1.0→0.05 — RL was 80% of gradient budget, drowning supervised signals on hard tail
+    'rl_weight': 0.0,            # V13.1: Disabled during rapid CE learning. Auto-reactivated by RL scheduler when TF exact plateaus.
     'ce_weight': 1.0,            # Cross-entropy weight (keep at 1.0)
     'n_samples_rloo': 4,         # Number of samples for RLOO baseline (A100: 4)
     'rl_temperature': 0.2,       # V12.40: Reduced 0.5→0.2 — at epoch 3000+, exploration hurts more than helps
     'entropy_weight': 0.2,       # Entropy bonus in REINFORCE reward (encourages exploration)
     'use_autoregressive_reinforce': True,  # Use KV-cached autoregressive sampling
     'rl_method': 'scst',         # 'scst' (Self-Critical, Rennie 2017) or 'rloo' (Ahmadian 2024)
+
+    # V13.1: RL auto-reactivation scheduler
+    # When rl_weight=0.0, this scheduler monitors TF exact match for plateau and
+    # automatically reactivates RL at rl_reactivation_weight when conditions are met.
+    # Conditions (ALL must be true):
+    #   1. TF exact >= rl_reactivation_min_exact (model is good enough for useful AR signal)
+    #   2. Exact match improvement over last rl_reactivation_window epochs < rl_reactivation_plateau_threshold
+    #   3. OR TF exact >= rl_reactivation_force_exact (unconditionally activate at high exact)
+    'rl_auto_reactivate': True,               # Enable auto-reactivation scheduler
+    'rl_reactivation_weight': 1.0,            # rl_weight to set when reactivated
+    'rl_reactivation_min_exact': 0.80,        # Don't activate below 80% TF exact
+    'rl_reactivation_window': 20,             # Epochs to measure plateau over
+    'rl_reactivation_plateau_threshold': 0.01, # <1% improvement over window = plateau
+    'rl_reactivation_force_exact': 0.92,      # Force-activate at 92% regardless of plateau
 
     # V12.40: Smart loss skip scheduling — skip converged losses to save compute
     # Each loss is tracked independently. When a loss drops below its converge_threshold,
@@ -4974,7 +4988,15 @@ def train():
               f"n_samples={TRAIN_CONFIG.get('n_samples_rloo', 2)}, "
               f"autoregressive=False (logit sampling)")
     else:
-        print("RL: Disabled (rl_weight=0)")
+        if TRAIN_CONFIG.get('rl_auto_reactivate', False):
+            print(f"RL: Disabled (rl_weight=0) — auto-reactivation scheduled")
+            print(f"  Will activate at: exact >= {TRAIN_CONFIG.get('rl_reactivation_force_exact', 0.92)*100:.0f}% "
+                  f"OR plateau (< {TRAIN_CONFIG.get('rl_reactivation_plateau_threshold', 0.01)*100:.1f}% gain "
+                  f"over {TRAIN_CONFIG.get('rl_reactivation_window', 20)} epochs) "
+                  f"when exact >= {TRAIN_CONFIG.get('rl_reactivation_min_exact', 0.80)*100:.0f}%")
+            print(f"  Reactivation weight: {TRAIN_CONFIG.get('rl_reactivation_weight', 1.0)}")
+        else:
+            print("RL: Disabled (rl_weight=0)")
 
     # V12.43: Wire up SC Constraint Zoo
     if TRAIN_CONFIG.get('constraint_zoo_enabled', False):
@@ -5447,6 +5469,10 @@ def train():
                 'base_weight': base_w,
             }
 
+    # V13.1: RL auto-reactivation state
+    rl_reactivated = TRAIN_CONFIG.get('rl_weight', 0.0) > 0  # Already active if weight > 0
+    rl_exact_history = []  # Ring buffer of recent TF exact match values
+
     for epoch in range(start_epoch, TRAIN_CONFIG['num_epochs']):
         _shutdown_state['epoch'] = epoch
 
@@ -5482,6 +5508,43 @@ def train():
                     dec_opt, T_max=remaining_epochs, eta_min=lr_min)
             print(f"  Phase B LR: {phase_b_lr}, all params unfrozen, schedulers rebuilt")
             v13_phase = 'B'  # Update phase tracking
+
+        # V13.1: RL auto-reactivation scheduler
+        # Check if TF exact match has plateaued and RL should be turned on
+        if (not rl_reactivated
+                and TRAIN_CONFIG.get('rl_auto_reactivate', False)
+                and epoch > start_epoch):
+            _rl_min = TRAIN_CONFIG.get('rl_reactivation_min_exact', 0.80)
+            _rl_force = TRAIN_CONFIG.get('rl_reactivation_force_exact', 0.92)
+            _rl_window = TRAIN_CONFIG.get('rl_reactivation_window', 20)
+            _rl_thresh = TRAIN_CONFIG.get('rl_reactivation_plateau_threshold', 0.01)
+
+            _activate = False
+            _reason = ""
+
+            # Condition 3: Force-activate at high exact regardless of plateau
+            if prev_exact >= _rl_force:
+                _activate = True
+                _reason = f"TF exact {prev_exact*100:.1f}% >= force threshold {_rl_force*100:.0f}%"
+
+            # Conditions 1+2: Plateau detection
+            elif prev_exact >= _rl_min and len(rl_exact_history) >= _rl_window:
+                _window_start = rl_exact_history[-_rl_window]
+                _improvement = prev_exact - _window_start
+                if _improvement < _rl_thresh:
+                    _activate = True
+                    _reason = (f"TF exact plateaued: {_window_start*100:.1f}% → {prev_exact*100:.1f}% "
+                              f"(+{_improvement*100:.2f}%) over {_rl_window} epochs < {_rl_thresh*100:.1f}% threshold")
+
+            if _activate:
+                _rl_w = TRAIN_CONFIG.get('rl_reactivation_weight', 1.0)
+                loss_fn.rl_weight = _rl_w
+                TRAIN_CONFIG['rl_weight'] = _rl_w  # Update config so logging/skip logic sees it
+                rl_reactivated = True
+                print(f"\n{'='*70}")
+                print(f"  [RL SCHEDULER] Reactivating REINFORCE (rl_weight={_rl_w})")
+                print(f"  Reason: {_reason}")
+                print(f"{'='*70}\n", flush=True)
 
         # Get curriculum weights for this epoch
         tc_weight, magpie_weight = get_curriculum_weights(epoch)
@@ -5662,6 +5725,9 @@ def train():
         if not rolled_back:
             prev_exact = metrics['exact_match']
         _shutdown_state['prev_exact'] = prev_exact  # V12.10: Keep shutdown state current
+
+        # V13.1: Track exact match history for RL reactivation plateau detection
+        rl_exact_history.append(metrics['exact_match'])
 
         # V12.9: Update entropy manager with this epoch's metrics
         if entropy_manager is not None and TRAIN_CONFIG.get('rl_weight', 0.0) > 0:
