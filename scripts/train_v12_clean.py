@@ -2043,10 +2043,12 @@ class CombinedLossWithREINFORCE(nn.Module):
         if not config.get('constraint_zoo_enabled', False):
             return
 
+        # Get device from encoder for sub-module placement
+        _device = next(encoder.parameters()).device
+
         # V13.0: Configure vocab layout for constraint rewards
         if v13_tokenizer is not None:
             # Create on GPU directly to avoid per-call CPU->GPU transfer
-            _device = next(encoder.parameters()).device
             _frac_values = torch.zeros(v13_tokenizer.vocab_size, device=_device)
             for tid in range(v13_tokenizer.fraction_token_start, v13_tokenizer.vocab_size):
                 _frac_values[tid] = v13_tokenizer.fraction_token_to_value(tid)
@@ -2108,13 +2110,13 @@ class CombinedLossWithREINFORCE(nn.Module):
         # A3: Site occupancy sum (differentiable)
         self._site_occupancy_loss = SiteOccupancySumLoss(
             weight=config.get('a3_site_occupancy_weight', 1.0),
-        )
+        ).to(_device)
 
-        # A6: Charge balance (differentiable)
+        # A6: Charge balance (differentiable) — must be on GPU for buffer indexing
         self._charge_balance_loss = ChargeBalanceLoss(
             weight=config.get('a6_charge_balance_weight', 1.0),
             tolerance=config.get('a6_charge_tolerance', 0.5),
-        )
+        ).to(_device)
 
         self._constraint_zoo_weight = config.get('constraint_zoo_weight', 0.5)
 
