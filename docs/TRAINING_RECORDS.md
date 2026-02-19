@@ -79,6 +79,19 @@ All scripts that construct `EnhancedTransformerDecoder` now auto-detect `vocab_s
 
 Phase A→B transition also rebuilds LR schedulers for new optimizers.
 
+### V13.0 Compatibility Fixes (cc2f6e4)
+
+Second-round audit of all loss modules for V12 token layout assumptions:
+
+| File | Bug | Fix |
+|------|-----|-----|
+| `constraint_rewards.py` | `_elem_idx(14)` and `_elem_idx(32)` NameError in B8 (A15) constraint — old lambda removed but still called | Added `_Si` and `_Ge` to `_rebuild_element_constants()` |
+| `formula_loss.py` | `TOKEN_TYPE_MASK` hardcoded to 148 elements — index out-of-bounds with V13 tokens | Added `set_formula_loss_tokenizer()`, dynamic mask resizing, `WeightedFormulaLoss` auto-rebuilds CE weights when vocab_size changes |
+| `semantic_unit_loss.py` | Uses V12 `IDX_TO_TOKEN` for semantic unit parsing | Added `set_semantic_unit_tokenizer()` with V13 `_parse_tokens_v13()` path |
+| `train_v12_clean.py` | `_v13_fraction_values` created on CPU, transferred to GPU every reward call | Created on encoder's GPU device directly |
+
+Note: `formula_loss.py` and `semantic_unit_loss.py` are NOT used in the main training loop (train_v12_clean.py computes CE directly), but are part of the public loss API and used by `SemanticUnitLoss` class.
+
 ---
 
 ## V12.43: SC Constraint Zoo — Physics-Grounded Generation Constraints (2026-02-18)
