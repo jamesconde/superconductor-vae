@@ -8,6 +8,9 @@ Includes:
 - consistency_losses: Self-consistency and bidirectional consistency losses
 - theory_losses: BCS, cuprate, and other theory-based regularization
 - z_supervision_loss: V12.31 Physics Z coordinate supervision
+- constraint_rewards: V12.43 REINFORCE reward modifiers (A1, A2, A4, A7, B1-B8)
+- round_trip_loss: V12.43 Round-trip cycle consistency (A5)
+- constraint_zoo: V12.43 Differentiable physics constraints (A3, A6)
 """
 
 from .formula_loss import (
@@ -66,6 +69,27 @@ from .z_supervision_loss import (
     PhysicsZLoss,
 )
 
+# V12.43: SC Constraint Zoo
+from .constraint_rewards import (
+    ConstraintRewardConfig,
+    FamilyConstraintConfig,
+    compute_constraint_rewards,
+    compute_duplicate_element_penalty,
+    compute_gcd_canonicality_penalty,
+    compute_stoich_normalization_penalty,
+    compute_impossible_element_penalty,
+    compute_family_constraint_rewards,
+)
+
+from .round_trip_loss import (
+    RoundTripConsistencyLoss,
+)
+
+from .constraint_zoo import (
+    SiteOccupancySumLoss,
+    ChargeBalanceLoss,
+)
+
 __all__ = [
     # formula_loss
     'TokenType',
@@ -111,4 +135,18 @@ __all__ = [
     'DimensionlessRatioConsistencyLoss',
     'DirectSupervisionLoss',
     'PhysicsZLoss',
+    # constraint_rewards (V12.43)
+    'ConstraintRewardConfig',
+    'FamilyConstraintConfig',
+    'compute_constraint_rewards',
+    'compute_duplicate_element_penalty',
+    'compute_gcd_canonicality_penalty',
+    'compute_stoich_normalization_penalty',
+    'compute_impossible_element_penalty',
+    'compute_family_constraint_rewards',
+    # round_trip_loss (V12.43)
+    'RoundTripConsistencyLoss',
+    # constraint_zoo (V12.43)
+    'SiteOccupancySumLoss',
+    'ChargeBalanceLoss',
 ]

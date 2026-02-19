@@ -1333,6 +1333,13 @@ class EnhancedTransformerDecoder(nn.Module):
         # No effect when TF = 1.0 (full teacher forcing).
         use_position_dependent_tf: bool = False,
         tf_position_decay: float = 0.5,
+        # V13.0: Configurable vocabulary size for semantic fraction tokens
+        # If None, falls back to VOCAB_SIZE (148) for backward compatibility
+        vocab_size: int = None,
+        # V13.0: Stoich conditioning input dimension
+        # V12.x: 37 = fractions(12) + numden(24) + count(1)
+        # V13.0: 13 = fractions(12) + count(1) — numden removed (implicit in fraction tokens)
+        stoich_input_dim: int = None,
     ):
         super().__init__()
 
@@ -1341,7 +1348,8 @@ class EnhancedTransformerDecoder(nn.Module):
         self.nhead = nhead
         self.num_layers = num_layers
         self.max_len = max_len
-        self.vocab_size = VOCAB_SIZE
+        # V13.0: Use provided vocab_size, or fall back to old VOCAB_SIZE for backward compat
+        self.vocab_size = vocab_size if vocab_size is not None else VOCAB_SIZE
         self.n_memory_tokens = n_memory_tokens
         self.use_skip_connection = use_skip_connection
         self.use_stoich_conditioning = use_stoich_conditioning
@@ -1352,7 +1360,7 @@ class EnhancedTransformerDecoder(nn.Module):
 
         # Token embedding
         self.token_embedding = nn.Embedding(
-            num_embeddings=VOCAB_SIZE,
+            num_embeddings=self.vocab_size,
             embedding_dim=d_model,
             padding_idx=PAD_IDX
         )
@@ -1380,16 +1388,20 @@ class EnhancedTransformerDecoder(nn.Module):
         else:
             self.skip_n_tokens = 0
 
-        # V12.4/V12.38: Stoichiometry conditioning - project fraction + numden predictions to memory tokens
+        # V12.4/V12.38/V13.0: Stoichiometry conditioning - project fraction predictions to memory tokens
         # This gives the decoder DIRECT visibility into predicted element fractions,
-        # numerators, and denominators, so when generating digits it can "look at" what
-        # stoichiometry it should produce.
-        # Input: stoich_pred [batch, max_elements*3 + 1] — fractions(12) + numden(24) + count(1) = 37
+        # so when generating tokens it can "look at" what stoichiometry it should produce.
+        # V12.x input: [batch, max_elements*3 + 1] — fractions(12) + numden(24) + count(1) = 37
+        # V13.0 input: [batch, max_elements + 1]   — fractions(12) + count(1) = 13
+        #   (numden removed — fraction info now implicit in semantic fraction tokens)
         # Output: stoich_memory [batch, n_stoich_tokens, d_model]
         if use_stoich_conditioning:
             self.stoich_n_tokens = n_stoich_tokens
             # Project stoich predictions to memory tokens
-            stoich_input_dim = max_elements * 3 + 1  # V12.38: fractions(12) + numerators(12) + denominators(12) + count(1) = 37
+            # V13.0: Accept explicit stoich_input_dim for flexibility, default to V12.x (37) for backward compat
+            if stoich_input_dim is None:
+                stoich_input_dim = max_elements * 3 + 1  # V12.x default: fractions(12) + numden(24) + count(1) = 37
+            self.stoich_input_dim = stoich_input_dim
             self.stoich_to_memory = nn.Sequential(
                 nn.Linear(stoich_input_dim, d_model),
                 nn.LayerNorm(d_model),
@@ -1420,7 +1432,7 @@ class EnhancedTransformerDecoder(nn.Module):
             nn.Linear(d_model, d_model),
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(d_model, VOCAB_SIZE)
+            nn.Linear(d_model, self.vocab_size)
         )
 
         # V12.30: Dedicated stop-prediction head
@@ -1448,13 +1460,13 @@ class EnhancedTransformerDecoder(nn.Module):
         self,
         z: torch.Tensor,
         encoder_skip: Optional[torch.Tensor] = None,
-        stoich_pred: Optional[torch.Tensor] = None,  # V12.38: [batch, max_elements*3 + 1] = [batch, 37]
+        stoich_pred: Optional[torch.Tensor] = None,  # V12.x: [batch, 37]; V13.0: [batch, 13]
     ) -> torch.Tensor:
         """Create combined memory from latent z, skip connection, and stoichiometry.
 
         V12.4: Now includes stoichiometry conditioning tokens that give the decoder
-        direct visibility into predicted element fractions. This helps with digit
-        generation because the decoder can "look at" what stoichiometry to produce.
+        direct visibility into predicted element fractions.
+        V13.0: stoich_pred is [batch, 13] = fractions(12) + count(1). numden removed.
 
         Memory layout: [latent_tokens (16) | skip_tokens (8) | stoich_tokens (4)]
         Total: 28 memory tokens for cross-attention

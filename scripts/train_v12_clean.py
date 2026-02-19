@@ -76,6 +76,8 @@ from superconductor.models.autoregressive_decoder import (
     EnhancedTransformerDecoder, tokenize_formula, tokens_to_indices,
     VOCAB_SIZE, PAD_IDX, START_IDX, END_IDX, IDX_TO_TOKEN, indices_to_formula
 )
+# V13.0: Semantic fraction tokenizer
+from superconductor.tokenizer.fraction_tokenizer import FractionAwareTokenizer
 from superconductor.encoders.element_properties import get_atomic_number
 
 # V12.8: REINFORCE support with GPU-native rewards
@@ -109,6 +111,13 @@ from superconductor.losses.theory_losses import (
 from superconductor.models.family_classifier import (
     SuperconductorFamily, RuleBasedFamilyClassifier, HybridFamilyClassifier
 )
+
+# V12.43: SC Constraint Zoo — physics-grounded generation constraints
+from superconductor.losses.constraint_rewards import (
+    ConstraintRewardConfig, FamilyConstraintConfig, compute_constraint_rewards
+)
+from superconductor.losses.round_trip_loss import RoundTripConsistencyLoss
+from superconductor.losses.constraint_zoo import SiteOccupancySumLoss, ChargeBalanceLoss
 
 
 # ============================================================================
@@ -392,7 +401,7 @@ def build_family_lookup_tensors(device):
     return fine_to_coarse, fine_to_cuprate_sub, fine_to_iron_sub
 
 
-ALGO_VERSION = 'V12.42'  # Bump this when making algorithm changes
+ALGO_VERSION = 'V13.0'  # Bump this when making algorithm changes
 
 TRAIN_CONFIG = {
     'num_epochs': 4000,
@@ -445,8 +454,9 @@ TRAIN_CONFIG = {
     'tc_weight': 20.0,                # V12.26: 10→20, focus gradient on Tc accuracy for generation
     'magpie_weight': 2.0,
     'stoich_weight': 2.0,  # V12.4: Stoichiometry loss weight
-    'numden_weight': 1.0,  # V12.38: Numerator/denominator loss weight
-    # V12.41: Stoich conditioning teacher forcing — feed GT fractions/numden to decoder
+    # V13.0: numden_weight removed — numden_head and numden_loss eliminated.
+    # Fraction prediction now handled by decoder cross-entropy over semantic fraction tokens.
+    # V12.41: Stoich conditioning teacher forcing — feed GT fractions to decoder
     # Breaks the vicious cycle: decoder ignored noisy stoich tokens → no gradient → head stays bad
     # 1.0 = always GT (decoder learns to use stoich tokens), 0.0 = always predicted
     'stoich_cond_tf': 1.0,  # Always use ground truth stoich conditioning during training
@@ -521,7 +531,7 @@ TRAIN_CONFIG = {
         # tc_loss: NEVER skip — core prediction capability
         'magpie_loss':     (0.1,   0.1),   # Magpie MSE ~0.06
         # stoich_loss: NEVER skip — directly feeds decoder conditioning
-        # numden_loss: NEVER skip — key improvement area for formula generation
+        # V13.0: numden_loss removed (was "NEVER skip")
         'tc_class_loss':   (0.5,   0.2),   # Tc bucket classification (CE, V12.28)
         # --- External losses (computed in train_epoch) ---
         'physics_z_loss':  (0.5,   0.2),   # PhysZ ~0.32 at epoch 3056
@@ -755,6 +765,64 @@ TRAIN_CONFIG = {
     # digit-by-digit '1','3' — the stoich head already handles integer stoichiometry.
     # Splitting integers into fraction digits would introduce new cascade error sources.
     'normalize_integers_to_fractions': False,
+
+    # =========================================================================
+    # V12.43: SC Constraint Zoo — Physics-Grounded Generation Constraints
+    # =========================================================================
+    # REINFORCE reward modifiers (A1, A2, A4, A7, B1-B8) and differentiable
+    # losses (A3 site occupancy, A5 round-trip, A6 charge balance).
+    # See docs/SC_CONSTRAINT_ZOO.md for full constraint definitions.
+    # =========================================================================
+    'constraint_zoo_enabled': True,
+    'constraint_zoo_weight': 0.5,         # Overall weight for differentiable constraint losses (A3, A6)
+
+    # A1: Duplicate element penalty (REINFORCE reward)
+    'a1_duplicate_penalty': -50.0,
+    # A2: GCD fraction canonicality penalty — V13.0: disabled (impossible to emit non-canonical fractions)
+    'a2_gcd_penalty': 0.0,
+    # A4: Stoichiometric normalization penalty (REINFORCE reward)
+    'a4_stoich_norm_penalty': -10.0,
+    # A7: Impossible element combination penalty (REINFORCE reward)
+    'a7_impossible_element_penalty': -30.0,
+
+    # A5: Round-trip cycle consistency (differentiable loss)
+    'a5_round_trip_weight': 1.0,
+    'a5_z_weight': 1.0,                  # MSE weight on Z reconstruction
+    'a5_tc_weight': 5.0,                 # MSE weight on Tc reconstruction
+    'a5_subset_fraction': 0.1,           # Fraction of batch for round-trip (0.1 = 10%)
+
+    # A3: Site occupancy sum (differentiable loss)
+    'a3_site_occupancy_weight': 1.0,
+    # A6: Charge balance (differentiable loss)
+    'a6_charge_balance_weight': 1.0,
+    'a6_charge_tolerance': 0.5,          # Charge imbalance below this not penalized
+
+    # B1-B8: Family-specific physics constraints (REINFORCE rewards)
+    'family_constraint_enabled': True,
+    'family_constraint_confidence': 0.8,  # Only apply when family classifier > this
+    'b1_ybco_oxygen_penalty': -40.0,
+    'b2_lsco_sr_doping_penalty': -40.0,
+    'b3_bscco_ca_cu_penalty': -40.0,
+    'b4_hg_volatile_penalty': -30.0,
+    'b5_tl_poison_penalty': -30.0,
+    'b6_iron_oxygen_penalty': -30.0,
+    'b7_mgb2_poison_penalty': -30.0,
+    'b8_a15_ratio_penalty': -30.0,
+
+    # =========================================================================
+    # V13.0: Semantic Fraction Tokenization
+    # =========================================================================
+    # Replace digit-by-digit fraction tokenization with single semantic tokens.
+    # Each (p/q) becomes one FRAC:p/q token, eliminating cascading digit errors.
+    # =========================================================================
+    'use_semantic_fractions': True,  # V13.0: Enable semantic fraction tokenizer
+    'fraction_vocab_path': 'data/fraction_vocab.json',  # Fraction vocabulary file
+    'fraction_token_weight': 2.0,  # Upweight fraction tokens in CE loss (optional)
+
+    # V13.0: Two-phase training for weight transfer from V12.x
+    'v13_phase': 'A',         # 'A' = frozen warmup (only fraction embeddings train), 'B' = full fine-tuning
+    'v13_phase_a_epochs': 5,  # Number of warmup epochs in Phase A
+    'v13_phase_a_lr': 1e-4,   # Learning rate for Phase A (higher, new params only)
 }
 
 CONTRASTIVE_DATA_PATH = PROJECT_ROOT / 'data/processed/supercon_fractions_contrastive.csv'
@@ -1153,6 +1221,11 @@ def _try_load_cache(csv_hash: str, max_formula_len: int):
         if not numden_cache_path.exists():
             print("  Cache stale: element_num_log.pt missing (V12.38 upgrade)")
             return None
+        # V13.0: Invalidate cache if semantic fraction tokenization setting changed
+        use_semantic = TRAIN_CONFIG.get('use_semantic_fractions', False)
+        if meta.get('use_semantic_fractions', False) != use_semantic:
+            print(f"  Cache stale: use_semantic_fractions changed ({meta.get('use_semantic_fractions', False)} → {use_semantic})")
+            return None
 
         # Load tensors
         tensors = {
@@ -1236,6 +1309,8 @@ def _save_cache(tensors: dict, norm_stats: dict, n_magpie_cols: int,
         'use_canonical_fractions': TRAIN_CONFIG.get('use_canonical_fractions', False),
         # V12.37: Integer normalization for cache invalidation
         'normalize_integers_to_fractions': TRAIN_CONFIG.get('normalize_integers_to_fractions', False),
+        # V13.0: Semantic fraction tokenization for cache invalidation
+        'use_semantic_fractions': TRAIN_CONFIG.get('use_semantic_fractions', False),
     }
     with open(cache_dir / 'cache_meta.json', 'w') as f:
         json.dump(meta, f)
@@ -1454,41 +1529,53 @@ def load_and_prepare_data():
         magpie_normalized = (magpie_data - magpie_mean) / magpie_std
 
         # Tokenize formulas
-        # V12.34: Optionally canonicalize fractions (GCD-reduce) before tokenization
-        # V12.37: Optionally normalize integer subscripts to fraction format
-        use_canonical = TRAIN_CONFIG.get('use_canonical_fractions', False)
-        use_int_norm = TRAIN_CONFIG.get('normalize_integers_to_fractions', False)
-        if use_canonical or use_int_norm:
-            parts = []
-            if use_canonical:
-                parts.append("fraction canonicalization")
-            if use_int_norm:
-                parts.append("integer normalization")
-            print(f"Tokenizing formulas (with {' + '.join(parts)})...")
+        # V13.0: Use FractionAwareTokenizer for semantic fraction tokens
+        use_semantic = TRAIN_CONFIG.get('use_semantic_fractions', False)
+        if use_semantic:
+            frac_vocab_path = PROJECT_ROOT / TRAIN_CONFIG.get('fraction_vocab_path', 'data/fraction_vocab.json')
+            v13_tokenizer = FractionAwareTokenizer(str(frac_vocab_path), max_len=max_len)
+            print(f"Tokenizing formulas (V13.0 semantic fractions, vocab_size={v13_tokenizer.vocab_size})...")
+            all_tokens = []
+            for formula in formulas:
+                indices = v13_tokenizer.encode(formula, add_bos_eos=True, pad=True)
+                all_tokens.append(torch.tensor(indices, dtype=torch.long))
+            formula_tokens = torch.stack(all_tokens)
+            print(f"  V13.0: Tokenized {len(formulas)} formulas with semantic fraction tokens")
         else:
-            print("Tokenizing formulas...")
-        all_tokens = []
-        n_canonicalized = 0
-        n_int_normalized = 0
-        for formula in formulas:
+            # V12.x fallback: character-level tokenization
+            use_canonical = TRAIN_CONFIG.get('use_canonical_fractions', False)
+            use_int_norm = TRAIN_CONFIG.get('normalize_integers_to_fractions', False)
+            if use_canonical or use_int_norm:
+                parts = []
+                if use_canonical:
+                    parts.append("fraction canonicalization")
+                if use_int_norm:
+                    parts.append("integer normalization")
+                print(f"Tokenizing formulas (with {' + '.join(parts)})...")
+            else:
+                print("Tokenizing formulas...")
+            all_tokens = []
+            n_canonicalized = 0
+            n_int_normalized = 0
+            for formula in formulas:
+                if use_canonical:
+                    canon = canonicalize_fractions(formula)
+                    if canon != formula:
+                        n_canonicalized += 1
+                    formula = canon
+                if use_int_norm:
+                    normalized = normalize_integers_to_fractions(formula)
+                    if normalized != formula:
+                        n_int_normalized += 1
+                    formula = normalized
+                tokens = tokenize_formula(formula)
+                indices = tokens_to_indices(tokens, max_len=max_len)
+                all_tokens.append(indices)
             if use_canonical:
-                canon = canonicalize_fractions(formula)
-                if canon != formula:
-                    n_canonicalized += 1
-                formula = canon
+                print(f"  Canonicalized {n_canonicalized}/{len(formulas)} formulas")
             if use_int_norm:
-                normalized = normalize_integers_to_fractions(formula)
-                if normalized != formula:
-                    n_int_normalized += 1
-                formula = normalized
-            tokens = tokenize_formula(formula)
-            indices = tokens_to_indices(tokens, max_len=max_len)
-            all_tokens.append(indices)
-        if use_canonical:
-            print(f"  Canonicalized {n_canonicalized}/{len(formulas)} formulas")
-        if use_int_norm:
-            print(f"  Integer-normalized {n_int_normalized}/{len(formulas)} formulas")
-        formula_tokens = torch.stack(all_tokens)
+                print(f"  Integer-normalized {n_int_normalized}/{len(formulas)} formulas")
+            formula_tokens = torch.stack(all_tokens)
 
         # Parse element compositions
         print("Parsing element compositions...")
@@ -1513,30 +1600,12 @@ def load_and_prepare_data():
                 except:
                     continue
 
-        # V12.38: Extract raw numerator/denominator pairs for decoder conditioning
-        element_numerators = torch.zeros(len(formulas), MAX_ELEMENTS, dtype=torch.float32)
-        element_denominators = torch.zeros(len(formulas), MAX_ELEMENTS, dtype=torch.float32)
-        for i, formula in enumerate(formulas):
-            # Apply same normalization as tokenization to get consistent numden
-            if use_canonical:
-                formula = canonicalize_fractions(formula)
-            if use_int_norm:
-                formula = normalize_integers_to_fractions(formula)
-            numden = parse_numden_from_formula(formula)
-            if not numden:
-                continue
-            for j, (num, den) in enumerate(numden):
-                if j >= MAX_ELEMENTS:
-                    break
-                if element_mask[i, j]:  # Only where we have valid elements
-                    element_numerators[i, j] = num
-                    element_denominators[i, j] = den
-        # Store in log1p space for range compression (nums/dens range 1-500)
-        element_num_log = torch.log1p(element_numerators)
-        element_den_log = torch.log1p(element_denominators)
-        print(f"  V12.38: Extracted numerator/denominator pairs "
-              f"(num range: {element_numerators[element_mask].min():.0f}-{element_numerators[element_mask].max():.0f}, "
-              f"den range: {element_denominators[element_mask].min():.0f}-{element_denominators[element_mask].max():.0f})")
+        # V13.0: numden extraction removed — no longer needed for decoder conditioning.
+        # Fraction info is now implicit in semantic fraction tokens.
+        # Create zero tensors for backward compatibility with dataset/cache structure.
+        element_num_log = torch.zeros(len(formulas), MAX_ELEMENTS, dtype=torch.float32)
+        element_den_log = torch.zeros(len(formulas), MAX_ELEMENTS, dtype=torch.float32)
+        print(f"  V13.0: numden extraction skipped (semantic fraction tokens handle fractions)")
 
         # Create tensors
         tc_tensor = torch.tensor(tc_normalized, dtype=torch.float32).unsqueeze(1)
@@ -1758,6 +1827,18 @@ def create_models(magpie_dim: int, device: torch.device):
         dropout=0.1
     ).to(device)
 
+    # V13.0: Determine vocab size and stoich input dim based on tokenizer mode
+    use_semantic = TRAIN_CONFIG.get('use_semantic_fractions', False)
+    if use_semantic:
+        frac_vocab_path = PROJECT_ROOT / TRAIN_CONFIG.get('fraction_vocab_path', 'data/fraction_vocab.json')
+        v13_tokenizer = FractionAwareTokenizer(str(frac_vocab_path), max_len=TRAIN_CONFIG['max_formula_len'])
+        decoder_vocab_size = v13_tokenizer.vocab_size
+        decoder_stoich_input_dim = 13  # fractions(12) + count(1)
+        print(f"V13.0: Decoder vocab_size={decoder_vocab_size}, stoich_input_dim={decoder_stoich_input_dim}")
+    else:
+        decoder_vocab_size = None  # Use default VOCAB_SIZE (148)
+        decoder_stoich_input_dim = None  # Use default (37)
+
     decoder = EnhancedTransformerDecoder(
         latent_dim=MODEL_CONFIG['latent_dim'],
         d_model=MODEL_CONFIG['d_model'],
@@ -1777,6 +1858,9 @@ def create_models(magpie_dim: int, device: torch.device):
         # V12.34: Position-dependent teacher forcing (no effect at TF=1.0)
         use_position_dependent_tf=TRAIN_CONFIG.get('use_position_dependent_tf', False),
         tf_position_decay=TRAIN_CONFIG.get('tf_position_decay', 0.5),
+        # V13.0: Configurable vocab and stoich dims for semantic fraction tokens
+        vocab_size=decoder_vocab_size,
+        stoich_input_dim=decoder_stoich_input_dim,
     ).to(device)
 
     enc_params = sum(p.numel() for p in encoder.parameters())
@@ -1815,7 +1899,7 @@ class CombinedLossWithREINFORCE(nn.Module):
         magpie_weight: float = 2.0,
         kl_weight: float = 0.0001,
         stoich_weight: float = 2.0,
-        numden_weight: float = 1.0,  # V12.38: Numerator/denominator loss weight
+        numden_weight: float = 0.0,  # V13.0: Deprecated, kept for backward compat (always 0)
         entropy_weight: float = 0.01,
         n_samples_rloo: int = 2,
         temperature: float = 0.8,
@@ -1852,7 +1936,7 @@ class CombinedLossWithREINFORCE(nn.Module):
         self.magpie_weight = magpie_weight
         self.kl_weight = kl_weight
         self.stoich_weight = stoich_weight
-        self.numden_weight = numden_weight  # V12.38
+        self.numden_weight = 0.0  # V13.0: numden loss removed
         self.entropy_weight = entropy_weight
         self.n_samples_rloo = n_samples_rloo
         self.temperature = temperature
@@ -1898,6 +1982,16 @@ class CombinedLossWithREINFORCE(nn.Module):
         else:
             self.ce_loss = nn.CrossEntropyLoss(reduction='none', ignore_index=PAD_IDX)
 
+        # V12.43: SC Constraint Zoo state (initialized via set_constraint_zoo())
+        self._constraint_reward_config = None
+        self._family_constraint_config = None
+        self._round_trip_loss = None
+        self._site_occupancy_loss = None
+        self._charge_balance_loss = None
+        self._constraint_zoo_weight = 0.0
+        self._a5_round_trip_weight = 0.0
+        self._last_family_preds = None  # Set per-batch in forward() for REINFORCE access
+
     def set_decoder(self, decoder, max_len: int = 60, draft_model=None, stop_boost: float = 0.0,
                     hard_stop_threshold: float = 0.0):
         """Set decoder for autoregressive REINFORCE sampling (V12.8).
@@ -1918,6 +2012,75 @@ class CombinedLossWithREINFORCE(nn.Module):
     def set_draft_model(self, draft_model):
         """Set draft model for speculative decoding (V12.9)."""
         self._draft_model = draft_model
+
+    def set_constraint_zoo(self, encoder, decoder, config: dict):
+        """V12.43: Configure SC Constraint Zoo losses and rewards.
+
+        Args:
+            encoder: FullMaterialsVAE instance (for A5 round-trip re-encoding)
+            decoder: EnhancedTransformerDecoder (for A5 greedy decode)
+            config: TRAIN_CONFIG dict with constraint zoo parameters
+        """
+        if not config.get('constraint_zoo_enabled', False):
+            return
+
+        # REINFORCE reward config (A1, A2, A4, A7)
+        self._constraint_reward_config = ConstraintRewardConfig(
+            a1_enabled=True,
+            a1_penalty=config.get('a1_duplicate_penalty', -50.0),
+            a2_enabled=True,
+            a2_penalty_per_violation=config.get('a2_gcd_penalty', -5.0),
+            a4_enabled=True,
+            a4_penalty=config.get('a4_stoich_norm_penalty', -10.0),
+            a7_enabled=True,
+            a7_penalty=config.get('a7_impossible_element_penalty', -30.0),
+        )
+
+        # Family-specific constraints (B1-B8)
+        self._family_constraint_config = FamilyConstraintConfig(
+            enabled=config.get('family_constraint_enabled', True),
+            confidence_threshold=config.get('family_constraint_confidence', 0.8),
+            b1_penalty=config.get('b1_ybco_oxygen_penalty', -40.0),
+            b2_penalty=config.get('b2_lsco_sr_doping_penalty', -40.0),
+            b3_penalty=config.get('b3_bscco_ca_cu_penalty', -40.0),
+            b4_penalty=config.get('b4_hg_volatile_penalty', -30.0),
+            b5_penalty=config.get('b5_tl_poison_penalty', -30.0),
+            b6_penalty=config.get('b6_iron_oxygen_penalty', -30.0),
+            b7_penalty=config.get('b7_mgb2_poison_penalty', -30.0),
+            b8_penalty=config.get('b8_a15_ratio_penalty', -30.0),
+        )
+
+        # A5: Round-trip cycle consistency (differentiable)
+        self._a5_round_trip_weight = config.get('a5_round_trip_weight', 1.0)
+        self._round_trip_loss = RoundTripConsistencyLoss(
+            z_weight=config.get('a5_z_weight', 1.0),
+            tc_weight=config.get('a5_tc_weight', 5.0),
+            subset_fraction=config.get('a5_subset_fraction', 0.1),
+        )
+        self._round_trip_loss.set_models(encoder, decoder)
+
+        # A3: Site occupancy sum (differentiable)
+        self._site_occupancy_loss = SiteOccupancySumLoss(
+            weight=config.get('a3_site_occupancy_weight', 1.0),
+        )
+
+        # A6: Charge balance (differentiable)
+        self._charge_balance_loss = ChargeBalanceLoss(
+            weight=config.get('a6_charge_balance_weight', 1.0),
+            tolerance=config.get('a6_charge_tolerance', 0.5),
+        )
+
+        self._constraint_zoo_weight = config.get('constraint_zoo_weight', 0.5)
+
+        print(f"  [Constraint Zoo] Enabled: A1({self._constraint_reward_config.a1_penalty}), "
+              f"A2({self._constraint_reward_config.a2_penalty_per_violation}), "
+              f"A4({self._constraint_reward_config.a4_penalty}), "
+              f"A7({self._constraint_reward_config.a7_penalty})")
+        print(f"  [Constraint Zoo] A5 round-trip weight={self._a5_round_trip_weight}, "
+              f"A3 site-occ, A6 charge-bal, zoo_weight={self._constraint_zoo_weight}")
+        print(f"  [Constraint Zoo] B1-B8 family constraints "
+              f"{'enabled' if self._family_constraint_config.enabled else 'disabled'} "
+              f"(conf>{self._family_constraint_config.confidence_threshold})")
 
     def compute_rloo_autoregressive(
         self,
@@ -2009,6 +2172,20 @@ class CombinedLossWithREINFORCE(nn.Module):
             config=self.gpu_reward_config,
             pad_idx=PAD_IDX, end_idx=END_IDX
         )
+
+        # V12.43: Add constraint rewards to RLOO task rewards
+        if self._constraint_reward_config is not None:
+            # Family predictions need to be expanded to match [batch * n_samples]
+            family_preds_expanded = None
+            if self._last_family_preds is not None:
+                family_preds_expanded = self._last_family_preds.repeat(n_samples, 1)
+            constraint_rewards = compute_constraint_rewards(
+                sampled_tokens, mask,
+                config=self._constraint_reward_config,
+                family_predictions=family_preds_expanded,
+                family_config=self._family_constraint_config,
+            )
+            task_rewards = task_rewards + constraint_rewards
 
         # Compute entropy bonus per sample
         seq_entropy = (entropy * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1)
@@ -2178,6 +2355,16 @@ class CombinedLossWithREINFORCE(nn.Module):
                 pad_idx=PAD_IDX, end_idx=END_IDX
             )
 
+            # V12.43: Add constraint rewards to greedy baseline
+            if self._constraint_reward_config is not None:
+                greedy_constraint = compute_constraint_rewards(
+                    greedy_tokens, greedy_mask,
+                    config=self._constraint_reward_config,
+                    family_predictions=self._last_family_preds,
+                    family_config=self._family_constraint_config,
+                )
+                greedy_rewards = greedy_rewards + greedy_constraint
+
         # 2. Sample decode — need log_probs for gradient
         sampled_tokens, log_probs, entropy, sample_mask = self._decoder.sample_for_reinforce(
             z=z,
@@ -2210,6 +2397,16 @@ class CombinedLossWithREINFORCE(nn.Module):
                 config=self.gpu_reward_config,
                 pad_idx=PAD_IDX, end_idx=END_IDX
             )
+
+            # V12.43: Add constraint rewards to sample rewards
+            if self._constraint_reward_config is not None:
+                sample_constraint = compute_constraint_rewards(
+                    sampled_tokens, sample_mask,
+                    config=self._constraint_reward_config,
+                    family_predictions=self._last_family_preds,
+                    family_config=self._family_constraint_config,
+                )
+                sample_rewards = sample_rewards + sample_constraint
 
         # 3. SCST advantage: how much better is the sample than greedy?
         advantages = sample_rewards - greedy_rewards
@@ -2254,6 +2451,9 @@ class CombinedLossWithREINFORCE(nn.Module):
         numden_pred: torch.Tensor = None,           # [batch, 24]
         element_num_log: torch.Tensor = None,       # [batch, 12] log1p(numerator) targets
         element_den_log: torch.Tensor = None,       # [batch, 12] log1p(denominator) targets
+        # V12.43: Constraint zoo inputs
+        element_indices: torch.Tensor = None,       # [batch, max_elements] atomic numbers (for A3, A6)
+        family_predictions: torch.Tensor = None,    # [batch, 14] composed family probs (for B-constraints)
     ) -> Dict[str, torch.Tensor]:
         """Compute combined loss with optional REINFORCE."""
 
@@ -2263,6 +2463,9 @@ class CombinedLossWithREINFORCE(nn.Module):
         # Use curriculum weights if provided
         tc_w = tc_weight_override if tc_weight_override is not None else self.tc_weight
         magpie_w = magpie_weight_override if magpie_weight_override is not None else self.magpie_weight
+
+        # V12.43: Store family predictions for REINFORCE constraint rewards access
+        self._last_family_preds = family_predictions
 
         # V12.34: Check if per-sample weighting is needed (A or D)
         need_per_sample = self.use_length_weighting or (self.use_element_count_weighting and n_elements is not None)
@@ -2435,19 +2638,60 @@ class CombinedLossWithREINFORCE(nn.Module):
                 element_count_target = element_mask.sum(dim=1).float()
                 element_count_loss = F.mse_loss(element_count_pred, element_count_target)
 
-        # 6b. V12.38: Numerator/denominator loss (masked MSE in log1p space)
+        # V13.0: numden_loss removed — fraction prediction handled by decoder CE over semantic tokens
         numden_loss = torch.tensor(0.0, device=formula_logits.device)
-        if (numden_pred is not None and element_num_log is not None
-                and element_den_log is not None and element_mask is not None):
-            # Split predictions: first 12 = log-numerators, last 12 = log-denominators
-            num_pred = numden_pred[:, :12]
-            den_pred = numden_pred[:, 12:]
-            # Masked MSE
-            elem_mask_float = element_mask.float()
-            num_se = ((num_pred - element_num_log) ** 2) * elem_mask_float
-            den_se = ((den_pred - element_den_log) ** 2) * elem_mask_float
-            n_valid = elem_mask_float.sum(dim=1).clamp(min=1)
-            numden_loss = ((num_se.sum(dim=1) + den_se.sum(dim=1)) / n_valid).mean()
+
+        # 7a. V12.43: Constraint Zoo differentiable losses (A3, A5, A6)
+        constraint_zoo_loss = torch.tensor(0.0, device=formula_logits.device)
+        a5_z_mse = torch.tensor(0.0, device=formula_logits.device)
+        a5_tc_mse = torch.tensor(0.0, device=formula_logits.device)
+        a3_loss = torch.tensor(0.0, device=formula_logits.device)
+        a6_loss = torch.tensor(0.0, device=formula_logits.device)
+        a6_charge_imbalance = torch.tensor(0.0, device=formula_logits.device)
+        a5_n_valid = 0
+
+        if self._constraint_zoo_weight > 0:
+            # A5: Round-trip cycle consistency
+            if (self._round_trip_loss is not None and self._a5_round_trip_weight > 0
+                    and z is not None and magpie_pred is not None and tc_pred is not None):
+                a5_result = self._round_trip_loss(
+                    z=z,
+                    magpie_pred=magpie_pred,
+                    tc_pred=tc_pred,
+                    stoich_pred=stoich_pred_for_reinforce,
+                    encoder_skip=encoder_skip,
+                    device=formula_logits.device,
+                )
+                constraint_zoo_loss = constraint_zoo_loss + self._a5_round_trip_weight * a5_result['round_trip_loss']
+                a5_z_mse = a5_result['z_mse']
+                a5_tc_mse = a5_result['tc_mse']
+                a5_n_valid = a5_result['n_valid']
+
+            # A3: Site occupancy sum
+            if (self._site_occupancy_loss is not None
+                    and element_indices is not None and element_fractions is not None
+                    and element_mask is not None):
+                a3_result = self._site_occupancy_loss(
+                    element_indices=element_indices,
+                    element_fractions=element_fractions,
+                    element_mask=element_mask,
+                    family_predictions=family_predictions,
+                )
+                a3_loss = a3_result['site_occupancy_loss']
+                constraint_zoo_loss = constraint_zoo_loss + a3_loss
+
+            # A6: Charge balance
+            if (self._charge_balance_loss is not None
+                    and element_indices is not None and element_fractions is not None
+                    and element_mask is not None):
+                a6_result = self._charge_balance_loss(
+                    element_indices=element_indices,
+                    element_fractions=element_fractions,
+                    element_mask=element_mask,
+                )
+                a6_loss = a6_result['charge_balance_loss']
+                a6_charge_imbalance = a6_result['mean_charge_imbalance']
+                constraint_zoo_loss = constraint_zoo_loss + a6_loss
 
         # 7. Combined Loss
         # V12.8: Entropy bonus is now part of REINFORCE reward, NOT subtracted here
@@ -2458,9 +2702,10 @@ class CombinedLossWithREINFORCE(nn.Module):
             magpie_w * magpie_loss +
             self.kl_weight * kl_loss +
             self.stoich_weight * stoich_loss +
-            self.numden_weight * numden_loss +  # V12.38: Numerator/denominator loss
+            # V13.0: numden_loss removed (was self.numden_weight * numden_loss)
             0.5 * element_count_loss +
-            self.tc_class_weight * tc_class_loss  # V12.28: Tc bucket classification
+            self.tc_class_weight * tc_class_loss +  # V12.28: Tc bucket classification
+            self._constraint_zoo_weight * constraint_zoo_loss  # V12.43: Constraint zoo
             # Entropy bonus removed - now in REINFORCE reward signal
         )
 
@@ -2498,6 +2743,14 @@ class CombinedLossWithREINFORCE(nn.Module):
             'mean_reward': mean_rewards.mean() if torch.is_tensor(mean_rewards) else mean_rewards,
             'token_accuracy': token_accuracy,
             'exact_match': exact_match,
+            # V12.43: Constraint zoo metrics
+            'constraint_zoo_loss': constraint_zoo_loss.detach() if torch.is_tensor(constraint_zoo_loss) else constraint_zoo_loss,
+            'a5_z_mse': a5_z_mse,
+            'a5_tc_mse': a5_tc_mse,
+            'a5_n_valid': a5_n_valid,
+            'a3_site_occ_loss': a3_loss.detach() if torch.is_tensor(a3_loss) else a3_loss,
+            'a6_charge_bal_loss': a6_loss.detach() if torch.is_tensor(a6_loss) else a6_loss,
+            'a6_charge_imbalance': a6_charge_imbalance,
         }
 
         # V12.9: Add speculative decoding stats if available
@@ -2664,12 +2917,16 @@ def cache_z_vectors(encoder, loader, device, epoch, cache_path, dataset_info=Non
                 attended_input = encoder_out.get('attended_input')
                 all_attended_input.append(attended_input.cpu() if attended_input is not None else None)
 
-                # V12.38: Assemble stoich_pred for decoder generation
+                # V12.38/V13.0: Assemble stoich_pred for decoder generation
                 _frac = encoder_out.get('fraction_pred')
                 _ecount = encoder_out.get('element_count_pred')
                 _ndpred = encoder_out.get('numden_pred')
                 if _frac is not None and _ecount is not None:
-                    if _ndpred is not None:
+                    _use_semantic = TRAIN_CONFIG.get('use_semantic_fractions', False)
+                    if _use_semantic:
+                        # V13.0: 13-dim stoich = fractions(12) + count(1)
+                        _stoich = torch.cat([_frac, _ecount.unsqueeze(-1)], dim=-1)
+                    elif _ndpred is not None:
                         _stoich = torch.cat([_frac, _ndpred, _ecount.unsqueeze(-1)], dim=-1)
                     else:
                         _ndpad = torch.zeros(_frac.shape[0], 24, device=_frac.device, dtype=_frac.dtype)
@@ -3205,7 +3462,8 @@ def load_checkpoint(encoder, decoder, checkpoint_path, entropy_manager=None,
 def evaluate_true_autoregressive(encoder, decoder, loader, device, max_samples=1000,
                                   log_errors=True, epoch=None, stop_boost=0.0,
                                   hard_stop_threshold=0.0,
-                                  norm_stats=None, family_lookup_tables=None):
+                                  norm_stats=None, family_lookup_tables=None,
+                                  v13_tokenizer=None):
     """
     V12.18: Enhanced evaluation with full Z-space diagnostics and reconstruction metrics.
     V12.34: Added norm_stats for Tc denormalization (fixes Tc range analysis bug).
@@ -3291,10 +3549,14 @@ def evaluate_true_autoregressive(encoder, decoder, loader, device, max_samples=1
         fraction_pred = encoder_out.get('fraction_pred')
         element_count_pred = encoder_out.get('element_count_pred')
 
-        # V12.38: Assemble stoich_pred for decoder generation
+        # V12.38/V13.0: Assemble stoich_pred for decoder generation
         numden_pred_eval = encoder_out.get('numden_pred')
         if fraction_pred is not None and element_count_pred is not None:
-            if numden_pred_eval is not None:
+            use_semantic_eval = TRAIN_CONFIG.get('use_semantic_fractions', False)
+            if use_semantic_eval:
+                # V13.0: 13-dim stoich = fractions(12) + count(1)
+                stoich_pred_eval = torch.cat([fraction_pred, element_count_pred.unsqueeze(-1)], dim=-1)
+            elif numden_pred_eval is not None:
                 stoich_pred_eval = torch.cat([fraction_pred, numden_pred_eval, element_count_pred.unsqueeze(-1)], dim=-1)
             else:
                 numden_pad = torch.zeros(batch_size, 24, device=device, dtype=fraction_pred.dtype)
@@ -3406,8 +3668,13 @@ def evaluate_true_autoregressive(encoder, decoder, loader, device, max_samples=1
 
             # V12.15: Record errors for analysis (with V12.18 Z diagnostics)
             if log_errors and n_errors > 0:
-                target_formula = indices_to_formula(formula_tokens[i])
-                generated_formula = indices_to_formula(generated_tokens[i])
+                # V13.0: Use semantic tokenizer if available, else old indices_to_formula
+                if v13_tokenizer is not None:
+                    target_formula = v13_tokenizer.decode(formula_tokens[i].tolist())
+                    generated_formula = v13_tokenizer.decode(generated_tokens[i].tolist())
+                else:
+                    target_formula = indices_to_formula(formula_tokens[i])
+                    generated_formula = indices_to_formula(generated_tokens[i])
 
                 # Find specific token mismatches
                 target_seq = targets[i]
@@ -3416,8 +3683,12 @@ def evaluate_true_autoregressive(encoder, decoder, loader, device, max_samples=1
                 mismatch_positions = []
                 for pos in range(len(seq_mask)):
                     if seq_mask[pos] and target_seq[pos] != gen_seq[pos]:
-                        target_token = IDX_TO_TOKEN.get(target_seq[pos].item(), '?')
-                        gen_token = IDX_TO_TOKEN.get(gen_seq[pos].item(), '?')
+                        if v13_tokenizer is not None:
+                            target_token = v13_tokenizer.get_token_name(target_seq[pos].item())
+                            gen_token = v13_tokenizer.get_token_name(gen_seq[pos].item())
+                        else:
+                            target_token = IDX_TO_TOKEN.get(target_seq[pos].item(), '?')
+                            gen_token = IDX_TO_TOKEN.get(gen_seq[pos].item(), '?')
                         mismatch_positions.append(f"pos{pos}:{target_token}->{gen_token}")
 
                 sample_global_idx = total_samples + i
@@ -3833,6 +4104,9 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
     total_physics_z_loss = 0  # V12.31
     total_family_loss = 0  # V12.32
     total_numden_loss = 0  # V12.38
+    total_constraint_zoo_loss = 0  # V12.43
+    total_a5_z_mse = 0  # V12.43
+    total_a5_tc_mse = 0  # V12.43
     total_sc_exact = 0
     total_non_sc_exact = 0
     total_spec_accept = 0  # V12.9: Speculative decoding acceptance rate
@@ -3907,29 +4181,37 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
             # Stoichiometry predictions for loss and conditioning
             fraction_pred = encoder_out.get('fraction_pred')
             element_count_pred = encoder_out.get('element_count_pred')
-            numden_pred = encoder_out.get('numden_pred')  # V12.38: [batch, 24]
+            numden_pred = encoder_out.get('numden_pred')  # V13.0: always None
             if fraction_pred is not None and element_count_pred is not None:
-                if numden_pred is not None:
-                    # V12.38: Widen stoich_pred with numden conditioning: [frac(12), numden(24), count(1)] = 37
-                    pred_stoich = torch.cat([fraction_pred, numden_pred, element_count_pred.unsqueeze(-1)], dim=-1)
-                else:
-                    # V12.38 backward compat: pad zeros for missing numden_pred (old checkpoints)
-                    # Decoder stoich_to_memory now expects 37-dim input
-                    numden_pad = torch.zeros(fraction_pred.shape[0], 24,
-                                             device=fraction_pred.device, dtype=fraction_pred.dtype)
-                    pred_stoich = torch.cat([fraction_pred, numden_pad, element_count_pred.unsqueeze(-1)], dim=-1)
+                # V13.0: Simplified stoich_pred — fractions(12) + count(1) = 13 dims
+                # numden removed (implicit in semantic fraction tokens)
+                use_semantic = TRAIN_CONFIG.get('use_semantic_fractions', False)
+                if use_semantic:
+                    pred_stoich = torch.cat([fraction_pred, element_count_pred.unsqueeze(-1)], dim=-1)  # [batch, 13]
 
-                # V12.41: Stoich conditioning teacher forcing — mix GT into decoder conditioning
-                # When stoich_cond_tf=1.0, decoder sees perfect stoich → learns to USE those tokens
-                # ND loss still trains numden_head on predictions vs GT (unchanged)
-                # At eval/inference, stoich_pred uses predictions only (no GT available)
-                if stoich_cond_tf > 0 and elem_num_log_batch is not None and elem_den_log_batch is not None:
-                    gt_numden = torch.cat([elem_num_log_batch, elem_den_log_batch], dim=-1)  # [batch, 24]
-                    gt_count = elem_mask.sum(dim=1).float()  # [batch]
-                    gt_stoich = torch.cat([elem_frac, gt_numden, gt_count.unsqueeze(-1)], dim=-1)  # [batch, 37]
-                    stoich_pred = stoich_cond_tf * gt_stoich + (1.0 - stoich_cond_tf) * pred_stoich
+                    # V12.41/V13.0: Stoich conditioning teacher forcing
+                    if stoich_cond_tf > 0:
+                        gt_count = elem_mask.sum(dim=1).float()
+                        gt_stoich = torch.cat([elem_frac, gt_count.unsqueeze(-1)], dim=-1)  # [batch, 13]
+                        stoich_pred = stoich_cond_tf * gt_stoich + (1.0 - stoich_cond_tf) * pred_stoich
+                    else:
+                        stoich_pred = pred_stoich
                 else:
-                    stoich_pred = pred_stoich
+                    # V12.x backward compat: 37-dim stoich with numden
+                    if numden_pred is not None:
+                        pred_stoich = torch.cat([fraction_pred, numden_pred, element_count_pred.unsqueeze(-1)], dim=-1)
+                    else:
+                        numden_pad = torch.zeros(fraction_pred.shape[0], 24,
+                                                 device=fraction_pred.device, dtype=fraction_pred.dtype)
+                        pred_stoich = torch.cat([fraction_pred, numden_pad, element_count_pred.unsqueeze(-1)], dim=-1)
+
+                    if stoich_cond_tf > 0 and elem_num_log_batch is not None and elem_den_log_batch is not None:
+                        gt_numden = torch.cat([elem_num_log_batch, elem_den_log_batch], dim=-1)
+                        gt_count = elem_mask.sum(dim=1).float()
+                        gt_stoich = torch.cat([elem_frac, gt_numden, gt_count.unsqueeze(-1)], dim=-1)
+                        stoich_pred = stoich_cond_tf * gt_stoich + (1.0 - stoich_cond_tf) * pred_stoich
+                    else:
+                        stoich_pred = pred_stoich
             else:
                 stoich_pred = None
 
@@ -4097,6 +4379,8 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
                     numden_pred=numden_pred,  # V12.38
                     element_num_log=elem_num_log_batch,  # V12.38
                     element_den_log=elem_den_log_batch,  # V12.38
+                    element_indices=elem_idx,  # V12.43: For A3, A6 constraints
+                    family_predictions=encoder_out.get('family_composed_14'),  # V12.43: For B-constraints
                 )
                 loss = (loss_dict['total'] + contrastive_weight * contrastive_loss_val
                         + hp_loss_weight * hp_loss_val
@@ -4130,6 +4414,8 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
                     numden_pred=numden_pred,  # V12.38
                     element_num_log=elem_num_log_batch,  # V12.38
                     element_den_log=elem_den_log_batch,  # V12.38
+                    element_indices=elem_idx,  # V12.43: For A3, A6 constraints
+                    family_predictions=encoder_out.get('family_composed_14'),  # V12.43
                 )
                 # Scale formula loss by non_sc_formula_weight
                 loss = (non_sc_formula_weight * loss_dict['total'] + contrastive_weight * contrastive_loss_val
@@ -4145,6 +4431,7 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
                 n_non_sc = (~sc_mask).sum().item()
 
                 # SC portion: full loss
+                _family_preds = encoder_out.get('family_composed_14')
                 sc_loss_dict = loss_fn(
                     formula_logits=formula_logits[sc_mask],
                     formula_targets=formula_targets[sc_mask],
@@ -4167,6 +4454,8 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
                     numden_pred=numden_pred[sc_mask] if numden_pred is not None else None,  # V12.38
                     element_num_log=elem_num_log_batch[sc_mask] if elem_num_log_batch is not None else None,  # V12.38
                     element_den_log=elem_den_log_batch[sc_mask] if elem_den_log_batch is not None else None,  # V12.38
+                    element_indices=elem_idx[sc_mask],  # V12.43
+                    family_predictions=_family_preds[sc_mask] if _family_preds is not None else None,  # V12.43
                 )
 
                 # Non-SC portion: formula-only, lower weight
@@ -4192,6 +4481,8 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
                     numden_pred=numden_pred[~sc_mask] if numden_pred is not None else None,  # V12.38
                     element_num_log=elem_num_log_batch[~sc_mask] if elem_num_log_batch is not None else None,  # V12.38
                     element_den_log=elem_den_log_batch[~sc_mask] if elem_den_log_batch is not None else None,  # V12.38
+                    element_indices=elem_idx[~sc_mask],  # V12.43
+                    family_predictions=_family_preds[~sc_mask] if _family_preds is not None else None,  # V12.43
                 )
 
                 # Weighted combination: SC at full weight, non-SC at reduced weight
@@ -4315,6 +4606,9 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
         total_physics_z_loss += physics_z_loss_val.item() if torch.is_tensor(physics_z_loss_val) else physics_z_loss_val  # V12.31
         total_family_loss += family_loss_val.item() if torch.is_tensor(family_loss_val) else family_loss_val  # V12.32
         total_numden_loss += loss_dict.get('numden_loss', torch.tensor(0.0)).item()  # V12.38
+        total_constraint_zoo_loss += loss_dict.get('constraint_zoo_loss', torch.tensor(0.0)).item()  # V12.43
+        total_a5_z_mse += loss_dict.get('a5_z_mse', torch.tensor(0.0)).item()  # V12.43
+        total_a5_tc_mse += loss_dict.get('a5_tc_mse', torch.tensor(0.0)).item()  # V12.43
         z_norm_val = z.detach().float().norm(dim=1).mean().item()
         if not math.isnan(z_norm_val):
             total_z_norm += z_norm_val
@@ -4385,6 +4679,9 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
         'physics_z_loss': total_physics_z_loss / n_batches,  # V12.31
         'family_loss': total_family_loss / n_batches,  # V12.32
         'numden_loss': total_numden_loss / n_batches,  # V12.38
+        'constraint_zoo_loss': total_constraint_zoo_loss / n_batches,  # V12.43
+        'a5_z_mse': total_a5_z_mse / n_batches,  # V12.43
+        'a5_tc_mse': total_a5_tc_mse / n_batches,  # V12.43
         'z_norm': total_z_norm / n_batches,
         'n_skipped': n_skipped,  # V12.12: Selective backprop skips
         'n_total_batches': n_batches,
@@ -4516,7 +4813,7 @@ def train():
         tc_weight=TRAIN_CONFIG['tc_weight'],
         magpie_weight=TRAIN_CONFIG['magpie_weight'],
         stoich_weight=TRAIN_CONFIG['stoich_weight'],
-        numden_weight=TRAIN_CONFIG.get('numden_weight', 1.0),  # V12.38
+        numden_weight=0.0,  # V13.0: numden loss removed
         kl_weight=TRAIN_CONFIG['kl_weight'],
         entropy_weight=TRAIN_CONFIG.get('entropy_weight', 0.01),
         n_samples_rloo=TRAIN_CONFIG.get('n_samples_rloo', 2),
@@ -4595,6 +4892,10 @@ def train():
               f"autoregressive=False (logit sampling)")
     else:
         print("RL: Disabled (rl_weight=0)")
+
+    # V12.43: Wire up SC Constraint Zoo
+    if TRAIN_CONFIG.get('constraint_zoo_enabled', False):
+        loss_fn.set_constraint_zoo(encoder, decoder, TRAIN_CONFIG)
 
     # V12.12: Create contrastive loss function
     contrastive_loss_fn = None
@@ -4712,8 +5013,39 @@ def train():
         enc_params = list(_itertools.chain(encoder.parameters(), *_extra_params))
     else:
         enc_params = list(encoder.parameters())
-    enc_opt = torch.optim.AdamW(enc_params, lr=TRAIN_CONFIG['learning_rate'])
-    dec_opt = torch.optim.AdamW(decoder.parameters(), lr=TRAIN_CONFIG['learning_rate'])
+    # V13.0: Two-phase training support
+    v13_phase = TRAIN_CONFIG.get('v13_phase', None)
+    v13_phase_a_epochs = TRAIN_CONFIG.get('v13_phase_a_epochs', 5)
+    v13_phase_a_lr = TRAIN_CONFIG.get('v13_phase_a_lr', 1e-4)
+    use_semantic = TRAIN_CONFIG.get('use_semantic_fractions', False)
+
+    if use_semantic and v13_phase == 'A':
+        # Phase A: Freeze all transferred weights, only train fraction embeddings + output proj
+        print(f"V13.0 Phase A: Freezing transferred weights, training only fraction params")
+        print(f"  Phase A epochs: {v13_phase_a_epochs}, LR: {v13_phase_a_lr}")
+
+        # Freeze encoder entirely in Phase A
+        for p in encoder.parameters():
+            p.requires_grad = False
+
+        # Freeze decoder, then selectively unfreeze fraction-related params
+        for p in decoder.parameters():
+            p.requires_grad = False
+
+        # Unfreeze token_embedding (fraction rows will learn, others frozen via optimizer tricks)
+        decoder.token_embedding.weight.requires_grad = True
+        # Unfreeze output_proj last linear layer
+        for p in decoder.output_proj[-1].parameters():
+            p.requires_grad = True
+
+        # Use separate param groups: only unfrozen params get gradients
+        dec_trainable = [p for p in decoder.parameters() if p.requires_grad]
+        enc_opt = torch.optim.AdamW(enc_params, lr=0.0)  # Encoder frozen
+        dec_opt = torch.optim.AdamW(dec_trainable, lr=v13_phase_a_lr)
+        print(f"  Decoder trainable params: {sum(p.numel() for p in dec_trainable):,}")
+    else:
+        enc_opt = torch.optim.AdamW(enc_params, lr=TRAIN_CONFIG['learning_rate'])
+        dec_opt = torch.optim.AdamW(decoder.parameters(), lr=TRAIN_CONFIG['learning_rate'])
 
     # V12.8: Learning rate schedulers (configurable)
     lr_scheduler_type = TRAIN_CONFIG.get('lr_scheduler', 'cosine')
@@ -4962,6 +5294,9 @@ def train():
         loss_fn.set_decoder(decoder, max_len=TRAIN_CONFIG['max_formula_len'], draft_model=draft_model,
                             stop_boost=TRAIN_CONFIG.get('stop_boost', 0.0),
                             hard_stop_threshold=TRAIN_CONFIG.get('hard_stop_threshold', 0.0))  # V12.37
+        # V12.43: Re-wire constraint zoo with compiled encoder/decoder references
+        if TRAIN_CONFIG.get('constraint_zoo_enabled', False):
+            loss_fn.set_constraint_zoo(encoder, decoder, TRAIN_CONFIG)
         print("  Encoder and decoder.transformer_decoder compiled")
 
         # Warmup pass: initialize CUDA graphs with a real batch to prevent NaN on first epoch
@@ -5032,6 +5367,36 @@ def train():
 
         if _shutdown_state['should_stop']:
             break
+
+        # V13.0: Phase A → Phase B transition
+        if (use_semantic and v13_phase == 'A'
+                and epoch == start_epoch + v13_phase_a_epochs):
+            print(f"\n{'='*70}")
+            print(f"V13.0: Phase A complete ({v13_phase_a_epochs} epochs). Transitioning to Phase B.")
+            print(f"{'='*70}")
+            # Unfreeze all parameters
+            for p in encoder.parameters():
+                p.requires_grad = True
+            for p in decoder.parameters():
+                p.requires_grad = True
+            # Rebuild optimizers with full parameter sets and Phase B LR
+            phase_b_lr = TRAIN_CONFIG['learning_rate']
+            enc_opt = torch.optim.AdamW(enc_params, lr=phase_b_lr)
+            dec_opt = torch.optim.AdamW(decoder.parameters(), lr=phase_b_lr)
+            # Rebuild LR schedulers for new optimizers
+            remaining_epochs = TRAIN_CONFIG['num_epochs'] - epoch
+            if lr_scheduler_type == 'cosine_warm_restarts':
+                enc_scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+                    enc_opt, T_0=T_0, T_mult=T_mult, eta_min=lr_min)
+                dec_scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+                    dec_opt, T_0=T_0, T_mult=T_mult, eta_min=lr_min)
+            else:  # cosine (default for this project)
+                enc_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                    enc_opt, T_max=remaining_epochs, eta_min=lr_min)
+                dec_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                    dec_opt, T_max=remaining_epochs, eta_min=lr_min)
+            print(f"  Phase B LR: {phase_b_lr}, all params unfrozen, schedulers rebuilt")
+            v13_phase = 'B'  # Update phase tracking
 
         # Get curriculum weights for this epoch
         tc_weight, magpie_weight = get_curriculum_weights(epoch)
@@ -5328,6 +5693,13 @@ def train():
         if TRAIN_CONFIG.get('use_family_classifier', False):
             base_msg += f" | Fam: {metrics['family_loss']:.4f}"
 
+        # V12.43: Show constraint zoo metrics if enabled
+        if TRAIN_CONFIG.get('constraint_zoo_enabled', False):
+            czl = metrics.get('constraint_zoo_loss', 0)
+            a5z = metrics.get('a5_z_mse', 0)
+            a5tc = metrics.get('a5_tc_mse', 0)
+            base_msg += f" | CZ: {czl:.4f} (z:{a5z:.3f} tc:{a5tc:.3f})"
+
         # V12.12: Show selective backprop stats
         if metrics.get('n_skipped', 0) > 0 and metrics.get('n_total_batches', 0) > 0:
             skip_pct = metrics['n_skipped'] / metrics['n_total_batches'] * 100
@@ -5360,6 +5732,11 @@ def train():
         is_final_epoch = (epoch == TRAIN_CONFIG['num_epochs'] - 1)
         if epoch % 4 == 0 or is_final_epoch:
             eval_max = 0 if is_final_epoch else 2000  # 0 = all samples
+            # V13.0: Pass tokenizer for decoding if using semantic fractions
+            _eval_tokenizer = None
+            if TRAIN_CONFIG.get('use_semantic_fractions', False):
+                _fvp = PROJECT_ROOT / TRAIN_CONFIG.get('fraction_vocab_path', 'data/fraction_vocab.json')
+                _eval_tokenizer = FractionAwareTokenizer(str(_fvp), max_len=TRAIN_CONFIG['max_formula_len'])
             true_eval = evaluate_true_autoregressive(
                 encoder, decoder, train_loader, device, max_samples=eval_max,
                 log_errors=True, epoch=epoch,
@@ -5367,6 +5744,7 @@ def train():
                 hard_stop_threshold=TRAIN_CONFIG.get('hard_stop_threshold', 0.0),  # V12.37
                 norm_stats=norm_stats,  # V12.34: Fix Tc range denormalization
                 family_lookup_tables=family_lookup_tables,  # V12.36: Family diagnostics
+                v13_tokenizer=_eval_tokenizer,  # V13.0: Semantic fraction tokenizer
             )
             err_dist = true_eval['error_distribution']
             scope = "FULL DATASET" if is_final_epoch else f"{eval_max} samples"

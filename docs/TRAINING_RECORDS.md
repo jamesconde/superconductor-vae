@@ -4,6 +4,166 @@ Chronological record of training runs, architecture changes, and optimization de
 
 ---
 
+## V13.0: Semantic Fraction Tokenization (2026-02-18)
+
+### Problem
+
+V12.42 achieves 97% exact match under teacher forcing but only 6% under true autoregressive generation. Root cause: digit-by-digit fraction tokenization. A fraction like `(17/20)` is 7 tokens `(`, `1`, `7`, `/`, `2`, `0`, `)`, where a single wrong digit cascades into a completely different stoichiometric value. 80% of errors preserve the correct element set but get fractions wrong.
+
+### Solution
+
+Replace character-level fraction tokenization with **single semantic fraction tokens**. Each `(p/q)` becomes one `FRAC:p/q` token.
+
+### Architecture Changes
+
+**New vocabulary structure:**
+```
+[0] PAD  [1] BOS  [2] EOS  [3] UNK  [4] FRAC_UNK    (5 special tokens)
+[5..122] H, He, Li, ..., Og                            (118 element tokens)
+[123..142] 1, 2, 3, ..., 20                            (20 integer tokens)
+[143..4354] FRAC:1/2, FRAC:1/4, ...                    (4212 fraction tokens)
+```
+Total vocab: 4,355 (was 148)
+
+**Decoder changes:**
+- `vocab_size` parameter added to `EnhancedTransformerDecoder` (was hardcoded 148)
+- `stoich_input_dim` reduced from 37 to 13 (fractions(12) + count(1), numden removed)
+- Embedding and output projection resized to new vocab
+
+**Encoder changes:**
+- `numden_head` removed (V12.38-V12.41) — fraction info now in semantic tokens
+
+**Training changes:**
+- numden_loss eliminated from combined loss
+- A2 GCD penalty disabled (impossible to emit non-canonical fractions)
+- Stoich conditioning simplified: 13 dims instead of 37
+- Two-phase training: Phase A (warmup, 5 epochs) → Phase B (full)
+
+### New Files
+| File | Purpose |
+|------|---------|
+| `scripts/audit_fractions.py` | Dataset fraction statistics |
+| `scripts/build_fraction_vocab.py` | Build `data/fraction_vocab.json` |
+| `src/superconductor/tokenizer/__init__.py` | Tokenizer package |
+| `src/superconductor/tokenizer/fraction_tokenizer.py` | FractionAwareTokenizer class |
+| `scripts/migrate_v12_to_v13.py` | V12→V13 checkpoint weight transfer |
+
+### Key Statistics
+- **4,212** unique fractions in training data (already canonical)
+- **37-70%** sequence length reduction (median ~50%)
+- Physics-informed fraction embedding initialization (interpolated from integer embeddings)
+- Weight transfer: stoich_to_memory reshaped (37→13), embeddings row-mapped
+
+### Migration
+```bash
+python scripts/migrate_v12_to_v13.py \
+    --checkpoint outputs/checkpoint_best.pt \
+    --output outputs/checkpoint_v13_migrated.pt
+```
+
+### Additional Scripts Updated for V13.0 Compatibility
+All scripts that construct `EnhancedTransformerDecoder` now auto-detect `vocab_size` and `stoich_input_dim` from checkpoint weights, allowing seamless loading of both V12.x and V13.0 checkpoints:
+- `scripts/holdout/holdout_search_targeted.py`
+- `scripts/holdout/holdout_search.py`
+- `scripts/holdout/holdout_tc_validation.py`
+- `scripts/analysis/generation_quality_audit.py`
+- `scripts/analysis/evaluate_generation_quality.py`
+
+Phase A→B transition also rebuilds LR schedulers for new optimizers.
+
+---
+
+## V12.43: SC Constraint Zoo — Physics-Grounded Generation Constraints (2026-02-18)
+
+### Problem
+
+Error analysis of V12.41-V12.42 generations reveals systematic physics violations:
+- **20.2%** of generated formulas contain duplicate elements (same element appearing twice)
+- **~60%** of near-miss formulas use non-canonical fractions (e.g., `4/10` instead of `2/5`)
+- Ba/Sr mode collapse proves the model needs self-consistency enforcement
+- No physics-based feedback on family-specific constraints (oxygen content, doping ranges, site occupancy)
+
+### Changes
+
+**New files:**
+- `src/superconductor/losses/constraint_rewards.py` — REINFORCE reward modifiers (A1, A2, A4, A7, B1-B8)
+- `src/superconductor/losses/round_trip_loss.py` — A5 round-trip cycle consistency (differentiable)
+- `src/superconductor/losses/constraint_zoo.py` — A3 site occupancy, A6 charge balance (differentiable)
+
+**Modified files:**
+- `scripts/train_v12_clean.py` — Integrated all constraints into `CombinedLossWithREINFORCE`
+- `src/superconductor/losses/__init__.py` — Registered new exports
+
+### Constraint Summary
+
+**Universal Formula Constraints (Part A) — applied to ALL generations:**
+
+| ID | Constraint | Type | Mechanism |
+|----|-----------|------|-----------|
+| A1 | No duplicate elements | REINFORCE reward | -50 penalty per violation |
+| A2 | Canonical fractions (GCD=1) | REINFORCE reward | -5 per non-canonical fraction |
+| A3 | Site occupancy sums correctly | Differentiable loss | Soft L1 on site sum deviation |
+| A4 | No reducible stoichiometry | REINFORCE reward | -10 for GCD(subscripts) > 1 |
+| A5 | Round-trip Z consistency | Differentiable loss | MSE(z_recon, z_original) on 10% subset |
+| A6 | Charge balance | Differentiable loss | tanh(excess charge imbalance) |
+| A7 | No impossible element combos | REINFORCE reward | -30 for forbidden pairs |
+
+**Family-Specific Physics Constraints (Part B) — confidence-gated (>0.8):**
+
+| ID | Family | Rule | Penalty |
+|----|--------|------|---------|
+| B1 | YBCO | O content >= 6.35 | -40 |
+| B2 | LSCO | 0.055 <= Sr <= 0.27 | -40 |
+| B3 | BSCCO | \|Ca - (Cu-1)\| <= 0.3 | -40 |
+| B4 | Hg-cuprate | V < 30% on Hg site | -30 |
+| B5 | Tl-cuprate | No magnetic 3d > 10% | -30 |
+| B6 | Iron-1111 | O = 1.0 or O >= 0.7 | -30 |
+| B7 | MgB2 | C < 12.5%, Al < 50% | -30 |
+| B8 | A15 | A:B ratio within 10% of 3:1 | -30 |
+
+### Architecture Details
+
+**A5 Magpie Blocker Solution:** The encoder requires 145 pre-computed Magpie features (from matminer, not available at generation time). Solution: use the decoder's own `magpie_head` predictions as proxy input for re-encoding. Gradients flow through magpie_head → encoder, creating a self-consistency training signal.
+
+**Memory/Compute Impact (A100 40GB, batch=252):**
+
+| Component | Memory | Time/batch |
+|-----------|--------|------------|
+| A1-A4, A7 (REINFORCE rewards) | ~3MB | ~7ms |
+| A5 round-trip (10% subset) | ~125MB | ~50ms |
+| A3, A6 (differentiable) | ~2MB | ~2ms |
+| B1-B8 (family rewards) | ~5MB | ~10ms |
+| **Total addition** | **~135MB** | **~69ms** |
+
+Epoch time increase: ~18% (69ms × ~1111 batches = ~77s added per epoch).
+
+### Configuration
+
+```python
+TRAIN_CONFIG = {
+    'constraint_zoo_enabled': True,
+    'constraint_zoo_weight': 0.5,
+    'a1_duplicate_penalty': -50.0,
+    'a2_gcd_penalty': -5.0,
+    'a4_stoich_norm_penalty': -10.0,
+    'a5_round_trip_weight': 1.0,
+    'a5_subset_fraction': 0.1,
+    'a6_charge_balance_weight': 1.0,
+    'a7_impossible_element_penalty': -30.0,
+    'family_constraint_enabled': True,
+    'family_constraint_confidence': 0.8,
+}
+```
+
+### Verification Targets
+
+1. A1 duplicate element rate: baseline 20.2% → target <5%
+2. A2 non-canonical fraction rate: baseline ~60% → target <20%
+3. A5 z_mse and tc_mse: should converge (decreasing over epochs)
+4. Overall TRUE AR exact match: should not decrease (constraints improve quality without hurting reconstruction)
+
+---
+
 ## V12.42: Net2Net 2x Wider Decoder Expansion (2026-02-18)
 
 ### Problem
@@ -76,10 +236,73 @@ python scripts/migrate_checkpoint_v1242_wider.py --dry-run
 
 ---
 
-## Generative Holdout Search Results (2026-02-17)
+## Generative Holdout Search Results — V12.41 Re-Run (2026-02-18)
+
+**V12.41 re-run complete.** Checkpoint updated from V12.38 (epoch 3032) to V12.41 (epoch 3292). The consistency check now runs automatically as part of the holdout script.
+
+### Checkpoint Change
+- **Old**: `checkpoint_best.pt` → symlink to `best_checkpoints/checkpoint_best_V12.38_colab.pt` (epoch 3032)
+- **New**: `checkpoint_best.pt` → symlink to `checkpoint_best V1241.pt` (epoch 3292, V12.41)
+- V12.41 has expanded numden_head (2048→512→256→24 vs old 2048→128→24), matching current model code
+- Symlink updated 2026-02-18
+
+### Script Improvements (2026-02-18)
+- **Self-consistency check integrated**: `holdout_search_targeted.py` now runs all model heads (Tc regression, Tc bucket classifier, SC classifier, hierarchical family head) on every Z centroid after search, and reports SC↔Tc, SC↔Family, and Tc↔Bucket agreement. Results saved in JSON `consistency` field.
+- **NumDen head architecture detection**: `load_models()` now detects whether the checkpoint uses old (128-dim) or new (512-dim) numden_head first layer and constructs a matching architecture before loading weights. No more shape mismatch errors.
+- **Tc denormalization**: Tc predictions are denormalized from z-score log1p space to Kelvin using `tc_mean=2.725, tc_std=1.353` from cache. Best-match Tc predictions now reported in Kelvin in the consistency output.
+
+### V12.41 Results
+
+- **Checkpoint**: V12.41, epoch 3292
+- **Targets searched**: 45
+- **Exact matches**: 10/45 (22.2%) — same count as V12.38
+- **Unique formulas generated**: 133,028
+
+| Threshold | Found | Percentage |
+|-----------|-------|------------|
+| sim = 1.000 (exact) | 15/45 | 33.3% |
+| >= 0.99 | 38/45 | 84.4% |
+| 0.95–0.99 | 3/45 | 6.7% |
+| 0.90–0.95 | 4/45 | 8.9% |
+| < 0.90 | 0/45 | 0.0% |
+
+> **Note**: 15 targets hit sim=1.000 but only 10 are flagged exact=YES — the other 5 have fraction precision differences (e.g., rounding in numerator/denominator).
+
+#### Self-Consistency (133,028 unique formulas)
+
+| Metric | Value |
+|--------|-------|
+| **Overall consistency** | **99.87%** |
+| SC↔Tc mismatches | 169 (0.13%) |
+| SC↔Family mismatches | 0 (0.00%) |
+| Tc↔Bucket mismatches | 352 (0.26%) |
+
+#### SC Prediction Breakdown
+
+| Class | Count | Percentage |
+|-------|-------|------------|
+| Superconductor (SC) | 123,515 | 92.8% |
+| Non-SC | 9,513 | 7.2% |
+
+#### V12.41 vs V12.38 Comparison
+
+| Metric | V12.38 (epoch 3032) | V12.41 (epoch 3292) | Delta |
+|--------|---------------------|---------------------|-------|
+| Exact matches | 12/45 | 10/45 | -2 |
+| sim=1.000 | 16/45 | 15/45 | -1 |
+| >= 0.99 | 38/45 | 38/45 | 0 |
+| >= 0.90 | 45/45 | 45/45 | 0 |
+| Unique formulas | — | 133,028 | — |
+| Self-consistency | — | 99.87% | — |
+
+---
+
+## Generative Holdout Search Results — V12.38 Baseline (2026-02-17)
+
+> **Note**: These results are from the older V12.38 checkpoint (epoch 3032). The V12.41 re-run above will supersede these. Kept for comparison.
 
 ### Setup
-- **Checkpoint**: `checkpoint_best.pt` (epoch 3032, V12.40)
+- **Checkpoint**: `checkpoint_best_V12.38_colab.pt` (epoch 3032)
 - **Script**: `scripts/holdout/holdout_search_targeted.py --all`
 - **Method**: For each of the 45 holdout formulas, find 100 element-matched training neighbors, encode as Z seeds, then explore Z-space via perturbation (8 noise scales × 100 samples × 30 seeds), pairwise interpolation (linear + slerp, 100 pairs × 15 steps), PCA walks (20 components × 20 alpha steps), centroid random directions, and temperature sampling (8 temperatures × 15 seeds × 30 samples). ~31K candidate formulas generated per target.
 - **New in this run**: Full Z→formula mapping saved. Per unique formula: Z centroid (2048-dim), Z spread (std across generating Z vectors), count, and similarity. Companion `.pt` file with Z centroids for Z-space analysis.
@@ -187,6 +410,29 @@ Cross-referencing ALL unique generated candidates across all 45 targets against 
 
 **98.5% of generated formulas are novel** — not memorized from training. Of the 1.5% that match known compounds, **96.4% are superconductors**.
 
+#### Novelty Deduplication: How Many Are Truly Distinct Materials?
+
+The 132K "novel" count is inflated by fraction-precision duplicates and string-representation variants (e.g., `Au(1/2)Au(1/2)Ba2Ca2Cu3O` vs `AuBa2Ca2Cu3O` — same material). Deduplicating at progressively coarser levels:
+
+| Level | Generated Unique | Novel | Novel % | What it measures |
+|-------|-----------------|-------|---------|------------------|
+| Raw strings | 133,979 | 132,002 | 98.5% | Exact string match |
+| Compositions (2dp) | 127,795 | 125,573 | 98.3% | Same elements, fractions rounded to 0.01 |
+| Compositions (1dp) | 115,239 | 113,287 | 98.3% | Same elements, fractions rounded to 0.1 |
+| Integer stoichiometry | 47,345 | 45,923 | 97.0% | Same elements, integer ratios only |
+| **Element sets** | **16,108** | **14,135** | **87.8%** | **Same elements regardless of fractions** |
+
+**The honest novelty count is ~14,000-16,000 genuinely distinct materials** (by unique element combination), not 132,000. The 8.3x inflation comes from:
+1. **Element-split variants**: Model writes `Au(1/2)Au(1/2)` instead of `Au1` — identical material, different tokenization
+2. **Fraction representation**: `Mg(17/20)` vs `Mg(849/1000)` — same 0.85 composition
+3. **Stoichiometric variants**: `MgB2` vs `Mg2B4` — same material, different normalization
+
+96.9% of 2dp compositions have exactly 1 formula string — the duplication is concentrated in mode attractors where the decoder produces many string variants of the same composition.
+
+**Key insight**: The latent space IS highly continuous (80.8% of formulas from single Z vectors), but the decoder's fraction tokenization creates artificial string diversity. The ~14K novel element combinations is the more scientifically meaningful number — and 87.8% novelty at that level is still strong.
+
+**Script**: `scratch/novel_formula_dedup_analysis.py`
+
 #### Non-SC Contamination by Family
 
 The 71 non-SC matches are not uniformly distributed — they cluster in specific chemical families with physical ambiguity:
@@ -283,6 +529,78 @@ PCA analysis of Z centroids for the Cu1Cr1O2 target neighborhood:
 The SC and non-SC regions ARE separated in PC1 of Z-space, but the separation ratio of 1.257 is marginal — the distributions overlap significantly. This confirms that Cu1Cr1O2's chemical neighborhood (delafossites, spinels, garnets) creates a genuine latent space boundary challenge. A stronger contrastive margin may be needed for this specific chemical regime.
 
 **Script**: `scratch/z_self_consistency_check.py`, `scratch/z_space_pca_analysis.py`
+
+### SC Sensitivity Landscape: How Robust Is Superconductivity to Chemical Changes?
+
+Classified all ~149K generated variants by their relationship to the 45 holdout targets and checked SC predictions. This maps the robustness of superconductivity to different types of composition changes.
+
+#### Global Perturbation Summary
+
+| Perturbation Type | Count | SC% | Mean Tc | Tc Std | Interpretation |
+|-------------------|-------|-----|---------|--------|----------------|
+| STOICH_ONLY (same elements, diff fractions) | 17,939 | 96.1% | 75.1K | 42.7K | Stoichiometry changes rarely kill SC |
+| ELEM_REMOVED (missing one element) | 43,717 | 97.8% | 73.8K | 39.9K | Removing an element usually preserves SC |
+| ELEM_SWAPPED (substitution) | 27,843 | 93.0% | 70.1K | 43.9K | Swapping elements is riskier |
+| ELEM_ADDED (extra element) | 12,171 | **83.6%** | 54.5K | 37.2K | **Adding elements is most disruptive** |
+| MAJOR_CHANGE (>2 elements diff) | 47,153 | 95.1% | 69.5K | 40.9K | Even major changes mostly preserve SC |
+
+**Key insight**: Adding a new element to a superconductor is the most likely perturbation to kill SC (83.6% survival vs 96-98% for other categories). This makes physical sense — dopants can introduce pair-breaking scattering.
+
+#### Most Fragile vs Robust Targets
+
+**Fragile** (SC sensitive to stoichiometry):
+- `Cu1Cr1O2`: Only 14.4% of stoich variants stay SC — the SC/non-SC boundary is razor-thin here
+- `Mg(49/50)Cr(1/50)B2`: 48.1% — Cr doping of MgB2 is very sensitive to concentration
+- `Y(1/5)Eu(4/5)Ba2Cu3O7`: 75.6% — high Eu substitution is near the SC transition
+
+**Robust** (SC survives stoichiometry changes):
+- All Bi-cuprate targets: 100% SC across all stoich variants
+- Hg-cuprate targets: 100% SC, Tc std only 2-16K — extremely stable
+- `Bi(8/5)Pb(2/5)Sr2Ca3Cu(97/25)Si(3/25)O12`: 100% SC, Tc range only 4.5K — tight basin
+
+#### Elements That Kill SC When Added
+
+| Element | SC% when added | n | Across targets | Physical interpretation |
+|---------|---------------|---|----------------|----------------------|
+| Br | 5.9% | 34 | 2 | Halide substitution destroys CuO2 planes |
+| Dy | 17.4% | 69 | 8 | Magnetic rare earth → pair-breaking |
+| Pr | 18.1% | 138 | 8 | Known pair-breaker in cuprates |
+| H | 19.4% | 67 | 5 | Hydrogen disrupts crystal structure |
+| Mn | 23.3% | 86 | 10 | Magnetic impurity → pair-breaking |
+| Se | 24.4% | 41 | 5 | Chalcogenide substitution in non-chalcogenide SC |
+| Zn | 33.3% | 216 | 17 | Classic pair-breaker in cuprates |
+
+**The model has learned real pair-breaking physics.** Pr and Zn are experimentally known to destroy superconductivity in cuprates. Magnetic rare earths (Dy, Mn) break Cooper pairs. The model correctly identifies these as SC-killing dopants.
+
+#### Elements That Preserve SC When Added
+
+| Element | SC% when added | n | Mean Tc |
+|---------|---------------|---|---------|
+| Bi | 100% | 2,316 | 81.0K |
+| Hg | 100% | 404 | 59.9K |
+| Ag | 99.2% | 126 | 109.1K |
+| Al | 99.8% | 599 | 42.4K |
+| F | 99.6% | 522 | 43.4K |
+| Gd | 99.7% | 340 | 91.8K |
+
+These are elements known to be SC-compatible: Bi and Hg form their own cuprate families, Ag is a classic dopant that enhances Tc, F is used in iron-based SC, and non-magnetic Gd preserves SC despite being a rare earth.
+
+#### Most Critical Elements (removing kills SC)
+
+| Element | SC% when removed | n | Interpretation |
+|---------|-----------------|---|----------------|
+| Fe | 57.4% | 162 | Essential for iron-based SC — no Fe, no SC |
+| As | 82.6% | 511 | FeAs layer is the SC mechanism |
+| Mg | 92.0% | 589 | Mg is structurally essential in MgB2 |
+| Cu | 94.9% | 1,079 | CuO2 planes are the SC mechanism in cuprates |
+
+**The model correctly identifies structurally essential elements.** Fe and As in pnictides, Cu in cuprates, Mg in MgB2 — removing these destroys the mechanism for superconductivity.
+
+#### Duplicate Element Token Issue
+
+20.2% of generated formulas (27,067 / 133,979) contain the same element appearing multiple times (e.g., `Au(3/5)Au(2/5)Ba2Ca2Cu3O` instead of `AuBa2Ca2Cu3O`). This is a decoder tokenization artifact — the autoregressive decoder sometimes emits the same element twice with different fractions. A duplicate element penalty or constrained decoding would clean this up.
+
+**Scripts**: `scratch/sc_sensitivity_landscape.py`, `scratch/novel_formula_dedup_analysis.py`
 
 ---
 
