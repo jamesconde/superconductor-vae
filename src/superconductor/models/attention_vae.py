@@ -274,7 +274,7 @@ class TcPredictorWithContributions(nn.Module):
         # Per-element contributions (for interpretability)
         contributions = self.element_contribution(element_embeddings).squeeze(-1)
         # Mask out padding
-        contributions = contributions.masked_fill(~element_mask, 0.0)
+        contributions = contributions.masked_fill(~element_mask.bool(), 0.0)
 
         return tc_pred, contributions
 

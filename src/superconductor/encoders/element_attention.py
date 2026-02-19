@@ -188,7 +188,7 @@ class ElementAttention(nn.Module):
 
         # Apply mask (set padding to -inf)
         if element_mask is not None:
-            mask = element_mask.unsqueeze(1).unsqueeze(2)  # [batch, 1, 1, n_elem]
+            mask = element_mask.bool().unsqueeze(1).unsqueeze(2)  # [batch, 1, 1, n_elem]
             scores = scores.masked_fill(~mask, float('-inf'))
 
         # Softmax to get attention weights
@@ -380,7 +380,7 @@ class MultiHeadElementAttention(nn.Module):
 
         # Mask
         if element_mask is not None:
-            mask = element_mask.unsqueeze(1)  # [batch, 1, n_elem]
+            mask = element_mask.bool().unsqueeze(1)  # [batch, 1, n_elem]
             scores = scores.masked_fill(~mask, float('-inf'))
 
         # Attention weights
