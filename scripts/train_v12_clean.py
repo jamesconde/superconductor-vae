@@ -4836,6 +4836,7 @@ def train():
     _shutdown_state['manifest_builder'] = _build_current_manifest
 
     # V12.8: Loss function with REINFORCE support
+    use_semantic = TRAIN_CONFIG.get('use_semantic_fractions', False)
     loss_fn = CombinedLossWithREINFORCE(
         ce_weight=TRAIN_CONFIG.get('ce_weight', 1.0),
         rl_weight=TRAIN_CONFIG.get('rl_weight', 0.0),
