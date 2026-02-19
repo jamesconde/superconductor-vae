@@ -1879,7 +1879,8 @@ def create_models(magpie_dim: int, device: torch.device):
     print(f"Decoder: {dec_params:,} parameters")
     print(f"Total: {enc_params + dec_params:,} parameters")
 
-    return encoder, decoder
+    # V13.0: Return tokenizer if using semantic fractions (needed for loss_fn config)
+    return encoder, decoder, v13_tokenizer if use_semantic else None
 
 
 # ============================================================================
@@ -4805,7 +4806,7 @@ def train():
     train_loader, norm_stats, magpie_dim = load_and_prepare_data()
 
     # Create models
-    encoder, decoder = create_models(magpie_dim, device)
+    encoder, decoder, v13_tokenizer = create_models(magpie_dim, device)
 
     # NOTE: torch.compile moved to AFTER checkpoint loading (see below)
     # This allows loading checkpoints saved without compile into models that will be compiled
