@@ -10,6 +10,12 @@ Token-level comparison is sufficient for training and is orders of magnitude fas
 V12.1 UPDATE: Added fraction-aware penalties. Errors within fractions (numerator/
 denominator digits) are penalized more heavily because they affect stoichiometry.
 
+V13.0 UPDATE: When use_semantic_fractions=True, fraction-aware penalties are
+disabled because fractions are single semantic tokens (no digit-by-digit errors
+possible). A new fraction-value penalty replaces the old digit penalty — it
+scales by the difference in float values between predicted and target fraction
+tokens. Basic token-match and exact-match rewards are tokenizer-agnostic.
+
 December 2025
 """
 
@@ -17,7 +23,8 @@ import torch
 from dataclasses import dataclass
 from typing import Optional
 
-# Token indices for fraction detection (from vocabulary)
+# V12 Token indices for fraction detection (from old vocabulary)
+# These are ONLY used when use_semantic_fractions=False
 LPAREN_IDX = 4      # '('
 RPAREN_IDX = 5      # ')'
 SLASH_IDX = 16      # '/'
@@ -206,6 +213,72 @@ def compute_semantic_digit_penalty(
 
 
 @torch.no_grad()
+def compute_fraction_value_penalty(
+    sampled_tokens: torch.Tensor,
+    target_tokens: torch.Tensor,
+    mask: torch.Tensor,
+    fraction_token_start: int,
+    fraction_values: torch.Tensor,
+    base_penalty: float = -10.0,
+    semantic_scale: float = 2.0,
+) -> torch.Tensor:
+    """V13.0: Compute penalty based on fraction VALUE difference.
+
+    When the target is a fraction token and the prediction is wrong, scale
+    penalty by how far the predicted value is from the target value.
+    E.g., predicting FRAC:1/4 (0.25) when target is FRAC:3/4 (0.75) gets
+    a larger penalty than predicting FRAC:17/20 (0.85) when target is FRAC:4/5 (0.80).
+
+    Args:
+        sampled_tokens: [batch, seq_len] predicted tokens
+        target_tokens: [batch, seq_len] ground truth tokens
+        mask: [batch, seq_len] valid position mask
+        fraction_token_start: First fraction token index (143 for V13)
+        fraction_values: [vocab_size] float value for each fraction token (0.0 for non-fraction)
+        base_penalty: Base penalty per fraction error
+        semantic_scale: How much to scale by value difference
+
+    Returns:
+        total_penalty: [batch] total fraction value penalty per sample
+    """
+    device = sampled_tokens.device
+    mask = mask.bool()
+
+    # Ensure fraction_values is on the right device
+    if fraction_values.device != device:
+        fraction_values = fraction_values.to(device)
+
+    # Identify fraction positions in target
+    target_is_frac = (target_tokens >= fraction_token_start) & mask
+    mismatches = (sampled_tokens != target_tokens)
+    frac_mismatches = mismatches & target_is_frac
+
+    if not frac_mismatches.any():
+        return torch.zeros(sampled_tokens.shape[0], device=device)
+
+    # Look up float values for sampled and target fraction tokens
+    # Clamp indices to valid range for the lookup table
+    vocab_size = fraction_values.shape[0]
+    sampled_clamped = sampled_tokens.clamp(0, vocab_size - 1)
+    target_clamped = target_tokens.clamp(0, vocab_size - 1)
+
+    sampled_vals = fraction_values[sampled_clamped]  # [batch, seq_len]
+    target_vals = fraction_values[target_clamped]    # [batch, seq_len]
+
+    # Compute value difference at mismatch positions
+    val_diff = torch.abs(sampled_vals - target_vals)
+
+    # Scale: base * (1 + scale * diff). diff is typically 0-20 for stoichiometry
+    # Normalize by max reasonable diff (20) to keep scale similar to V12 digit penalty
+    penalty_scale = 1.0 + semantic_scale * val_diff.clamp(max=20.0) / 20.0
+
+    # Apply penalty only at fraction mismatch positions
+    position_penalty = frac_mismatches.float() * base_penalty * penalty_scale
+
+    return position_penalty.sum(dim=1)
+
+
+@torch.no_grad()
 def compute_reward_gpu_native(
     sampled_tokens: torch.Tensor,      # [batch, seq_len]
     target_tokens: torch.Tensor,       # [batch, seq_len]
@@ -213,6 +286,9 @@ def compute_reward_gpu_native(
     config: Optional[GPURewardConfig] = None,
     pad_idx: int = 0,
     end_idx: int = 2,
+    use_semantic_fractions: bool = False,
+    fraction_token_start: int = 0,
+    fraction_values: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """
     Compute rewards using pure tensor operations on GPU.
@@ -229,6 +305,10 @@ def compute_reward_gpu_native(
         config: Reward configuration
         pad_idx: Padding token index
         end_idx: End token index
+        use_semantic_fractions: V13.0 flag — disables V12 digit-level fraction
+            penalties and enables fraction-value penalty instead
+        fraction_token_start: First fraction token index (V13.0 only)
+        fraction_values: [vocab_size] float values per token (V13.0 only)
 
     Returns:
         rewards: [batch] tensor of rewards
@@ -275,33 +355,41 @@ def compute_reward_gpu_native(
     length_diff = torch.abs(sampled_end_pos - target_end_pos)
 
     # 5. Compute rewards (all tensor ops)
-    # ========== V12.5: COMPUTE SEMANTIC PENALTY FIRST (for all non-exact) ==========
-    # Detect fraction regions in TARGET (ground truth structure)
-    target_in_fraction = detect_fraction_positions(target_tokens, mask)
-    target_is_structure = detect_fraction_structure(target_tokens, mask)
-
-    # Count structural errors (missing/wrong parentheses or slashes)
-    structure_errors = (mismatches & target_is_structure).sum(dim=1).float()
-
-    # V12.5: Semantic digit penalty - scales by digit difference
-    if config.use_semantic_digit_penalty:
-        # Use semantic penalty that scales by |pred_digit - target_digit|
-        # 8→3 (diff=5) gets ~2.1x penalty vs 8→7 (diff=1) gets ~1.2x penalty
-        digit_penalty = compute_semantic_digit_penalty(
-            sampled_tokens, target_tokens, mask, target_in_fraction,
+    # ========== COMPUTE FRACTION PENALTY (for all non-exact) ==========
+    if use_semantic_fractions and fraction_values is not None:
+        # V13.0: Fractions are single tokens — no digit/structure penalties.
+        # Instead, penalize by float value difference between predicted and target fractions.
+        fraction_penalty = compute_fraction_value_penalty(
+            sampled_tokens, target_tokens, mask,
+            fraction_token_start=fraction_token_start,
+            fraction_values=fraction_values,
             base_penalty=config.fraction_digit_penalty,
             semantic_scale=config.semantic_digit_scale,
         )
     else:
-        # Fallback to flat penalty (V12.2 behavior)
-        target_is_digit = detect_digit_positions(target_tokens, mask)
-        digit_in_fraction = target_is_digit & target_in_fraction
-        digit_errors = (mismatches & digit_in_fraction).sum(dim=1).float()
-        digit_penalty = digit_errors * config.fraction_digit_penalty
+        # V12.x: Character-level fraction penalties (digit-by-digit)
+        # Detect fraction regions in TARGET (ground truth structure)
+        target_in_fraction = detect_fraction_positions(target_tokens, mask)
+        target_is_structure = detect_fraction_structure(target_tokens, mask)
 
-    # Combined fraction penalty (applies to ALL non-exact matches)
-    fraction_penalty = digit_penalty + structure_errors * config.fraction_structure_penalty
-    # ========== END SEMANTIC PENALTY COMPUTATION ==========
+        # Count structural errors (missing/wrong parentheses or slashes)
+        structure_errors = (mismatches & target_is_structure).sum(dim=1).float()
+
+        # V12.5: Semantic digit penalty - scales by digit difference
+        if config.use_semantic_digit_penalty:
+            digit_penalty = compute_semantic_digit_penalty(
+                sampled_tokens, target_tokens, mask, target_in_fraction,
+                base_penalty=config.fraction_digit_penalty,
+                semantic_scale=config.semantic_digit_scale,
+            )
+        else:
+            target_is_digit = detect_digit_positions(target_tokens, mask)
+            digit_in_fraction = target_is_digit & target_in_fraction
+            digit_errors = (mismatches & digit_in_fraction).sum(dim=1).float()
+            digit_penalty = digit_errors * config.fraction_digit_penalty
+
+        fraction_penalty = digit_penalty + structure_errors * config.fraction_structure_penalty
+    # ========== END FRACTION PENALTY COMPUTATION ==========
 
     rewards = torch.zeros(batch_size, device=device)
 

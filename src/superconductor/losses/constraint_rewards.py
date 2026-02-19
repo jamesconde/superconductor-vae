@@ -1,5 +1,5 @@
 """
-SC Constraint Zoo: REINFORCE Reward Modifiers (V12.43)
+SC Constraint Zoo: REINFORCE Reward Modifiers (V12.43 / V13.0)
 
 Physics-grounded generation constraints applied as reward adjustments
 during REINFORCE training (SCST/RLOO). All functions operate under
@@ -12,6 +12,10 @@ Constraints implemented:
   A7 — Impossible Element Combination Penalty
   B1-B8 — Family-specific physics constraints
 
+V13.0: Token layout is configurable via VocabConfig to support both
+V12 (148 tokens, character-level fractions) and V13 (4355 tokens,
+semantic fraction tokens).
+
 Reference: docs/SC_CONSTRAINT_ZOO.md
 """
 
@@ -21,51 +25,105 @@ from typing import Dict, List, Optional, Set, Tuple
 
 import torch
 
-# Token index constants (from autoregressive_decoder.py VOCAB layout)
-# SPECIAL(20) + ELEMENTS[1:](118) + DIGITS(10) = 148 tokens
-_ELEMENT_START = 20   # H
-_ELEMENT_END = 137    # Og (inclusive)
-_DIGIT_START = 138    # '0'
-_DIGIT_END = 147      # '9' (inclusive)
-_LPAREN_IDX = 4       # '('
-_RPAREN_IDX = 5       # ')'
-_SLASH_IDX = 16       # '/'
-_PAD_IDX = 0
-_END_IDX = 2
 
-# Element token indices for specific elements (SPECIAL_offset=20, then 1-based element list)
-# Element Z=N maps to token index 20 + N - 1 = 19 + N
-_elem_idx = lambda z: 19 + z  # atomic number Z -> token index
+@dataclass
+class VocabConfig:
+    """Token vocabulary layout configuration.
 
-# Key element token indices
-_Cu = _elem_idx(29)   # 48
-_O = _elem_idx(8)     # 27
-_Fe = _elem_idx(26)   # 45
-_Ba = _elem_idx(56)   # 75
-_Sr = _elem_idx(38)   # 57
-_Y = _elem_idx(39)    # 58
-_La = _elem_idx(57)   # 76
-_Bi = _elem_idx(83)   # 102
-_Tl = _elem_idx(81)   # 100
-_Hg = _elem_idx(80)   # 99
-_Mg = _elem_idx(12)   # 31
-_B = _elem_idx(5)     # 24
-_F = _elem_idx(9)     # 28
-_Ca = _elem_idx(20)   # 39
-_Pb = _elem_idx(82)   # 101
-_As = _elem_idx(33)   # 52
-_Se = _elem_idx(34)   # 53
-_Te = _elem_idx(52)   # 71
-_Nb = _elem_idx(41)   # 60
-_Sn = _elem_idx(50)   # 69
-_V = _elem_idx(23)    # 42
-_Al = _elem_idx(13)   # 32
-_C = _elem_idx(6)     # 25
-_Li = _elem_idx(3)    # 22
-_Na = _elem_idx(11)   # 30
+    Supports both V12 (character-level) and V13 (semantic fraction) tokenizers.
+    """
+    element_start: int = 20      # First element token index (H)
+    element_end: int = 137       # Last element token index (Og), inclusive
+    digit_start: int = 138       # First digit/integer token index
+    digit_end: int = 147         # Last digit/integer token index, inclusive
+    lparen_idx: int = 4          # '(' token index (V12 only, -1 if absent)
+    rparen_idx: int = 5          # ')' token index (V12 only, -1 if absent)
+    slash_idx: int = 16          # '/' token index (V12 only, -1 if absent)
+    pad_idx: int = 0
+    end_idx: int = 2
+    use_semantic_fractions: bool = False  # V13.0: fractions are single tokens
+    fraction_token_start: int = 0        # V13.0: first FRAC: token index
+    fraction_values: Optional[torch.Tensor] = None  # V13.0: [vocab_size] float values
 
-# Magnetic 3d transition metals (Mn, Fe, Co, Ni — Z=25,26,27,28)
-_MAGNETIC_3D = frozenset([_elem_idx(25), _elem_idx(26), _elem_idx(27), _elem_idx(28)])
+    def elem_idx(self, z: int) -> int:
+        """Atomic number Z -> token index."""
+        # V12: element_start=20, Z=1(H) -> 20, so offset = element_start - 1 = 19
+        # V13: element_start=5, Z=1(H) -> 5, so offset = element_start - 1 = 4
+        return self.element_start - 1 + z
+
+
+# Default V12 config (backward compatibility)
+_V12_VOCAB = VocabConfig()
+
+# V13 config is created dynamically via make_v13_vocab_config()
+def make_v13_vocab_config(fraction_token_start: int = 143,
+                          fraction_values: Optional[torch.Tensor] = None) -> VocabConfig:
+    """Create V13.0 vocabulary config."""
+    return VocabConfig(
+        element_start=5,
+        element_end=122,
+        digit_start=123,      # Integer tokens (1-20)
+        digit_end=142,
+        lparen_idx=-1,         # No parens in V13
+        rparen_idx=-1,
+        slash_idx=-1,
+        use_semantic_fractions=True,
+        fraction_token_start=fraction_token_start,
+        fraction_values=fraction_values,
+    )
+
+
+# Active vocab config (set by set_vocab_config)
+_active_vocab: VocabConfig = _V12_VOCAB
+
+
+def set_vocab_config(config: VocabConfig):
+    """Set the active vocabulary config for constraint reward functions."""
+    global _active_vocab
+    _active_vocab = config
+    _rebuild_element_constants()
+
+
+def _rebuild_element_constants():
+    """Rebuild element index constants from active vocab config."""
+    global _Cu, _O, _Fe, _Ba, _Sr, _Y, _La, _Bi, _Tl, _Hg, _Mg, _B, _F
+    global _Ca, _Pb, _As, _Se, _Te, _Nb, _Sn, _V, _Al, _C, _Li, _Na
+    global _MAGNETIC_3D, _FORBIDDEN_PAIRS
+
+    v = _active_vocab
+    _Cu = v.elem_idx(29)
+    _O = v.elem_idx(8)
+    _Fe = v.elem_idx(26)
+    _Ba = v.elem_idx(56)
+    _Sr = v.elem_idx(38)
+    _Y = v.elem_idx(39)
+    _La = v.elem_idx(57)
+    _Bi = v.elem_idx(83)
+    _Tl = v.elem_idx(81)
+    _Hg = v.elem_idx(80)
+    _Mg = v.elem_idx(12)
+    _B = v.elem_idx(5)
+    _F = v.elem_idx(9)
+    _Ca = v.elem_idx(20)
+    _Pb = v.elem_idx(82)
+    _As = v.elem_idx(33)
+    _Se = v.elem_idx(34)
+    _Te = v.elem_idx(52)
+    _Nb = v.elem_idx(41)
+    _Sn = v.elem_idx(50)
+    _V = v.elem_idx(23)
+    _Al = v.elem_idx(13)
+    _C = v.elem_idx(6)
+    _Li = v.elem_idx(3)
+    _Na = v.elem_idx(11)
+
+    _MAGNETIC_3D = frozenset([v.elem_idx(25), v.elem_idx(26),
+                              v.elem_idx(27), v.elem_idx(28)])
+    _FORBIDDEN_PAIRS = [(_F, _Tl)]
+
+
+# Initialize with V12 defaults
+_rebuild_element_constants()
 
 
 @dataclass
@@ -105,11 +163,7 @@ class FamilyConstraintConfig:
     b8_penalty: float = -30.0   # A15 stoichiometry ratio
 
 
-# A7: Forbidden element pair lookup table
-# (element_idx_a, element_idx_b) pairs that should not co-occur
-_FORBIDDEN_PAIRS: List[Tuple[int, int]] = [
-    (_F, _Tl),   # F + Tl: fluorine destroys Tl-cuprate structure
-]
+# A7: Forbidden element pair lookup table — initialized by _rebuild_element_constants()
 
 
 def _extract_elements_and_fractions(
@@ -118,10 +172,14 @@ def _extract_elements_and_fractions(
 ) -> Tuple[List[int], Dict[int, float]]:
     """Extract element token indices and their fractions from a single token sequence.
 
+    Supports both V12 (character-level) and V13 (semantic fraction) token layouts,
+    based on the active VocabConfig set via set_vocab_config().
+
     Returns:
         elements: list of element token indices found
         fractions: dict mapping element token idx -> fraction value
     """
+    v = _active_vocab
     seq_len = tokens.size(0)
     elements = []
     fractions = {}
@@ -131,53 +189,70 @@ def _extract_elements_and_fractions(
         tok = tokens[i].item()
         if not mask[i].item():
             break
-        if tok == _END_IDX:
+        if tok == v.end_idx:
             break
 
         # Check if this is an element token
-        if _ELEMENT_START <= tok <= _ELEMENT_END:
+        if v.element_start <= tok <= v.element_end:
             elem = tok
             elements.append(elem)
             frac = 1.0  # Default fraction
 
-            # Look ahead for fraction: (num/den) or plain digits
+            # Look ahead for subscript
             j = i + 1
-            if j < seq_len and tokens[j].item() == _LPAREN_IDX:
-                # Parse (numerator/denominator)
-                j += 1
-                num_digits = []
-                den_digits = []
-                parsing_num = True
-                while j < seq_len:
-                    t = tokens[j].item()
-                    if t == _SLASH_IDX:
-                        parsing_num = False
-                    elif t == _RPAREN_IDX:
-                        j += 1
-                        break
-                    elif _DIGIT_START <= t <= _DIGIT_END:
-                        digit = t - _DIGIT_START
-                        if parsing_num:
-                            num_digits.append(digit)
-                        else:
-                            den_digits.append(digit)
-                    else:
-                        break  # Malformed fraction
-                    j += 1
+            if j < seq_len and mask[j].item():
+                next_tok = tokens[j].item()
 
-                if num_digits and den_digits:
-                    num = int(''.join(str(d) for d in num_digits))
-                    den = int(''.join(str(d) for d in den_digits))
-                    if den > 0:
-                        frac = num / den
-                i = j
-            elif j < seq_len and _DIGIT_START <= tokens[j].item() <= _DIGIT_END:
-                # Plain integer subscript (e.g., O4, Cu3)
-                digits = []
-                while j < seq_len and _DIGIT_START <= tokens[j].item() <= _DIGIT_END:
-                    digits.append(tokens[j].item() - _DIGIT_START)
-                    j += 1
-                frac = float(int(''.join(str(d) for d in digits)))
+                if v.use_semantic_fractions:
+                    # V13.0: Check for integer token (123-142) or fraction token (143+)
+                    if v.digit_start <= next_tok <= v.digit_end:
+                        # Integer subscript: token value = next_tok - digit_start + 1
+                        frac = float(next_tok - v.digit_start + 1)
+                        j += 1
+                    elif (next_tok >= v.fraction_token_start and
+                          v.fraction_values is not None):
+                        # Semantic fraction token: look up float value
+                        if next_tok < v.fraction_values.shape[0]:
+                            frac = v.fraction_values[next_tok].item()
+                        j += 1
+                else:
+                    # V12: Character-level parsing
+                    if next_tok == v.lparen_idx:
+                        # Parse (numerator/denominator)
+                        j += 1
+                        num_digits = []
+                        den_digits = []
+                        parsing_num = True
+                        while j < seq_len:
+                            t = tokens[j].item()
+                            if t == v.slash_idx:
+                                parsing_num = False
+                            elif t == v.rparen_idx:
+                                j += 1
+                                break
+                            elif v.digit_start <= t <= v.digit_end:
+                                digit = t - v.digit_start
+                                if parsing_num:
+                                    num_digits.append(digit)
+                                else:
+                                    den_digits.append(digit)
+                            else:
+                                break
+                            j += 1
+
+                        if num_digits and den_digits:
+                            num = int(''.join(str(d) for d in num_digits))
+                            den = int(''.join(str(d) for d in den_digits))
+                            if den > 0:
+                                frac = num / den
+                    elif v.digit_start <= next_tok <= v.digit_end:
+                        # Plain integer subscript (e.g., O4, Cu3)
+                        digits = []
+                        while j < seq_len and v.digit_start <= tokens[j].item() <= v.digit_end:
+                            digits.append(tokens[j].item() - v.digit_start)
+                            j += 1
+                        frac = float(int(''.join(str(d) for d in digits)))
+
                 i = j
             else:
                 i += 1
@@ -202,16 +277,17 @@ def compute_duplicate_element_penalty(
     """
     batch_size, seq_len = sampled_tokens.shape
     device = sampled_tokens.device
+    v = _active_vocab
 
     # Mask to only element tokens
-    is_element = (sampled_tokens >= _ELEMENT_START) & (sampled_tokens <= _ELEMENT_END) & mask.bool()
+    is_element = (sampled_tokens >= v.element_start) & (sampled_tokens <= v.element_end) & mask.bool()
 
     # Map element tokens to range [0, 117] for scatter
-    elem_indices = (sampled_tokens - _ELEMENT_START).clamp(min=0)
+    elem_indices = (sampled_tokens - v.element_start).clamp(min=0)
     elem_indices = elem_indices * is_element.long()  # Zero out non-element positions
 
     # Count occurrences per element per batch using scatter_add
-    n_elements = _ELEMENT_END - _ELEMENT_START + 1  # 118
+    n_elements = v.element_end - v.element_start + 1  # 118
     counts = torch.zeros(batch_size, n_elements, device=device, dtype=torch.float32)
     ones = is_element.float()
 
@@ -232,14 +308,22 @@ def compute_gcd_canonicality_penalty(
 ) -> torch.Tensor:  # [batch]
     """A2: Penalize non-canonical fractions where GCD(num, den) > 1.
 
-    Scans for fraction patterns (num/den) in token sequences and checks
+    V13.0: Fractions are GCD-canonical by construction (tokenizer auto-reduces).
+    Returns zero penalty for V13.
+
+    V12: Scans for fraction patterns (num/den) in token sequences and checks
     if each fraction is in lowest terms.
     """
     batch_size = sampled_tokens.shape[0]
     device = sampled_tokens.device
     penalties = torch.zeros(batch_size, device=device)
+    v = _active_vocab
 
-    # Process on CPU for GCD computation (small per-sample cost)
+    # V13.0: Semantic fractions are always canonical — skip entirely
+    if v.use_semantic_fractions:
+        return penalties
+
+    # V12: Process on CPU for GCD computation (small per-sample cost)
     tokens_cpu = sampled_tokens.cpu()
     mask_cpu = mask.cpu()
 
@@ -253,7 +337,7 @@ def compute_gcd_canonicality_penalty(
         while i < seq_len:
             if not m[i].item():
                 break
-            if seq[i].item() == _LPAREN_IDX:
+            if seq[i].item() == v.lparen_idx:
                 # Try to parse (num/den)
                 j = i + 1
                 num_digits = []
@@ -262,17 +346,17 @@ def compute_gcd_canonicality_penalty(
                 valid = False
                 while j < seq_len and m[j].item():
                     t = seq[j].item()
-                    if t == _SLASH_IDX:
+                    if t == v.slash_idx:
                         parsing_num = False
-                    elif t == _RPAREN_IDX:
+                    elif t == v.rparen_idx:
                         valid = True
                         j += 1
                         break
-                    elif _DIGIT_START <= t <= _DIGIT_END:
+                    elif v.digit_start <= t <= v.digit_end:
                         if parsing_num:
-                            num_digits.append(t - _DIGIT_START)
+                            num_digits.append(t - v.digit_start)
                         else:
-                            den_digits.append(t - _DIGIT_START)
+                            den_digits.append(t - v.digit_start)
                     else:
                         break
                     j += 1
@@ -306,6 +390,7 @@ def compute_stoich_normalization_penalty(
     batch_size = sampled_tokens.shape[0]
     device = sampled_tokens.device
     penalties = torch.zeros(batch_size, device=device)
+    v = _active_vocab
 
     tokens_cpu = sampled_tokens.cpu()
     mask_cpu = mask.cpu()
@@ -322,24 +407,38 @@ def compute_stoich_normalization_penalty(
             if not m[i].item():
                 break
             t = seq[i].item()
-            if t == _END_IDX:
+            if t == v.end_idx:
                 break
 
-            if t == _LPAREN_IDX:
+            # V13.0: Check for fraction token (single token = has fractions)
+            if v.use_semantic_fractions and t >= v.fraction_token_start:
                 has_fractions = True
-                break  # Fraction formula — skip A4
+                break
+            # V12: Check for '(' = has fractions
+            if not v.use_semantic_fractions and t == v.lparen_idx:
+                has_fractions = True
+                break
 
-            if _ELEMENT_START <= t <= _ELEMENT_END:
+            if v.element_start <= t <= v.element_end:
                 # Check for following integer subscript
                 j = i + 1
-                digits = []
-                while j < seq_len and m[j].item() and _DIGIT_START <= seq[j].item() <= _DIGIT_END:
-                    digits.append(seq[j].item() - _DIGIT_START)
-                    j += 1
-                if digits:
-                    subscripts.append(int(''.join(str(d) for d in digits)))
+                if v.use_semantic_fractions:
+                    # V13: Integer tokens at digit_start..digit_end represent values 1-20
+                    if j < seq_len and m[j].item() and v.digit_start <= seq[j].item() <= v.digit_end:
+                        subscripts.append(seq[j].item() - v.digit_start + 1)
+                        j += 1
+                    else:
+                        subscripts.append(1)
                 else:
-                    subscripts.append(1)
+                    # V12: Multi-digit integer subscripts
+                    digits = []
+                    while j < seq_len and m[j].item() and v.digit_start <= seq[j].item() <= v.digit_end:
+                        digits.append(seq[j].item() - v.digit_start)
+                        j += 1
+                    if digits:
+                        subscripts.append(int(''.join(str(d) for d in digits)))
+                    else:
+                        subscripts.append(1)
                 i = j
             else:
                 i += 1

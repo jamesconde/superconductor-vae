@@ -136,22 +136,26 @@ class RoundTripConsistencyLoss(nn.Module):
         self._encoder = None
         self._decoder = None
 
-    def set_models(self, encoder, decoder):
+    def set_models(self, encoder, decoder, v13_tokenizer=None, max_len: int = 60):
         """Set encoder and decoder references (called during training setup).
 
         Args:
             encoder: FullMaterialsVAE instance (has .encode() method)
             decoder: EnhancedTransformerDecoder instance (has .generate_with_kv_cache())
+            v13_tokenizer: Optional FractionAwareTokenizer for V13 token decoding
+            max_len: Maximum formula length for generation
         """
         self._encoder = encoder
         self._decoder = decoder
+        self._v13_tokenizer = v13_tokenizer
+        self._max_len = max_len
 
     def forward(
         self,
         z: torch.Tensor,            # [batch, 2048] original latent
         magpie_pred: torch.Tensor,   # [batch, 145] from decoder's magpie_head
         tc_pred: torch.Tensor,       # [batch] from decoder's tc_head
-        stoich_pred: torch.Tensor,   # [batch, 37] for decoder conditioning
+        stoich_pred: torch.Tensor,   # [batch, 13 or 37] for decoder conditioning
         encoder_skip: torch.Tensor,  # [batch, 256] skip connections
         device: torch.device,
     ) -> Dict[str, torch.Tensor]:
@@ -186,13 +190,14 @@ class RoundTripConsistencyLoss(nn.Module):
         skip_subset = encoder_skip[subset_idx] if encoder_skip is not None else None
 
         # Step 1: Greedy decode to get token sequences (no gradients)
+        _gen_max_len = getattr(self, '_max_len', 60)
         with torch.no_grad():
             generated_tokens, _, _ = self._decoder.generate_with_kv_cache(
                 z=z_subset,
                 encoder_skip=skip_subset,
                 stoich_pred=stoich_subset,
                 temperature=0.0,  # Greedy
-                max_len=60,
+                max_len=_gen_max_len,
                 return_log_probs=False,
             )
 
@@ -202,7 +207,12 @@ class RoundTripConsistencyLoss(nn.Module):
 
         with torch.no_grad():
             for i in range(subset_size):
-                formula = _indices_to_formula(generated_tokens[i])
+                # V13.0: Use semantic fraction tokenizer if available
+                if getattr(self, '_v13_tokenizer', None) is not None:
+                    formula = self._v13_tokenizer.decode(generated_tokens[i].tolist())
+                else:
+                    _ensure_imports()
+                    formula = _indices_to_formula(generated_tokens[i])
                 encoder_input = _formula_to_encoder_input(
                     formula, max_elements=self.max_elements, device=device
                 )

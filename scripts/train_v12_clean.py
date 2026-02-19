@@ -114,7 +114,8 @@ from superconductor.models.family_classifier import (
 
 # V12.43: SC Constraint Zoo — physics-grounded generation constraints
 from superconductor.losses.constraint_rewards import (
-    ConstraintRewardConfig, FamilyConstraintConfig, compute_constraint_rewards
+    ConstraintRewardConfig, FamilyConstraintConfig, compute_constraint_rewards,
+    VocabConfig, make_v13_vocab_config, set_vocab_config,
 )
 from superconductor.losses.round_trip_loss import RoundTripConsistencyLoss
 from superconductor.losses.constraint_zoo import SiteOccupancySumLoss, ChargeBalanceLoss
@@ -2029,16 +2030,39 @@ class CombinedLossWithREINFORCE(nn.Module):
         """Set draft model for speculative decoding (V12.9)."""
         self._draft_model = draft_model
 
-    def set_constraint_zoo(self, encoder, decoder, config: dict):
+    def set_constraint_zoo(self, encoder, decoder, config: dict,
+                           v13_tokenizer=None):
         """V12.43: Configure SC Constraint Zoo losses and rewards.
 
         Args:
             encoder: FullMaterialsVAE instance (for A5 round-trip re-encoding)
             decoder: EnhancedTransformerDecoder (for A5 greedy decode)
             config: TRAIN_CONFIG dict with constraint zoo parameters
+            v13_tokenizer: Optional FractionAwareTokenizer for V13 compatibility
         """
         if not config.get('constraint_zoo_enabled', False):
             return
+
+        # V13.0: Configure vocab layout for constraint rewards
+        if v13_tokenizer is not None:
+            _frac_values = torch.zeros(v13_tokenizer.vocab_size)
+            for tid in range(v13_tokenizer.fraction_token_start, v13_tokenizer.vocab_size):
+                _frac_values[tid] = v13_tokenizer.fraction_token_to_value(tid)
+            self._v13_fraction_values = _frac_values
+            self._v13_fraction_token_start = v13_tokenizer.fraction_token_start
+            self._use_semantic_fractions = True
+
+            v13_vc = make_v13_vocab_config(
+                fraction_token_start=v13_tokenizer.fraction_token_start,
+                fraction_values=_frac_values,
+            )
+            set_vocab_config(v13_vc)
+            print(f"  [Constraint Zoo] V13.0 vocab config set (elements={v13_vc.element_start}-{v13_vc.element_end}, "
+                  f"fractions={v13_vc.fraction_token_start}+)")
+        else:
+            self._v13_fraction_values = None
+            self._v13_fraction_token_start = 0
+            self._use_semantic_fractions = False
 
         # REINFORCE reward config (A1, A2, A4, A7)
         self._constraint_reward_config = ConstraintRewardConfig(
@@ -2073,7 +2097,11 @@ class CombinedLossWithREINFORCE(nn.Module):
             tc_weight=config.get('a5_tc_weight', 5.0),
             subset_fraction=config.get('a5_subset_fraction', 0.1),
         )
-        self._round_trip_loss.set_models(encoder, decoder)
+        self._round_trip_loss.set_models(
+            encoder, decoder,
+            v13_tokenizer=v13_tokenizer,
+            max_len=config.get('max_formula_len', 60),
+        )
 
         # A3: Site occupancy sum (differentiable)
         self._site_occupancy_loss = SiteOccupancySumLoss(
@@ -2186,7 +2214,10 @@ class CombinedLossWithREINFORCE(nn.Module):
         task_rewards = compute_reward_gpu_native(
             sampled_tokens, targets_expanded, mask.bool(),
             config=self.gpu_reward_config,
-            pad_idx=PAD_IDX, end_idx=END_IDX
+            pad_idx=PAD_IDX, end_idx=END_IDX,
+            use_semantic_fractions=getattr(self, '_use_semantic_fractions', False),
+            fraction_token_start=getattr(self, '_v13_fraction_token_start', 0),
+            fraction_values=getattr(self, '_v13_fraction_values', None),
         )
 
         # V12.43: Add constraint rewards to RLOO task rewards
@@ -2267,7 +2298,10 @@ class CombinedLossWithREINFORCE(nn.Module):
             task_rewards = compute_reward_gpu_native(
                 sampled_tokens, targets, mask,
                 config=self.gpu_reward_config,
-                pad_idx=PAD_IDX, end_idx=END_IDX
+                pad_idx=PAD_IDX, end_idx=END_IDX,
+                use_semantic_fractions=getattr(self, '_use_semantic_fractions', False),
+                fraction_token_start=getattr(self, '_v13_fraction_token_start', 0),
+                fraction_values=getattr(self, '_v13_fraction_values', None),
             )
 
             # V12.8: Use proper entropy H(p) = -sum(p * log(p)) from full distribution
@@ -2368,7 +2402,10 @@ class CombinedLossWithREINFORCE(nn.Module):
             greedy_rewards = compute_reward_gpu_native(
                 greedy_tokens, targets, greedy_mask,
                 config=self.gpu_reward_config,
-                pad_idx=PAD_IDX, end_idx=END_IDX
+                pad_idx=PAD_IDX, end_idx=END_IDX,
+                use_semantic_fractions=getattr(self, '_use_semantic_fractions', False),
+                fraction_token_start=getattr(self, '_v13_fraction_token_start', 0),
+                fraction_values=getattr(self, '_v13_fraction_values', None),
             )
 
             # V12.43: Add constraint rewards to greedy baseline
@@ -2411,7 +2448,10 @@ class CombinedLossWithREINFORCE(nn.Module):
             sample_rewards = compute_reward_gpu_native(
                 sampled_tokens, targets, sample_mask,
                 config=self.gpu_reward_config,
-                pad_idx=PAD_IDX, end_idx=END_IDX
+                pad_idx=PAD_IDX, end_idx=END_IDX,
+                use_semantic_fractions=getattr(self, '_use_semantic_fractions', False),
+                fraction_token_start=getattr(self, '_v13_fraction_token_start', 0),
+                fraction_values=getattr(self, '_v13_fraction_values', None),
             )
 
             # V12.43: Add constraint rewards to sample rewards
@@ -4929,7 +4969,8 @@ def train():
 
     # V12.43: Wire up SC Constraint Zoo
     if TRAIN_CONFIG.get('constraint_zoo_enabled', False):
-        loss_fn.set_constraint_zoo(encoder, decoder, TRAIN_CONFIG)
+        loss_fn.set_constraint_zoo(encoder, decoder, TRAIN_CONFIG,
+                                    v13_tokenizer=v13_tokenizer)
 
     # V12.12: Create contrastive loss function
     contrastive_loss_fn = None
@@ -5330,7 +5371,8 @@ def train():
                             hard_stop_threshold=TRAIN_CONFIG.get('hard_stop_threshold', 0.0))  # V12.37
         # V12.43: Re-wire constraint zoo with compiled encoder/decoder references
         if TRAIN_CONFIG.get('constraint_zoo_enabled', False):
-            loss_fn.set_constraint_zoo(encoder, decoder, TRAIN_CONFIG)
+            loss_fn.set_constraint_zoo(encoder, decoder, TRAIN_CONFIG,
+                                    v13_tokenizer=v13_tokenizer)
         print("  Encoder and decoder.transformer_decoder compiled")
 
         # Warmup pass: initialize CUDA graphs with a real batch to prevent NaN on first epoch
