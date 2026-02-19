@@ -168,9 +168,22 @@ def load_models():
     if 'stoich_to_memory.0.weight' in dec_state:
         stoich_dim = dec_state['stoich_to_memory.0.weight'].shape[1]
 
+    # Auto-detect decoder architecture from checkpoint (V12.42 wider model support)
+    _d_model = checkpoint.get('d_model', None)
+    if _d_model is None and 'token_embedding.weight' in dec_state:
+        _d_model = dec_state['token_embedding.weight'].shape[1]
+    _d_model = _d_model or 512
+    _dim_ff = checkpoint.get('dim_feedforward', None)
+    if _dim_ff is None and 'transformer_decoder.layers.0.linear1.weight' in dec_state:
+        _dim_ff = dec_state['transformer_decoder.layers.0.linear1.weight'].shape[0]
+    _dim_ff = _dim_ff or 2048
+    _nhead = checkpoint.get('nhead', 8)
+    _num_layers = checkpoint.get('num_layers', 12)
+    _max_len = checkpoint.get('max_formula_len', 60)
+
     decoder = EnhancedTransformerDecoder(
-        latent_dim=2048, d_model=512, nhead=8, num_layers=12,
-        dim_feedforward=2048, dropout=0.1, max_len=60,
+        latent_dim=2048, d_model=_d_model, nhead=_nhead, num_layers=_num_layers,
+        dim_feedforward=_dim_ff, dropout=0.1, max_len=_max_len,
         n_memory_tokens=16, encoder_skip_dim=256,
         use_skip_connection=True, use_stoich_conditioning=True,
         max_elements=12, n_stoich_tokens=4,

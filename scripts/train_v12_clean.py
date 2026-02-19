@@ -2835,6 +2835,16 @@ def save_checkpoint(encoder, decoder, epoch, suffix='', entropy_manager=None,
     if manifest is not None:
         checkpoint_data['manifest'] = manifest
 
+    # V13.0: Store decoder architecture params for auto-detection by holdout/analysis scripts
+    checkpoint_data['d_model'] = MODEL_CONFIG.get('d_model', 512)
+    checkpoint_data['nhead'] = MODEL_CONFIG.get('nhead', 8)
+    checkpoint_data['dim_feedforward'] = MODEL_CONFIG.get('dim_feedforward', 2048)
+    checkpoint_data['num_layers'] = MODEL_CONFIG.get('num_layers', 12)
+    checkpoint_data['max_formula_len'] = TRAIN_CONFIG.get('max_formula_len', 30)
+    if TRAIN_CONFIG.get('use_semantic_fractions', False):
+        checkpoint_data['tokenizer_vocab_size'] = decoder.vocab_size
+        checkpoint_data['stoich_input_dim'] = 13
+
     torch.save(checkpoint_data, path)
     print(f"  Saved checkpoint: {path.name}", flush=True)
 

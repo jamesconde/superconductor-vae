@@ -309,6 +309,11 @@ def migrate_checkpoint(
         'tokenizer_vocab_size': tokenizer.vocab_size,
         'tokenizer_n_fractions': tokenizer.n_fraction_tokens,
         'stoich_input_dim': 13,
+        # Store decoder architecture for scripts that load the checkpoint
+        'd_model': d_model,
+        'nhead': checkpoint.get('nhead', 8),
+        'dim_feedforward': dec_state['transformer_decoder.layers.0.linear1.weight'].shape[0] if 'transformer_decoder.layers.0.linear1.weight' in dec_state else 2048,
+        'num_layers': max(int(k.split('.')[2]) for k in dec_state if k.startswith('transformer_decoder.layers.')) + 1 if any(k.startswith('transformer_decoder.layers.') for k in dec_state) else 12,
     }
 
     # Copy optimizer state if present (will need resetting for Phase A)
@@ -330,13 +335,20 @@ def migrate_checkpoint(
     # Verification: try loading into new model
     print("\n--- Verification ---")
     try:
+        # Auto-detect architecture params from checkpoint weights
+        dim_feedforward = new_dec_state['transformer_decoder.layers.0.linear1.weight'].shape[0]
+        num_layers = max(int(k.split('.')[2]) for k in new_dec_state if k.startswith('transformer_decoder.layers.')) + 1
+        # nhead can't be detected from weight shapes — default to 8 (used by both V12.41 and V12.42)
+        nhead = checkpoint.get('nhead', 8)
+        print(f"  Auto-detected: d_model={d_model}, dim_feedforward={dim_feedforward}, nhead={nhead}, num_layers={num_layers}")
+
         # Build new decoder with V13.0 config
         test_decoder = EnhancedTransformerDecoder(
             latent_dim=2048,
             d_model=d_model,
-            nhead=8,
-            num_layers=12,
-            dim_feedforward=2048,
+            nhead=nhead,
+            num_layers=num_layers,
+            dim_feedforward=dim_feedforward,
             max_len=max_formula_len,
             n_memory_tokens=16,
             encoder_skip_dim=256,
