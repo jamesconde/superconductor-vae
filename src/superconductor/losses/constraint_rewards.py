@@ -88,6 +88,7 @@ def _rebuild_element_constants():
     """Rebuild element index constants from active vocab config."""
     global _Cu, _O, _Fe, _Ba, _Sr, _Y, _La, _Bi, _Tl, _Hg, _Mg, _B, _F
     global _Ca, _Pb, _As, _Se, _Te, _Nb, _Sn, _V, _Al, _C, _Li, _Na
+    global _Si, _Ge
     global _MAGNETIC_3D, _FORBIDDEN_PAIRS
 
     v = _active_vocab
@@ -116,6 +117,8 @@ def _rebuild_element_constants():
     _C = v.elem_idx(6)
     _Li = v.elem_idx(3)
     _Na = v.elem_idx(11)
+    _Si = v.elem_idx(14)
+    _Ge = v.elem_idx(32)
 
     _MAGNETIC_3D = frozenset([v.elem_idx(25), v.elem_idx(26),
                               v.elem_idx(27), v.elem_idx(28)])
@@ -608,7 +611,7 @@ def compute_family_constraint_rewards(
         elif fam == 1:  # BCS_CONVENTIONAL
             # A15 detection: Nb3Sn, V3Si, Nb3Ge, Nb3Al patterns
             a_site = {_Nb, _V}
-            b_site = {_Sn, _Al, _elem_idx(14), _elem_idx(32)}  # Si=14, Ge=32
+            b_site = {_Sn, _Al, _Si, _Ge}  # Si=14, Ge=32
             a_total = sum(fractions.get(e, 0.0) for e in a_site if e in elem_set)
             b_total = sum(fractions.get(e, 0.0) for e in b_site if e in elem_set)
             if a_total > 0 and b_total > 0:

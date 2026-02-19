@@ -23,6 +23,7 @@ from .formula_loss import (
     WeightedFormulaLoss,
     FormulaLossWithAccuracy,
     format_accuracy_log,
+    set_formula_loss_tokenizer,
 )
 
 from .semantic_unit_loss import (
@@ -30,6 +31,7 @@ from .semantic_unit_loss import (
     parse_tokens_to_semantic_units,
     compute_semantic_loss,
     SemanticUnitLoss,
+    set_semantic_unit_tokenizer,
 )
 
 from .reinforce_loss import (
@@ -101,11 +103,13 @@ __all__ = [
     'WeightedFormulaLoss',
     'FormulaLossWithAccuracy',
     'format_accuracy_log',
+    'set_formula_loss_tokenizer',
     # semantic_unit_loss
     'SemanticUnit',
     'parse_tokens_to_semantic_units',
     'compute_semantic_loss',
     'SemanticUnitLoss',
+    'set_semantic_unit_tokenizer',
     # reinforce_loss
     'RewardConfig',
     'compute_exact_match_reward',

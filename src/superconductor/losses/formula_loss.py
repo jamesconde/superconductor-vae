@@ -30,6 +30,41 @@ from ..models.autoregressive_decoder import (
     ELEMENTS, DIGITS, SPECIAL_CHARS
 )
 
+# V13.0: Support for semantic fraction tokenizer with larger vocab
+# When V13 is active, _active_vocab_size may be > VOCAB_SIZE (148)
+_active_vocab_size: int = VOCAB_SIZE
+_v13_tokenizer = None
+
+
+def set_formula_loss_tokenizer(tokenizer) -> None:
+    """Configure formula_loss for V13 semantic fraction tokenizer.
+
+    Call this during training setup if using V13. Updates TOKEN_TYPE_MASK
+    to cover the full V13 vocab (elements + integers + fraction tokens).
+    """
+    global _active_vocab_size, _v13_tokenizer, TOKEN_TYPE_MASK
+    _v13_tokenizer = tokenizer
+    _active_vocab_size = tokenizer.vocab_size
+    TOKEN_TYPE_MASK = _build_token_type_mask_v13(tokenizer)
+
+
+def _build_token_type_mask_v13(tokenizer) -> torch.Tensor:
+    """Build TOKEN_TYPE_MASK for V13 semantic fraction tokenizer."""
+    type_mask = torch.zeros(tokenizer.vocab_size, dtype=torch.long)
+    # PAD=0, BOS=1, EOS=2, UNK=3, FRAC_UNK=4 -> CONTROL
+    for idx in [0, 1, 2, 3, 4]:
+        type_mask[idx] = TokenType.CONTROL.value
+    # Elements (5-122) -> ELEMENT
+    for idx in range(5, 123):
+        type_mask[idx] = TokenType.ELEMENT.value
+    # Integers 1-20 (123-142) -> DIGIT
+    for idx in range(123, 143):
+        type_mask[idx] = TokenType.DIGIT.value
+    # Fraction tokens (143+) -> STRUCTURE (closest semantic category)
+    for idx in range(tokenizer.fraction_token_start, tokenizer.vocab_size):
+        type_mask[idx] = TokenType.STRUCTURE.value
+    return type_mask
+
 
 class TokenType(Enum):
     """Categories of tokens in chemical formulas."""
@@ -58,7 +93,7 @@ def get_token_type(token_idx: int) -> TokenType:
 
 
 def build_token_type_mask() -> torch.Tensor:
-    """Build a tensor mapping token indices to their types."""
+    """Build a tensor mapping token indices to their types (V12 layout)."""
     type_mask = torch.zeros(VOCAB_SIZE, dtype=torch.long)
     for idx in range(VOCAB_SIZE):
         type_mask[idx] = get_token_type(idx).value
@@ -73,7 +108,9 @@ def build_loss_weights(
     element_weight: float = 5.0,
     digit_weight: float = 2.0,
     structure_weight: float = 3.0,
-    other_weight: float = 1.0
+    other_weight: float = 1.0,
+    vocab_size: int = 0,
+    fraction_weight: float = 0.0,
 ) -> torch.Tensor:
     """
     Build per-token loss weights.
@@ -87,13 +124,35 @@ def build_loss_weights(
         digit_weight: Weight for digit tokens (default 2.0)
         structure_weight: Weight for ( ) / tokens (default 3.0)
         other_weight: Weight for other tokens (default 1.0)
+        vocab_size: Override vocab size (0 = use active vocab size)
+        fraction_weight: Override weight for V13 fraction tokens (0 = use structure_weight)
 
     Returns:
         Tensor of shape [vocab_size] with per-token weights
     """
-    weights = torch.ones(VOCAB_SIZE)
+    vs = vocab_size if vocab_size > 0 else _active_vocab_size
+    weights = torch.ones(vs)
 
-    for idx in range(VOCAB_SIZE):
+    # V13: use the V13-aware TOKEN_TYPE_MASK directly
+    if vs > VOCAB_SIZE and _v13_tokenizer is not None:
+        frac_w = fraction_weight if fraction_weight > 0 else structure_weight
+        for idx in range(vs):
+            if idx < len(TOKEN_TYPE_MASK):
+                tt = TOKEN_TYPE_MASK[idx].item()
+            else:
+                tt = TokenType.OTHER.value
+            if tt == TokenType.ELEMENT.value:
+                weights[idx] = element_weight
+            elif tt == TokenType.DIGIT.value:
+                weights[idx] = digit_weight
+            elif tt == TokenType.STRUCTURE.value:
+                weights[idx] = frac_w
+            elif tt == TokenType.OTHER.value:
+                weights[idx] = other_weight
+        return weights
+
+    # V12: original path
+    for idx in range(vs):
         token_type = get_token_type(idx)
         if token_type == TokenType.ELEMENT:
             weights[idx] = element_weight
@@ -196,11 +255,19 @@ class FormulaAccuracyTracker:
 
         batch_size, seq_len = predictions.shape
 
+        # If targets contain indices beyond the mask size (V13 vocab), resize
+        max_target = targets.max().item()
+        if max_target >= self.token_type_mask.shape[0]:
+            new_mask = TOKEN_TYPE_MASK.to(predictions.device)
+            if new_mask.shape[0] > self.token_type_mask.shape[0]:
+                self.token_type_mask = new_mask
+
         # Per-token correctness
         correct_mask = (predictions == targets) & mask
 
-        # Get token types for targets
-        target_types = self.token_type_mask[targets]  # [batch, seq_len]
+        # Get token types for targets — clamp to avoid out-of-bounds
+        clamped_targets = targets.clamp(max=self.token_type_mask.shape[0] - 1)
+        target_types = self.token_type_mask[clamped_targets]  # [batch, seq_len]
 
         # Count per type
         for token_type in TokenType:
@@ -319,6 +386,22 @@ class WeightedFormulaLoss(nn.Module):
         """
         batch_size, seq_len, vocab_size = logits.shape
 
+        # V13: rebuild CE loss if vocab size changed (e.g., 148 -> 4355)
+        if vocab_size != self.weights.shape[0]:
+            new_weights = build_loss_weights(
+                element_weight=self.element_weight,
+                digit_weight=self.digit_weight,
+                structure_weight=self.structure_weight,
+                vocab_size=vocab_size,
+            ).to(logits.device)
+            self.weights = new_weights
+            ce_reduction = 'none' if self.reduction == 'sum_over_positions' else self.reduction
+            self.ce_loss = nn.CrossEntropyLoss(
+                weight=new_weights,
+                ignore_index=PAD_IDX,
+                reduction=ce_reduction,
+            )
+
         # Reshape for cross-entropy: [batch*seq, vocab] vs [batch*seq]
         logits_flat = logits.view(-1, vocab_size)
         targets_flat = targets.view(-1)
@@ -428,9 +511,17 @@ class FormulaLossWithAccuracy(nn.Module):
                 if self.token_type_mask.device != predictions.device:
                     self.token_type_mask = self.token_type_mask.to(predictions.device)
 
+                # V13: resize token type mask if targets exceed it
+                max_target = targets.max().item()
+                if max_target >= self.token_type_mask.shape[0]:
+                    new_mask = TOKEN_TYPE_MASK.to(predictions.device)
+                    if new_mask.shape[0] > self.token_type_mask.shape[0]:
+                        self.token_type_mask = new_mask
+
                 # Per-type accuracy
                 correct = (predictions == targets) & mask
-                target_types = self.token_type_mask[targets]
+                clamped_targets = targets.clamp(max=self.token_type_mask.shape[0] - 1)
+                target_types = self.token_type_mask[clamped_targets]
 
                 for token_type in [TokenType.ELEMENT, TokenType.DIGIT, TokenType.STRUCTURE]:
                     type_mask = (target_types == token_type.value) & mask

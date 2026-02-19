@@ -34,6 +34,15 @@ from ..models.autoregressive_decoder import (
     ELEMENTS
 )
 
+# V13.0: Optional semantic fraction tokenizer
+_v13_tokenizer = None
+
+
+def set_semantic_unit_tokenizer(tokenizer) -> None:
+    """Configure semantic_unit_loss for V13 semantic fraction tokenizer."""
+    global _v13_tokenizer
+    _v13_tokenizer = tokenizer
+
 
 @dataclass
 class SemanticUnit:
@@ -48,12 +57,73 @@ def parse_tokens_to_semantic_units(token_indices: torch.Tensor) -> List[Semantic
     """
     Parse a sequence of token indices into semantic units.
 
-    Example:
+    Supports both V12 (character-level) and V13 (semantic fraction) tokenizers.
+
+    Example (V12):
         [La, (, 7, /, 1, 0, ), Sr, (, 3, /, 1, 0, ), Cu, O, 4]
         ->
         [Element("La"), Fraction("(7/10)"), Element("Sr"), Fraction("(3/10)"),
          Element("Cu"), Element("O"), Subscript("4")]
+
+    Example (V13):
+        [La, FRAC:7/10, Sr, FRAC:3/10, Cu, O, 4]
+        ->
+        [Element("La"), Fraction("(7/10)"), Element("Sr"), Fraction("(3/10)"),
+         Element("Cu"), Element("O"), Subscript("4")]
     """
+    # V13 path: use the semantic fraction tokenizer
+    if _v13_tokenizer is not None:
+        return _parse_tokens_v13(token_indices)
+
+    # V12 path: original character-level parsing
+    return _parse_tokens_v12(token_indices)
+
+
+def _parse_tokens_v13(token_indices: torch.Tensor) -> List[SemanticUnit]:
+    """Parse V13 semantic fraction token sequence into semantic units."""
+    units = []
+    tok = _v13_tokenizer
+
+    for idx, token_idx in enumerate(token_indices.tolist()):
+        # Skip special tokens (PAD=0, BOS=1, EOS=2, UNK=3, FRAC_UNK=4)
+        if token_idx <= 4:
+            continue
+
+        # Element tokens (5-122)
+        if tok.is_element_token(token_idx):
+            name = tok.decode([token_idx])
+            units.append(SemanticUnit(
+                unit_type='element',
+                tokens=[name],
+                positions=[idx],
+                value=name
+            ))
+
+        # Integer tokens (123-142)
+        elif tok.is_integer_token(token_idx):
+            val = tok.decode([token_idx])
+            units.append(SemanticUnit(
+                unit_type='subscript',
+                tokens=[val],
+                positions=[idx],
+                value=val
+            ))
+
+        # Fraction tokens (143+)
+        elif tok.is_fraction_token(token_idx):
+            frac_str = tok.decode([token_idx])  # e.g., "(7/10)"
+            units.append(SemanticUnit(
+                unit_type='fraction',
+                tokens=[frac_str],
+                positions=[idx],
+                value=frac_str
+            ))
+
+    return units
+
+
+def _parse_tokens_v12(token_indices: torch.Tensor) -> List[SemanticUnit]:
+    """Parse V12 character-level token sequence into semantic units."""
     units = []
     tokens = []
 

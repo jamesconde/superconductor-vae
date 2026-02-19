@@ -2045,7 +2045,9 @@ class CombinedLossWithREINFORCE(nn.Module):
 
         # V13.0: Configure vocab layout for constraint rewards
         if v13_tokenizer is not None:
-            _frac_values = torch.zeros(v13_tokenizer.vocab_size)
+            # Create on GPU directly to avoid per-call CPU->GPU transfer
+            _device = next(encoder.parameters()).device
+            _frac_values = torch.zeros(v13_tokenizer.vocab_size, device=_device)
             for tid in range(v13_tokenizer.fraction_token_start, v13_tokenizer.vocab_size):
                 _frac_values[tid] = v13_tokenizer.fraction_token_to_value(tid)
             self._v13_fraction_values = _frac_values
