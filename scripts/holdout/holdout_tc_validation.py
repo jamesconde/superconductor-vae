@@ -159,12 +159,23 @@ def load_models():
 
     dec_state_raw = checkpoint.get('decoder_state_dict', {})
     dec_state = {k.replace('_orig_mod.', ''): v for k, v in dec_state_raw.items()}
+
+    # V13.0: Auto-detect vocab_size and stoich_input_dim from checkpoint
+    dec_vocab_size = checkpoint.get('tokenizer_vocab_size', None)
+    if dec_vocab_size is None and 'token_embedding.weight' in dec_state:
+        dec_vocab_size = dec_state['token_embedding.weight'].shape[0]
+    stoich_dim = None
+    if 'stoich_to_memory.0.weight' in dec_state:
+        stoich_dim = dec_state['stoich_to_memory.0.weight'].shape[1]
+
     decoder = EnhancedTransformerDecoder(
         latent_dim=2048, d_model=512, nhead=8, num_layers=12,
         dim_feedforward=2048, dropout=0.1, max_len=60,
         n_memory_tokens=16, encoder_skip_dim=256,
         use_skip_connection=True, use_stoich_conditioning=True,
         max_elements=12, n_stoich_tokens=4,
+        vocab_size=dec_vocab_size,
+        stoich_input_dim=stoich_dim,
     ).to(DEVICE)
     decoder.load_state_dict(dec_state, strict=False)
 

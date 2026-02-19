@@ -174,13 +174,14 @@ def load_models(checkpoint_path):
     stoich_weight_key = 'stoich_to_memory.0.weight'
     if stoich_weight_key in dec_state:
         stoich_dim = dec_state[stoich_weight_key].shape[1]
-        # stoich_dim = max_elements * N + 1, where N=1 (pre-V12.38) or N=3 (V12.38+)
-        if stoich_dim == 37:
-            max_elements = 12  # V12.38: 12*3+1=37
-        else:
-            max_elements = stoich_dim - 1  # Pre-V12.38: 12+1=13, so max_elements=12
     else:
-        max_elements = 12
+        stoich_dim = None
+    max_elements = 12
+
+    # V13.0: Auto-detect vocab_size from checkpoint
+    dec_vocab_size = checkpoint.get('tokenizer_vocab_size', None)
+    if dec_vocab_size is None and 'token_embedding.weight' in dec_state:
+        dec_vocab_size = dec_state['token_embedding.weight'].shape[0]
 
     decoder = EnhancedTransformerDecoder(
         latent_dim=2048, d_model=512, nhead=8, num_layers=12,
@@ -188,6 +189,8 @@ def load_models(checkpoint_path):
         n_memory_tokens=16, encoder_skip_dim=256,
         use_skip_connection=True, use_stoich_conditioning=True,
         max_elements=max_elements, n_stoich_tokens=4,
+        vocab_size=dec_vocab_size,
+        stoich_input_dim=stoich_dim,
     ).to(DEVICE)
     decoder.load_state_dict(dec_state, strict=False)
 

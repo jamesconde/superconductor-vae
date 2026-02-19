@@ -37,7 +37,15 @@ Total vocab: 4,355 (was 148)
 - numden_loss eliminated from combined loss
 - A2 GCD penalty disabled (impossible to emit non-canonical fractions)
 - Stoich conditioning simplified: 13 dims instead of 37
-- Two-phase training: Phase A (warmup, 5 epochs) → Phase B (full)
+- Two-phase training: Phase A (warmup, 10 epochs) → Phase B (full)
+
+**Config tuning for V13.0:**
+- `max_formula_len`: 60 → 30 (V13 max=24, P99=16, mean=8.9 — halves decoder compute)
+- `label_smoothing`: 0.1 → 0.05 (30x larger vocab dilutes per-class smoothing effect)
+- `length_weight_base`: 15 → 8 (matches V13 mean sequence length)
+- `lr_warmup_epochs`: 20 → 0 (Phase A/B handle LR transitions; warmup throttled fraction training)
+- `fraction_token_weight`: 2.0 — now wired into FocalLossWithLabelSmoothing (upweights fraction targets 2x)
+- Positional encoding truncated from [1,60,512] to [1,30,512] in migration
 
 ### New Files
 | File | Purpose |

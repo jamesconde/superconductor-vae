@@ -406,8 +406,8 @@ ALGO_VERSION = 'V13.0'  # Bump this when making algorithm changes
 TRAIN_CONFIG = {
     'num_epochs': 4000,
     'learning_rate': 3e-5,      # Reduced for stable fine-tuning (was 1e-4)
-    'lr_warmup_epochs': 20,     # V12.42: Linear warmup from 0 → lr over N epochs (for fresh optimizer after Net2Net)
-    'max_formula_len': 60,
+    'lr_warmup_epochs': 0,      # V13.0: Disabled — Phase A/B handle LR transitions; warmup would throttle Phase A fraction embedding training
+    'max_formula_len': 30,      # V13.0: Reduced from 60 — semantic tokens shorten sequences (max=24, P99=16, mean=8.9)
     'checkpoint_interval': 50,
 
     # =========================================================================
@@ -492,7 +492,7 @@ TRAIN_CONFIG = {
 
     # Focal loss and label smoothing (to break accuracy plateau)
     'focal_gamma': 2.0,          # Focal loss focusing parameter (0=standard CE, 2=typical)
-    'label_smoothing': 0.1,      # Label smoothing factor (0.0=none, 0.1=typical)
+    'label_smoothing': 0.05,     # V13.0: Reduced from 0.1 — 30x larger vocab dilutes smoothing effect
 
     # =========================================================================
     # V12.8: REINFORCE Settings
@@ -615,7 +615,7 @@ TRAIN_CONFIG = {
     'entropy_plateau_relative': True,    # If True, threshold scales with performance
 
     # Resume from checkpoint (set to None to train from scratch)
-    'resume_checkpoint': 'outputs/checkpoint_best.pt',  # V12.10: Resume from best checkpoint
+    'resume_checkpoint': 'outputs/checkpoint_v13_migrated.pt',  # V13.0: Resume from migrated checkpoint
 
     # V12.12: Retrain on new/combined data - resets catastrophic drop detector
     # Set to True when training data has changed (new normalization stats)
@@ -720,9 +720,9 @@ TRAIN_CONFIG = {
     # A: Sequence-length weighted loss — longer seqs get higher loss weight
     # (50% of errors occur in final third of sequences)
     'use_length_weighting': True,
-    'length_weight_base': 15,     # Seqs <= this length get weight 1.0
+    'length_weight_base': 8,      # V13.0: Reduced from 15 — V13 mean=8.9, seqs <= this get weight 1.0
     'length_weight_alpha': 1.0,   # Scale: w = 1 + alpha * max(0, (len-base)/base)
-                                  # len=30: w=2.0, len=45: w=3.0
+                                  # V13.0: len=12: w=1.5, len=16(P99): w=2.0, len=24(max): w=3.0
 
     # B: Fraction canonicalization — GCD-reduce all fractions before tokenization
     # Eliminates ambiguity when multiple equivalent representations exist
@@ -821,7 +821,7 @@ TRAIN_CONFIG = {
 
     # V13.0: Two-phase training for weight transfer from V12.x
     'v13_phase': 'A',         # 'A' = frozen warmup (only fraction embeddings train), 'B' = full fine-tuning
-    'v13_phase_a_epochs': 5,  # Number of warmup epochs in Phase A
+    'v13_phase_a_epochs': 10, # Number of warmup epochs in Phase A (4,212 fraction tokens need sufficient gradient coverage)
     'v13_phase_a_lr': 1e-4,   # Learning rate for Phase A (higher, new params only)
 }
 
@@ -854,12 +854,16 @@ class FocalLossWithLabelSmoothing(nn.Module):
     """
 
     def __init__(self, gamma: float = 2.0, alpha: float = 1.0,
-                 smoothing: float = 0.1, ignore_index: int = -100):
+                 smoothing: float = 0.1, ignore_index: int = -100,
+                 fraction_token_start: int = 0, fraction_token_weight: float = 1.0):
         super().__init__()
         self.gamma = gamma
         self.alpha = alpha
         self.smoothing = smoothing
         self.ignore_index = ignore_index
+        # V13.0: Per-token class weight for fraction tokens
+        self.fraction_token_start = fraction_token_start
+        self.fraction_token_weight = fraction_token_weight
 
     def forward(self, logits: torch.Tensor, targets: torch.Tensor,
                 reduction: str = 'mean') -> torch.Tensor:
@@ -916,6 +920,12 @@ class FocalLossWithLabelSmoothing(nn.Module):
             )
         else:
             focal_loss = focal_weight * (-target_log_probs)
+
+        # V13.0: Upweight fraction tokens to focus training on stoichiometric precision
+        if self.fraction_token_weight != 1.0 and self.fraction_token_start > 0:
+            is_fraction = valid_targets >= self.fraction_token_start
+            token_weights = torch.where(is_fraction, self.fraction_token_weight, 1.0)
+            focal_loss = focal_loss * token_weights
 
         if reduction == 'per_sample' and orig_3d:
             # V12.34: Scatter per-token losses back to [batch, seq_len] shape,
@@ -1927,6 +1937,9 @@ class CombinedLossWithREINFORCE(nn.Module):
         use_element_count_weighting: bool = False,  # D: Weight by element count
         element_count_base: float = 3.0,
         element_count_beta: float = 0.5,
+        # V13.0: Fraction token upweighting
+        fraction_token_start: int = 0,
+        fraction_token_weight: float = 1.0,
     ):
         super().__init__()
 
@@ -1977,7 +1990,9 @@ class CombinedLossWithREINFORCE(nn.Module):
             self.ce_loss = FocalLossWithLabelSmoothing(
                 gamma=focal_gamma,
                 smoothing=label_smoothing,
-                ignore_index=PAD_IDX
+                ignore_index=PAD_IDX,
+                fraction_token_start=fraction_token_start,
+                fraction_token_weight=fraction_token_weight,
             )
         else:
             self.ce_loss = nn.CrossEntropyLoss(reduction='none', ignore_index=PAD_IDX)
@@ -3375,6 +3390,10 @@ def load_checkpoint(encoder, decoder, checkpoint_path, entropy_manager=None,
     # V12.10: Load optimizer state if available
     # Encoder optimizer may fail to restore if parameter count changed (e.g., fc_logvar removed)
     fresh_optimizers = False  # V12.31: Track for grace period
+    # V13.0: Detect missing optimizer state (migrated checkpoints have no optimizer)
+    if enc_opt is not None and 'enc_optimizer_state_dict' not in checkpoint:
+        fresh_optimizers = True
+        print(f"  [Checkpoint] No optimizer state in checkpoint — using fresh optimizers", flush=True)
     if enc_opt is not None and 'enc_optimizer_state_dict' in checkpoint:
         try:
             enc_opt.load_state_dict(checkpoint['enc_optimizer_state_dict'])
@@ -4842,6 +4861,9 @@ def train():
         use_element_count_weighting=TRAIN_CONFIG.get('use_element_count_weighting', False),
         element_count_base=TRAIN_CONFIG.get('element_count_base', 3.0),
         element_count_beta=TRAIN_CONFIG.get('element_count_beta', 0.5),
+        # V13.0: Fraction token upweighting in CE loss
+        fraction_token_start=v13_tokenizer.fraction_token_start if use_semantic else 0,
+        fraction_token_weight=TRAIN_CONFIG.get('fraction_token_weight', 1.0) if use_semantic else 1.0,
     )
 
     # V12.9: Build or load draft model for speculative decoding

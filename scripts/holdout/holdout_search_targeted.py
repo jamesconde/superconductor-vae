@@ -63,6 +63,23 @@ TEMPERATURES = [0.01, 0.05, 0.1, 0.2, 0.3, 0.5, 0.7, 1.0]
 # Only search for holdouts below this threshold from first run
 REDO_THRESHOLD = 0.95
 
+# Tc normalization stats (from data/processed/cache/cache_meta.json)
+# Model predicts Tc in z-score normalized log1p space.
+# Denormalize: tc_kelvin = expm1(tc_pred * TC_STD + TC_MEAN)
+TC_MEAN = 2.725219433789196
+TC_STD = 1.3527019896187407
+
+# Family class names (14 classes from HierarchicalFamilyHead composed_14)
+FAMILY_NAMES = [
+    'NOT_SC', 'BCS_CONVENTIONAL', 'YBCO', 'LSCO', 'BSCCO', 'TBCCO',
+    'HBCCO', 'OTHER_CUPRATE', 'PNICTIDE', 'CHALCOGENIDE', 'MGB2',
+    'HEAVY_FERMION', 'ORGANIC', 'OTHER_UNKNOWN',
+]
+
+# Tc bucket names (5 classes from tc_class_head)
+TC_BUCKET_NAMES = ['non-SC (0K)', 'low (0-10K)', 'medium (10-50K)',
+                   'high (50-100K)', 'very-high (100K+)']
+
 _CANONICALIZER = CanonicalOrderer()
 
 
@@ -197,11 +214,33 @@ def load_models(checkpoint_path):
     # Detect V12.38+ numden_head
     has_numden_head = any('numden_head.' in k for k in enc_state)
 
+    # Detect numden_head architecture from checkpoint weights
+    # Current code has V12.41 expanded numden_head (z→512→256→24) but older
+    # checkpoints may have the original (z→128→24). Detect and adapt.
+    numden_first_key = 'numden_head.0.weight'
+    old_numden_arch = False
+    if numden_first_key in enc_state:
+        numden_first_dim = enc_state[numden_first_key].shape[0]
+        if numden_first_dim == 128:
+            old_numden_arch = True
+            print(f"  Detected OLD numden_head architecture (128-dim first layer)")
+
     encoder = FullMaterialsVAE(
         n_elements=118, element_embed_dim=128, n_attention_heads=8,
         magpie_dim=magpie_dim, fusion_dim=256, encoder_hidden=[512, 256],
         latent_dim=2048, decoder_hidden=[256, 512], dropout=0.1
     ).to(DEVICE)
+
+    # Replace numden_head with old architecture if checkpoint uses it
+    if old_numden_arch:
+        import torch.nn as nn
+        encoder.numden_head = nn.Sequential(
+            nn.Linear(2048, 128),
+            nn.ReLU(),
+            nn.Linear(128, encoder.max_elements * 2),
+        ).to(DEVICE)
+        print(f"  Replaced numden_head with old architecture (2048→128→24)")
+
     encoder.load_state_dict(enc_state, strict=False)
 
     dec_state_raw = checkpoint.get('decoder_state_dict', {})
@@ -211,12 +250,17 @@ def load_models(checkpoint_path):
     stoich_weight_key = 'stoich_to_memory.0.weight'
     if stoich_weight_key in dec_state:
         stoich_dim = dec_state[stoich_weight_key].shape[1]
-        if stoich_dim == 37:
-            max_elements = 12  # V12.38: 12*3+1=37
-        else:
-            max_elements = stoich_dim - 1  # Pre-V12.38: 12+1=13
     else:
-        max_elements = 12
+        stoich_dim = 37  # Default: V12.38 format
+    max_elements = 12
+
+    # Detect vocab_size from checkpoint (V13.0 stores it as metadata)
+    dec_vocab_size = checkpoint.get('tokenizer_vocab_size', None)
+    if dec_vocab_size is None:
+        # Fall back to detecting from embedding weight shape
+        embed_key = 'token_embedding.weight'
+        if embed_key in dec_state:
+            dec_vocab_size = dec_state[embed_key].shape[0]
 
     decoder = EnhancedTransformerDecoder(
         latent_dim=2048, d_model=512, nhead=8, num_layers=12,
@@ -224,6 +268,8 @@ def load_models(checkpoint_path):
         n_memory_tokens=16, encoder_skip_dim=256,
         use_skip_connection=True, use_stoich_conditioning=True,
         max_elements=max_elements, n_stoich_tokens=4,
+        vocab_size=dec_vocab_size,  # V13.0: auto-detect from checkpoint
+        stoich_input_dim=stoich_dim,  # V13.0: pass directly instead of computing from max_elements
     ).to(DEVICE)
     decoder.load_state_dict(dec_state, strict=False)
 
@@ -533,6 +579,191 @@ def search_single_target(encoder, decoder, data, target_formula, target_tc, targ
     }
 
 
+def run_consistency_check(encoder, z_maps, results):
+    """
+    Run Z centroids through all model heads and check self-consistency.
+
+    For each target's Z centroids, predict: Tc, SC probability, family, Tc bucket.
+    Flag inconsistencies:
+      - SC prob > 0.5 but Tc <= 0, or SC prob < 0.5 but Tc > 5K
+      - SC prob > 0.8 but family = NOT_SC, or SC prob < 0.5 but family != NOT_SC
+      - Tc and Tc bucket disagree by more than 1 bucket
+    """
+    print("\n" + "=" * 70)
+    print("SELF-CONSISTENCY CHECK (all heads)")
+    print("=" * 70)
+
+    # Build target metadata lookup
+    target_meta = {}
+    for r in results:
+        target_meta[r['target']] = r
+
+    global_stats = {
+        'total': 0, 'sc_tc_mismatch': 0, 'sc_family_mismatch': 0,
+        'tc_bucket_mismatch': 0, 'pred_sc': 0, 'pred_nonsc': 0,
+    }
+    consistency_results = {}
+
+    for target_formula, formula_z_map in sorted(z_maps.items()):
+        if not formula_z_map:
+            continue
+
+        meta = target_meta.get(target_formula, {})
+        target_tc = meta.get('target_tc', 0)
+        target_family = meta.get('target_family', 'Other')
+
+        formulas = list(formula_z_map.keys())
+        z_centroids = torch.stack([formula_z_map[f] for f in formulas]).to(DEVICE)
+
+        # Run all heads in batches
+        batch_size = 512
+        all_tc, all_sc_prob, all_family, all_tc_bucket = [], [], [], []
+
+        for i in range(0, len(formulas), batch_size):
+            z_batch = z_centroids[i:i+batch_size]
+            with torch.no_grad():
+                # Decode pathway
+                dec_out = encoder.decode(z_batch)
+                tc_norm = dec_out['tc_pred']
+                tc_kelvin = torch.expm1(tc_norm * TC_STD + TC_MEAN)
+
+                # Tc bucket
+                tc_bucket = dec_out['tc_class_logits'].argmax(-1)
+
+                # Auxiliary heads
+                competence = encoder.competence_head(z_batch).squeeze(-1)
+                fraction_output = encoder.fraction_head(z_batch)
+                fraction_pred = fraction_output[:, :encoder.max_elements]
+                element_count_pred = fraction_output[:, -1]
+                numden_pred = encoder.numden_head(z_batch)
+                hp_pred = encoder.hp_head(z_batch).squeeze(-1)
+                tc_class_logits = dec_out['tc_class_logits']
+
+                # SC head (cross-head consistency input)
+                sc_input = torch.cat([
+                    z_batch,
+                    dec_out['tc_pred'].unsqueeze(-1),
+                    dec_out['magpie_pred'],
+                    hp_pred.unsqueeze(-1),
+                    fraction_pred,
+                    element_count_pred.unsqueeze(-1),
+                    competence.unsqueeze(-1),
+                    tc_class_logits,
+                ], dim=-1)
+                sc_logit = encoder.sc_head(sc_input).squeeze(-1)
+                sc_prob = torch.sigmoid(sc_logit)
+
+                # Family
+                family_out = encoder.hierarchical_family_head(
+                    dec_out['backbone_h'], sc_logit.detach()
+                )
+                family_pred = family_out['composed_14'].argmax(-1)
+
+            all_tc.append(tc_kelvin.cpu())
+            all_sc_prob.append(sc_prob.cpu())
+            all_family.append(family_pred.cpu())
+            all_tc_bucket.append(tc_bucket.cpu())
+
+        tc_vals = torch.cat(all_tc).numpy()
+        sc_probs = torch.cat(all_sc_prob).numpy()
+        family_vals = torch.cat(all_family).numpy()
+        tc_buckets = torch.cat(all_tc_bucket).numpy()
+
+        # Check consistency rules
+        n = len(formulas)
+        issues = {'sc_tc': 0, 'sc_family': 0, 'tc_bucket': 0}
+
+        for j in range(n):
+            tc = tc_vals[j]
+            sc_p = sc_probs[j]
+            fam = family_vals[j]
+            bucket = tc_buckets[j]
+
+            # SC↔Tc
+            if (sc_p < 0.5 and tc > 5.0) or (sc_p > 0.8 and tc <= 0.0):
+                issues['sc_tc'] += 1
+
+            # SC↔Family
+            if (sc_p < 0.5 and fam != 0) or (sc_p > 0.8 and fam == 0):
+                issues['sc_family'] += 1
+
+            # Tc↔Bucket (expected bucket from tc value)
+            if tc <= 0:
+                exp_bucket = 0
+            elif tc <= 10:
+                exp_bucket = 1
+            elif tc <= 50:
+                exp_bucket = 2
+            elif tc <= 100:
+                exp_bucket = 3
+            else:
+                exp_bucket = 4
+            if abs(exp_bucket - bucket) > 1:
+                issues['tc_bucket'] += 1
+
+        n_sc = int((sc_probs > 0.5).sum())
+        n_nonsc = n - n_sc
+        global_stats['total'] += n
+        global_stats['sc_tc_mismatch'] += issues['sc_tc']
+        global_stats['sc_family_mismatch'] += issues['sc_family']
+        global_stats['tc_bucket_mismatch'] += issues['tc_bucket']
+        global_stats['pred_sc'] += n_sc
+        global_stats['pred_nonsc'] += n_nonsc
+
+        total_issues = issues['sc_tc'] + issues['sc_family'] + issues['tc_bucket']
+        flag = " !!" if total_issues > 0 else " ok"
+
+        # Get best match predictions
+        best_gen = meta.get('best_gen', '')
+        best_info = {}
+        if best_gen in formulas:
+            idx = formulas.index(best_gen)
+            best_info = {
+                'tc_pred_K': round(float(tc_vals[idx]), 1),
+                'sc_prob': round(float(sc_probs[idx]), 3),
+                'family': FAMILY_NAMES[family_vals[idx]],
+                'tc_bucket': TC_BUCKET_NAMES[tc_buckets[idx]],
+            }
+
+        consistency_results[target_formula] = {
+            'n_formulas': n,
+            'n_sc': n_sc,
+            'n_nonsc': n_nonsc,
+            'mean_tc_K': round(float(tc_vals.mean()), 1),
+            'sc_tc_mismatch': issues['sc_tc'],
+            'sc_family_mismatch': issues['sc_family'],
+            'tc_bucket_mismatch': issues['tc_bucket'],
+            'best_match_preds': best_info,
+        }
+
+        print(f"  [{target_family:15s}] {target_formula[:50]:50s} | "
+              f"SC:{n_sc:5d} nonSC:{n_nonsc:4d} | "
+              f"mean_tc={tc_vals.mean():6.1f}K | "
+              f"mismatches: sc_tc={issues['sc_tc']}, sc_fam={issues['sc_family']}, "
+              f"tc_bkt={issues['tc_bucket']}{flag}")
+
+    # Summary
+    total = global_stats['total']
+    print(f"\n{'='*70}")
+    print(f"CONSISTENCY SUMMARY ({total:,} unique formulas)")
+    print(f"{'='*70}")
+    print(f"  SC predictions:   {global_stats['pred_sc']:,} ({global_stats['pred_sc']/total*100:.1f}%)")
+    print(f"  Non-SC predictions: {global_stats['pred_nonsc']:,} ({global_stats['pred_nonsc']/total*100:.1f}%)")
+    total_mismatches = (global_stats['sc_tc_mismatch'] +
+                        global_stats['sc_family_mismatch'] +
+                        global_stats['tc_bucket_mismatch'])
+    print(f"  SC↔Tc mismatches:    {global_stats['sc_tc_mismatch']:,} "
+          f"({global_stats['sc_tc_mismatch']/total*100:.2f}%)")
+    print(f"  SC↔Family mismatches: {global_stats['sc_family_mismatch']:,} "
+          f"({global_stats['sc_family_mismatch']/total*100:.2f}%)")
+    print(f"  Tc↔Bucket mismatches: {global_stats['tc_bucket_mismatch']:,} "
+          f"({global_stats['tc_bucket_mismatch']/total*100:.2f}%)")
+    consistency_rate = (1 - total_mismatches / (total * 3)) * 100  # 3 checks per formula
+    print(f"  Overall consistency: {consistency_rate:.2f}%")
+
+    return consistency_results
+
+
 def main():
     parser = argparse.ArgumentParser(description='Targeted Holdout Search (Element-Anchored)')
     parser.add_argument('--checkpoint', type=str,
@@ -656,6 +887,9 @@ def main():
     for result in results:
         z_maps[result['target']] = result.pop('formula_to_z')
 
+    # Run self-consistency check across all model heads
+    consistency_results = run_consistency_check(encoder, z_maps, results)
+
     # Save JSON (without Z tensors — they're too large for JSON)
     output = {
         'timestamp': time.strftime('%Y-%m-%dT%H:%M:%S'),
@@ -664,6 +898,7 @@ def main():
         'n_targets_searched': len(targets_to_search),
         'n_found_095': found_count,
         'n_exact': sum(1 for r in results if r.get('exact')),
+        'consistency': consistency_results,
         'results': results,
     }
     with open(output_path, 'w') as f:
