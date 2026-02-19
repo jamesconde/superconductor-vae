@@ -200,7 +200,7 @@ def load_models(checkpoint_path):
         latent_dim=2048, d_model=_d_model, nhead=_nhead, num_layers=_num_layers,
         dim_feedforward=_dim_ff, dropout=0.1, max_len=_max_len,
         n_memory_tokens=16, encoder_skip_dim=256,
-        use_skip_connection=True, use_stoich_conditioning=True,
+        use_skip_connection=False, use_stoich_conditioning=True,  # V13.1: skip removed
         max_elements=max_elements, n_stoich_tokens=4,
         vocab_size=dec_vocab_size,
         stoich_input_dim=stoich_dim,
@@ -260,8 +260,6 @@ def full_enchilada_batch(encoder, decoder, data, indices, has_numden_head, tempe
         dec_out = encoder.decode(z)
         tc_pred = dec_out['tc_pred'].detach().cpu()           # [batch, 1]
         magpie_pred = dec_out['magpie_pred'].detach().cpu()   # [batch, 145]
-        encoder_skip = dec_out['attended_input']
-
         # V12.38: Assemble stoich_pred with numden conditioning
         # fraction_head outputs [batch, max_elements+1] where last dim is element count
         fraction_output = encoder.fraction_head(z)
@@ -274,9 +272,9 @@ def full_enchilada_batch(encoder, decoder, data, indices, has_numden_head, tempe
         else:
             stoich_pred = torch.cat([fraction_pred, element_count_pred.unsqueeze(-1)], dim=-1)
 
-        # Generate formula
+        # Generate formula (V13.1: no skip connection)
         generated, _, _ = decoder.generate_with_kv_cache(
-            z=z, encoder_skip=encoder_skip, stoich_pred=stoich_pred,
+            z=z, stoich_pred=stoich_pred,
             temperature=temperature,
         )
 

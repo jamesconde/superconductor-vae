@@ -229,14 +229,9 @@ def evaluate_autoregressive(encoder, decoder, data, max_samples=None, batch_size
             )
             z = enc_outputs['z']
 
-            # Get attended_input for decoder skip connection
-            dec_outputs = encoder.decode(z)
-            encoder_skip = dec_outputs['attended_input']
-
-            # Decode autoregressively with KV cache (much faster!)
+            # Decode autoregressively with KV cache (V13.1: no skip connection)
             generated_tokens, _, _ = decoder.generate_with_kv_cache(
                 z,
-                encoder_skip=encoder_skip,
                 max_len=60,
                 temperature=1.0,
             )

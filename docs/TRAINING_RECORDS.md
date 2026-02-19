@@ -4,6 +4,64 @@ Chronological record of training runs, architecture changes, and optimization de
 
 ---
 
+## V13.1: Remove Encoder Skip Connection (2026-02-19)
+
+### Problem
+
+The decoder received encoder information through **two paths**:
+1. **z** (2048-dim latent) → `latent_to_memory` → 16 memory tokens
+2. **attended_input** (256-dim skip) → `skip_to_memory` → 8 memory tokens (bypasses z bottleneck)
+
+The skip connection contributed 8 of 28 memory tokens (29%), undermining the VAE information bottleneck. The decoder could reconstruct formulas using information that leaked through the skip path without being compressed into z. Evidence: TRUE autoregressive exact match was 0.1% while teacher-forced exact was 80.6% — the skip made TF artificially easy while doing nothing for AR generation.
+
+### Solution
+
+Set `use_skip_connection=False` in decoder construction. Memory layout changes from `[16 latent | 8 skip | 4 stoich] = 28 tokens` to `[16 latent | 4 stoich] = 20 tokens`. All encoder→decoder communication now flows exclusively through z.
+
+### Changes
+
+**Decoder construction** (`train_v12_clean.py`):
+- `use_skip_connection=True` → `use_skip_connection=False`
+
+**Training loop** (`train_v12_clean.py`):
+- Removed `attended_input` extraction from encoder output
+- Removed `encoder_skip=attended_input` from decoder forward call
+- Changed all 4 loss function calls to pass `encoder_skip=None`
+- Changed round-trip loss (A5 constraint) to pass `encoder_skip=None`
+- Removed `attended_input` collection from z-caching
+- Removed `encoder_skip` from warmup pass
+
+**Evaluation** (`train_v12_clean.py`):
+- Removed `encoder_skip` from `evaluate_true_autoregressive()`
+
+**Holdout/analysis scripts** (6 files):
+- Set `use_skip_connection=False` in decoder construction
+- Removed `encoder_skip` extraction and passing
+
+### What Was NOT Changed
+
+- **Encoder `attended_head`**: Kept for checkpoint compatibility (output computed but unused)
+- **Decoder class code**: Already supports `use_skip_connection=False` — no changes needed
+- **Loss classes**: Already handle `encoder_skip=None` — no changes needed
+- **Round-trip loss module**: Already handles `encoder_skip=None` — no changes needed
+
+### Checkpoint Compatibility
+
+Loading V13.0 checkpoint with `use_skip_connection=False`: the `skip_to_memory.*` weights appear as "unexpected keys" and are silently ignored by `strict=False` loading (logged to console).
+
+### Files Modified
+| File | Change |
+|------|--------|
+| `scripts/train_v12_clean.py` | Disable skip, remove ~15 `encoder_skip`/`attended_input` references |
+| `scripts/holdout/holdout_search.py` | `use_skip_connection=False`, remove skip passing |
+| `scripts/holdout/holdout_search_targeted.py` | Same |
+| `scripts/holdout/holdout_tc_validation.py` | Same |
+| `scripts/analysis/evaluate_generation_quality.py` | Same |
+| `scripts/analysis/evaluate_vae_errors.py` | Remove skip passing |
+| `scripts/analysis/generation_quality_audit.py` | `use_skip_connection=False`, remove skip passing |
+
+---
+
 ## V13.0: Semantic Fraction Tokenization (2026-02-18)
 
 ### Problem

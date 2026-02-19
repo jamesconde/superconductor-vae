@@ -245,7 +245,7 @@ def load_models():
         latent_dim=2048, d_model=_d_model, nhead=_nhead, num_layers=_num_layers,
         dim_feedforward=_dim_ff, dropout=0.1, max_len=_max_len,
         n_memory_tokens=16, encoder_skip_dim=256,
-        use_skip_connection=True, use_stoich_conditioning=True,
+        use_skip_connection=False, use_stoich_conditioning=True,  # V13.1: skip removed
         max_elements=12, n_stoich_tokens=4,
         vocab_size=dec_vocab_size,
         stoich_input_dim=stoich_dim,
@@ -357,46 +357,40 @@ def encode_samples(encoder, data, indices):
 
 @torch.no_grad()
 def get_decoder_conditioning(encoder, z_batch):
-    """Get encoder_skip (attended_input) and stoich_pred from Z vectors.
+    """Get stoich_pred from Z vectors.
 
-    The decoder needs these for skip connections and stoichiometry conditioning.
+    V13.1: Skip connection removed — decoder only needs stoichiometry conditioning.
 
     Args:
-        encoder: FullMaterialsVAE (has decode() method: z -> attended_input, fraction_pred, etc.)
+        encoder: FullMaterialsVAE (has decode() method and fraction_head)
         z_batch: [N, 2048] latent vectors (CPU or GPU)
 
     Returns:
-        attended_input: [N, 256] encoder skip connection
-        fraction_pred: [N, 13] stoichiometry prediction
+        None (no skip connection), stoich_pred: [N, 13] stoichiometry prediction
     """
     batch_size = 128
-    all_skip = []
     all_stoich = []
 
     for start in range(0, len(z_batch), batch_size):
         z = z_batch[start:start + batch_size].to(DEVICE)
-
-        # encoder.decode() gives us tc_pred, magpie_pred, attended_input
-        dec_out = encoder.decode(z)
-        all_skip.append(dec_out['attended_input'].cpu())
 
         # Get fraction_pred from fraction_head
         fraction_output = encoder.fraction_head(z)
         fraction_pred = fraction_output[:, :12]  # max_elements=12
         all_stoich.append(fraction_pred.cpu())
 
-    return torch.cat(all_skip, dim=0), torch.cat(all_stoich, dim=0)
+    return None, torch.cat(all_stoich, dim=0)
 
 
 @torch.no_grad()
 def decode_z_batch(encoder, decoder, z_batch, temperature=0.01, stop_boost=0.0):
     """Decode a batch of Z vectors into formula strings.
 
-    Uses encoder.decode() to get skip connections and stoichiometry conditioning,
-    then passes them to the decoder for generation.
+    Uses encoder heads for stoichiometry conditioning, then generates via decoder.
+    V13.1: Skip connection removed — all info flows through z.
 
     Args:
-        encoder: FullMaterialsVAE (for computing attended_input + fraction_pred)
+        encoder: FullMaterialsVAE (for computing fraction_pred)
         decoder: EnhancedTransformerDecoder
         z_batch: [N, 2048] latent vectors (on CPU or GPU)
         temperature: sampling temperature
@@ -411,17 +405,12 @@ def decode_z_batch(encoder, decoder, z_batch, temperature=0.01, stop_boost=0.0):
     for start in range(0, len(z_batch), batch_size):
         z = z_batch[start:start + batch_size].to(DEVICE)
 
-        # Get decoder conditioning from encoder heads
-        dec_out = encoder.decode(z)
-        encoder_skip = dec_out['attended_input']
-
         # Get stoichiometry prediction
         fraction_output = encoder.fraction_head(z)
         stoich_pred = fraction_output  # [batch, 13] (12 fractions + count)
 
         generated, _, _ = decoder.generate_with_kv_cache(
             z=z,
-            encoder_skip=encoder_skip,
             stoich_pred=stoich_pred,
             temperature=temperature,
             stop_boost=stop_boost,

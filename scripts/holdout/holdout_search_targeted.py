@@ -279,7 +279,7 @@ def load_models(checkpoint_path):
         latent_dim=2048, d_model=_d_model, nhead=_nhead, num_layers=_num_layers,
         dim_feedforward=_dim_ff, dropout=0.1, max_len=_max_len,
         n_memory_tokens=16, encoder_skip_dim=256,
-        use_skip_connection=True, use_stoich_conditioning=True,
+        use_skip_connection=False, use_stoich_conditioning=True,  # V13.1: skip removed
         max_elements=max_elements, n_stoich_tokens=4,
         vocab_size=dec_vocab_size,
         stoich_input_dim=stoich_dim,
@@ -340,8 +340,6 @@ def decode_z_batch(encoder, decoder, z_batch, has_numden_head=False, temperature
     all_formulas = []
     for start in range(0, len(z_batch), batch_size):
         z = z_batch[start:start + batch_size].to(DEVICE)
-        dec_out = encoder.decode(z)
-        encoder_skip = dec_out['attended_input']
 
         # V12.38: Assemble stoich_pred with numden conditioning
         fraction_output = encoder.fraction_head(z)
@@ -355,7 +353,7 @@ def decode_z_batch(encoder, decoder, z_batch, has_numden_head=False, temperature
             stoich_pred = torch.cat([fraction_pred, element_count_pred.unsqueeze(-1)], dim=-1)
 
         generated, _, _ = decoder.generate_with_kv_cache(
-            z=z, encoder_skip=encoder_skip, stoich_pred=stoich_pred,
+            z=z, stoich_pred=stoich_pred,  # V13.1: no encoder_skip
             temperature=temperature,
         )
         for i in range(len(z)):

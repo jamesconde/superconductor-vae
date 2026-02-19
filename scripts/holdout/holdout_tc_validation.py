@@ -185,7 +185,7 @@ def load_models():
         latent_dim=2048, d_model=_d_model, nhead=_nhead, num_layers=_num_layers,
         dim_feedforward=_dim_ff, dropout=0.1, max_len=_max_len,
         n_memory_tokens=16, encoder_skip_dim=256,
-        use_skip_connection=True, use_stoich_conditioning=True,
+        use_skip_connection=False, use_stoich_conditioning=True,  # V13.1: skip removed
         max_elements=12, n_stoich_tokens=4,
         vocab_size=dec_vocab_size,
         stoich_input_dim=stoich_dim,
@@ -247,12 +247,9 @@ def full_forward(encoder, decoder, elem_idx, elem_frac, elem_mask, magpie, tc, t
     else:
         stoich_pred = torch.cat([fraction_pred, element_count_pred.unsqueeze(-1)], dim=-1)
 
-    # Skip connection for formula decoder
-    encoder_skip = enc_out['attended_input']
-
-    # Formula generation
+    # Formula generation (V13.1: no skip connection)
     generated, log_probs, entropy = decoder.generate_with_kv_cache(
-        z=z, encoder_skip=encoder_skip, stoich_pred=stoich_pred,
+        z=z, stoich_pred=stoich_pred,
         temperature=temperature,
     )
     formula = tokens_to_formula(generated[0])

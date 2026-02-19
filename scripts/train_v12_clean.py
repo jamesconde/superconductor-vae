@@ -1873,7 +1873,7 @@ def create_models(magpie_dim: int, device: torch.device):
         max_len=TRAIN_CONFIG['max_formula_len'],
         n_memory_tokens=MODEL_CONFIG['n_memory_tokens'],
         encoder_skip_dim=MODEL_CONFIG['fusion_dim'],
-        use_skip_connection=True,
+        use_skip_connection=False,  # V13.1: Skip connection removed — all info flows through z
         use_stoich_conditioning=True,
         max_elements=12,
         n_stoich_tokens=4,
@@ -2733,7 +2733,7 @@ class CombinedLossWithREINFORCE(nn.Module):
                     magpie_pred=magpie_pred,
                     tc_pred=tc_pred,
                     stoich_pred=stoich_pred_for_reinforce,
-                    encoder_skip=encoder_skip,
+                    encoder_skip=None,  # V13.1: skip connection removed
                     device=formula_logits.device,
                 )
                 constraint_zoo_loss = constraint_zoo_loss + self._a5_round_trip_weight * a5_result['round_trip_loss']
@@ -2970,8 +2970,6 @@ def cache_z_vectors(encoder, loader, device, epoch, cache_path, dataset_info=Non
     all_generated_tokens = []
     all_exact_match = []
     all_log_probs = []
-    all_attended_input = []
-
     sample_idx = 0
     include_predictions = mode in ['z_and_predictions', 'full'] and decoder is not None
     include_log_probs = mode == 'full' and decoder is not None
@@ -2998,9 +2996,6 @@ def cache_z_vectors(encoder, loader, device, epoch, cache_path, dataset_info=Non
             all_target_tokens.append(tokens.cpu())
 
             if include_predictions:
-                attended_input = encoder_out.get('attended_input')
-                all_attended_input.append(attended_input.cpu() if attended_input is not None else None)
-
                 # V12.38/V13.0: Assemble stoich_pred for decoder generation
                 _frac = encoder_out.get('fraction_pred')
                 _ecount = encoder_out.get('element_count_pred')
@@ -3021,7 +3016,7 @@ def cache_z_vectors(encoder, loader, device, epoch, cache_path, dataset_info=Non
                 # Generate predictions using decoder
                 if include_log_probs:
                     gen_tokens, log_probs, _, _ = decoder.sample_for_reinforce(
-                        z=z, encoder_skip=attended_input, stoich_pred=_stoich,  # V12.38
+                        z=z, stoich_pred=_stoich,  # V12.38
                         temperature=0.0,  # Greedy
                         max_len=tokens.size(1),
                         stop_boost=stop_boost,  # V12.37: Was missing — caused 1.6% exact match
@@ -3030,7 +3025,7 @@ def cache_z_vectors(encoder, loader, device, epoch, cache_path, dataset_info=Non
                     all_log_probs.append(log_probs.cpu())
                 else:
                     gen_tokens = decoder.generate_with_kv_cache(
-                        z=z, encoder_skip=attended_input, stoich_pred=_stoich,  # V12.38
+                        z=z, stoich_pred=_stoich,  # V12.38
                         temperature=0.0,
                         max_len=tokens.size(1), return_log_probs=False, return_entropy=False,
                         stop_boost=stop_boost,  # V12.37: Was missing — caused 1.6% exact match
@@ -3631,7 +3626,6 @@ def evaluate_true_autoregressive(encoder, decoder, loader, device, max_samples=1
         # Encode (same order as train_epoch) - get ALL encoder outputs
         encoder_out = encoder(elem_idx, elem_frac, elem_mask, magpie, tc)
         z = encoder_out['z']
-        encoder_skip = encoder_out['attended_input']
         tc_pred = encoder_out['tc_pred']
         magpie_pred = encoder_out['magpie_pred']
         fraction_pred = encoder_out.get('fraction_pred')
@@ -3710,7 +3704,6 @@ def evaluate_true_autoregressive(encoder, decoder, loader, device, max_samples=1
         # Generate autoregressively (TRUE inference - no teacher forcing)
         generated_tokens, _, _ = decoder.generate_with_kv_cache(
             z=z,
-            encoder_skip=encoder_skip,
             stoich_pred=stoich_pred_eval,  # V12.38: Include numden conditioning
             temperature=0.001,  # Near-greedy for evaluation
             max_len=decoder.max_len,
@@ -4263,7 +4256,6 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
 
             tc_pred = encoder_out['tc_pred']
             magpie_pred = encoder_out['magpie_pred']
-            attended_input = encoder_out['attended_input']
             # NOTE: 'kl_loss' is actually L2 reg (mean(z²)) since deterministic encoder.
             # Key name kept for compatibility — see attention_vae.py forward() comment.
             kl_loss = encoder_out['kl_loss']
@@ -4314,7 +4306,7 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
 
             # Decoder forward with teacher forcing ratio (all samples)
             formula_logits, _, stop_logits = decoder(
-                z, tokens, encoder_skip=attended_input,
+                z, tokens,
                 stoich_pred=stoich_pred, teacher_forcing_ratio=tf_ratio
             )
             formula_targets = tokens[:, 1:]
@@ -4465,7 +4457,7 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
                     element_mask=elem_mask,
                     element_count_pred=element_count_pred,
                     z=z,
-                    encoder_skip=attended_input,
+                    encoder_skip=None,  # V13.1: skip connection removed
                     stoich_pred_for_reinforce=stoich_pred,
                     tc_class_logits=tc_class_logits,  # V12.28
                     n_elements=elem_mask.bool().sum(dim=1),  # V12.34
@@ -4500,7 +4492,7 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
                     element_mask=elem_mask,
                     element_count_pred=element_count_pred,
                     z=None,  # No REINFORCE for non-SC
-                    encoder_skip=attended_input,
+                    encoder_skip=None,  # V13.1: skip connection removed
                     stoich_pred_for_reinforce=None,
                     tc_class_logits=tc_class_logits,  # V12.28
                     n_elements=elem_mask.bool().sum(dim=1),  # V12.34
@@ -4540,7 +4532,7 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
                     element_mask=elem_mask[sc_mask],
                     element_count_pred=element_count_pred[sc_mask] if element_count_pred is not None else None,
                     z=z[sc_mask],
-                    encoder_skip=attended_input[sc_mask],
+                    encoder_skip=None,  # V13.1: skip connection removed
                     stoich_pred_for_reinforce=stoich_pred[sc_mask] if stoich_pred is not None else None,
                     tc_class_logits=tc_class_logits[sc_mask] if tc_class_logits is not None else None,  # V12.28
                     n_elements=elem_mask[sc_mask].bool().sum(dim=1),  # V12.34
@@ -4567,7 +4559,7 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
                     element_mask=elem_mask[~sc_mask],
                     element_count_pred=element_count_pred[~sc_mask] if element_count_pred is not None else None,
                     z=None,  # No REINFORCE for non-SC
-                    encoder_skip=attended_input[~sc_mask],
+                    encoder_skip=None,  # V13.1: skip connection removed
                     stoich_pred_for_reinforce=None,
                     tc_class_logits=tc_class_logits[~sc_mask] if tc_class_logits is not None else None,  # V12.28
                     n_elements=elem_mask[~sc_mask].bool().sum(dim=1),  # V12.34
@@ -5417,7 +5409,7 @@ def train():
             wb = [b.to(device) for b in warmup_batch]
             elem_idx, elem_frac, elem_mask, tokens, tc, magpie = wb[0], wb[1], wb[2], wb[3], wb[4], wb[5]
             enc_out = encoder(elem_idx, elem_frac, elem_mask, magpie, tc)
-            _ = decoder(enc_out['z'], tokens, encoder_skip=enc_out['attended_input'])
+            _ = decoder(enc_out['z'], tokens)  # V13.1: no skip connection
         torch.cuda.synchronize()
         encoder.train()
         decoder.train()
