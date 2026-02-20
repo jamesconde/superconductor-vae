@@ -4,7 +4,47 @@ Chronological record of training runs, architecture changes, and optimization de
 
 ---
 
-## V13.1c: Reduce Auxiliary Loss Weights — Prioritize Formula CE (2026-02-19)
+## Restore Auxiliary Loss Weights to Full Strength + Remove Dead Code (2026-02-19)
+
+### Problem: V13.1c Weight Reductions Caused 0-10K Tc R² Collapse
+
+V13.1c (below) reduced `sc_loss_weight`, `tc_class_weight`, and `hp_loss_weight` to avoid gradient competition with formula CE. By epoch 3756, the consequences were clear:
+
+- **0-10K Tc R²**: 0.9999 (V12.41, epoch 3293) → **-57.8** (V13.0, epoch 3756) → **-93.4** (epoch 3760)
+- All other Tc bins remained excellent (10-30K: 0.999, 30-77K: 0.999, 77-120K: 0.995)
+- Non-SC Tc MAE: 2.29 in normalized space (terrible — model can't distinguish Tc=0 from Tc=5K)
+
+The root cause: starving the SC classification head (0.5→0.1) removed the encoder's primary signal for distinguishing non-SC (Tc=0) from low-Tc SC samples in z-space. The Tc regression loss alone has weak gradients near Tc=0 (Kelvin weighting gives 1.0x at Tc=0, vs 6x at 100K). Without explicit SC/non-SC classification pressure, the encoder stops encoding this distinction. The `tc_class_weight` reduction (4.0→0.5) compounded the problem — the bucket classification head that explicitly distinguished "Tc=0" from "Tc=0-10K" lost 87.5% of its gradient.
+
+### Solution: Full Weight (1.0) for All Three
+
+| Weight | V13.1c | Restored | Reasoning |
+|--------|--------|----------|-----------|
+| `hp_loss_weight` | 0.1 | **1.0** | Material property mastery — let loss self-regulate |
+| `sc_loss_weight` | 0.1 | **1.0** | SC/non-SC distinction critical for Tc=0 encoding |
+| `tc_class_weight` | 0.5 | **1.0** | Tc bucket classification guides z-space structure |
+
+### Philosophy Correction
+
+V13.1c's philosophy ("reduce auxiliaries to avoid gradient competition") was wrong for this system. These losses already self-regulate through their own mechanisms — Huber clipping, focal weighting, bin-specific multipliers. Artificially throttling them starved the encoder of supervision it needs. The correct approach: **let full gradient flow**. If exact match dips temporarily while the encoder re-learns proper z-space structure, that's the correct tradeoff for a system whose end goal is generative discovery, not string reconstruction.
+
+### Dead Code Removal
+
+Also removed two dead loss components that were producing zero-value log entries:
+
+- **Numden (ND)**: Head was removed in V13.0 (fractions are now single semantic tokens), but the parameter, loss computation (`tensor(0.0)`), accumulator, and `ND: 0.0000` log line all remained. Fully removed from `CombinedLossWithREINFORCE`, `train_epoch()`, CSV logging, and epoch output. Also removed all V12.x backward-compat stoich assembly branches.
+- **Contrastive (Con)**: Weight was 0.0 since V12.26 (~1000 epochs ago — "plateaued at 5.06, consuming 16% of gradient budget"). Removed import, loss function creation, warmup computation, and `Con: 0.0000 (w=0.000)` log line. Kept `contrastive_mode: True` config flag (controls SC/non-SC dataset loading). SC/nSC exact match reporting is now unconditional.
+
+Net result: -156 lines, +33 lines. Cleaner logs, no more always-zero metrics.
+
+---
+
+## ~~V13.1c: Reduce Auxiliary Loss Weights — Prioritize Formula CE (2026-02-19)~~ SUPERSEDED
+
+**SUPERSEDED**: This change was reversed (see above). The weight reductions caused 0-10K Tc R² to collapse from 0.9999 to -93. Weights restored to 1.0.
+
+<details>
+<summary>Original rationale (kept for historical context)</summary>
 
 ### Problem
 
@@ -30,6 +70,8 @@ Reduce auxiliary weights to make them true auxiliaries (gentle guidance, not gra
 ### Philosophy
 
 These classifier heads exist to guide z-space organization, not to dominate training. At reduced weights, they still provide useful gradient signal (SC clustering, family separation, Tc ordering) without competing with formula reconstruction. The model should master formulas first — auxiliary structure follows naturally.
+
+</details>
 
 ---
 
