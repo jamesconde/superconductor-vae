@@ -90,10 +90,6 @@ from superconductor.training.entropy_maintenance import (
     EntropyManager, create_entropy_manager, EntropyConfig
 )
 
-# V12.12: Contrastive learning for SC vs non-SC separation
-from superconductor.losses.contrastive import (
-    SuperconductorContrastiveLoss, category_to_label
-)
 from torch.utils.data import WeightedRandomSampler
 
 # V12.9: N-gram + Structural hybrid draft model for speculative decoding
@@ -455,15 +451,13 @@ TRAIN_CONFIG = {
     'tc_weight': 20.0,                # V12.26: 10→20, focus gradient on Tc accuracy for generation
     'magpie_weight': 2.0,
     'stoich_weight': 2.0,  # V12.4: Stoichiometry loss weight
-    # V13.0: numden_weight removed — numden_head and numden_loss eliminated.
-    # Fraction prediction now handled by decoder cross-entropy over semantic fraction tokens.
     # V12.41: Stoich conditioning teacher forcing — feed GT fractions to decoder
     # Breaks the vicious cycle: decoder ignored noisy stoich tokens → no gradient → head stays bad
     # 1.0 = always GT (decoder learns to use stoich tokens), 0.0 = always predicted
     'stoich_cond_tf': 1.0,  # Always use ground truth stoich conditioning during training
     'kl_weight': 0.0001,  # Now L2 regularization weight on z (deterministic encoder)
-    'hp_loss_weight': 0.1,   # V13.1b: 0.5→0.1, reduce gradient competition with formula CE
-    'sc_loss_weight': 0.1,   # V13.1b: 0.5→0.1, reduce gradient competition with formula CE
+    'hp_loss_weight': 1.0,   # V13.2: Full weight — mastery of material properties over per-token accuracy
+    'sc_loss_weight': 1.0,   # V13.2: Full weight — SC/non-SC distinction critical for Tc=0 encoding in z-space
 
     # V12.20: Tc loss improvements (log-transform + Huber)
     'tc_log_transform': True,   # Apply log1p(Tc) before z-score normalization (reduces skew 2.18→-0.17)
@@ -474,7 +468,7 @@ TRAIN_CONFIG = {
     'tc_relative_weight': 0.5,         # V12.24: Blend weight for relative error (0=pure Huber, 1=pure relative)
 
     # V12.28: Tc prediction improvements
-    'tc_class_weight': 0.5,     # V13.1b: 4.0→0.5, reduce gradient competition with formula CE
+    'tc_class_weight': 1.0,     # V13.2: Full weight — Tc bucket classification guides z-space structure for 0-10K region
     'tc_class_bins': [0, 10, 50, 100],  # Bin edges in Kelvin (creates 5 classes: 0, 0-10, 10-50, 50-100, 100+)
     'tc_bin_weights': {0: 1.0, 10: 1.5, 50: 2.0, 100: 2.5, 150: 3.0},  # Per-bin Tc loss multipliers
     'mc_dropout_samples': 10,   # MC Dropout forward passes at eval time
@@ -546,7 +540,6 @@ TRAIN_CONFIG = {
         # tc_loss: NEVER skip — core prediction capability
         'magpie_loss':     (0.1,   0.1),   # Magpie MSE ~0.06
         # stoich_loss: NEVER skip — directly feeds decoder conditioning
-        # V13.0: numden_loss removed (was "NEVER skip")
         'tc_class_loss':   (0.5,   0.2),   # Tc bucket classification (CE, V12.28)
         # --- External losses (computed in train_epoch) ---
         'physics_z_loss':  (0.5,   0.2),   # PhysZ ~0.32 at epoch 3056
@@ -642,17 +635,8 @@ TRAIN_CONFIG = {
     'disable_drop_detection': True,
 
     # =========================================================================
-    # V12.12: Contrastive Learning Settings
-    # =========================================================================
-    # Trains on 46K mixed SC + non-SC data with contrastive loss to:
-    # 1. Improve decoder on rare elements (more formula examples)
-    # 2. Separate SC vs non-SC in latent space
-    # 3. Cluster SC families together
-    # =========================================================================
-    'contrastive_mode': True,          # Enable contrastive training with non-SC data
-    'contrastive_weight': 0.0,         # V12.26: Disabled — plateaued at 5.06, consuming 16% of gradient budget
-    'contrastive_warmup_epochs': 100,  # Warm up contrastive loss over N epochs
-    'contrastive_temperature': 0.07,   # SupCon temperature (0.07 = standard)
+    # Contrastive dataset mode: loads 46K mixed SC + non-SC data
+    'contrastive_mode': True,          # Enable mixed SC/non-SC training data
     'non_sc_formula_weight': 0.5,      # Formula loss weight for non-SC samples (lower)
     'use_extended_labels': True,       # Use per-family labels (vs binary SC/non-SC)
     'balanced_sampling': True,         # Balanced sampling: ~50/50 SC/non-SC per batch
@@ -1951,7 +1935,6 @@ class CombinedLossWithREINFORCE(nn.Module):
         magpie_weight: float = 2.0,
         kl_weight: float = 0.0001,
         stoich_weight: float = 2.0,
-        numden_weight: float = 0.0,  # V13.0: Deprecated, kept for backward compat (always 0)
         entropy_weight: float = 0.01,
         n_samples_rloo: int = 2,
         temperature: float = 0.8,
@@ -1991,7 +1974,6 @@ class CombinedLossWithREINFORCE(nn.Module):
         self.magpie_weight = magpie_weight
         self.kl_weight = kl_weight
         self.stoich_weight = stoich_weight
-        self.numden_weight = 0.0  # V13.0: numden loss removed
         self.entropy_weight = entropy_weight
         self.n_samples_rloo = n_samples_rloo
         self.temperature = temperature
@@ -2547,10 +2529,6 @@ class CombinedLossWithREINFORCE(nn.Module):
         tc_class_logits: torch.Tensor = None,
         # V12.34: Element count for per-sample weighting (D)
         n_elements: torch.Tensor = None,
-        # V12.38: Numerator/denominator loss inputs
-        numden_pred: torch.Tensor = None,           # [batch, 24]
-        element_num_log: torch.Tensor = None,       # [batch, 12] log1p(numerator) targets
-        element_den_log: torch.Tensor = None,       # [batch, 12] log1p(denominator) targets
         # V12.43: Constraint zoo inputs
         element_indices: torch.Tensor = None,       # [batch, max_elements] atomic numbers (for A3, A6)
         family_predictions: torch.Tensor = None,    # [batch, 14] composed family probs (for B-constraints)
@@ -2738,9 +2716,6 @@ class CombinedLossWithREINFORCE(nn.Module):
                 element_count_target = element_mask.sum(dim=1).float()
                 element_count_loss = F.mse_loss(element_count_pred, element_count_target)
 
-        # V13.0: numden_loss removed — fraction prediction handled by decoder CE over semantic tokens
-        numden_loss = torch.tensor(0.0, device=formula_logits.device)
-
         # 7a. V12.43: Constraint Zoo differentiable losses (A3, A5, A6)
         constraint_zoo_loss = torch.tensor(0.0, device=formula_logits.device)
         a5_z_mse = torch.tensor(0.0, device=formula_logits.device)
@@ -2802,7 +2777,6 @@ class CombinedLossWithREINFORCE(nn.Module):
             magpie_w * magpie_loss +
             self.kl_weight * kl_loss +
             self.stoich_weight * stoich_loss +
-            # V13.0: numden_loss removed (was self.numden_weight * numden_loss)
             0.5 * element_count_loss +
             self.tc_class_weight * tc_class_loss +  # V12.28: Tc bucket classification
             self._constraint_zoo_weight * constraint_zoo_loss  # V12.43: Constraint zoo
@@ -2835,7 +2809,6 @@ class CombinedLossWithREINFORCE(nn.Module):
             'tc_loss': tc_loss,
             'magpie_loss': magpie_loss,
             'stoich_loss': stoich_loss,
-            'numden_loss': numden_loss,  # V12.38
             'kl_loss': kl_loss,
             'tc_class_loss': tc_class_loss,  # V12.28
             'z_norm_penalty': z_norm_penalty,  # V12.34
@@ -3022,20 +2995,11 @@ def cache_z_vectors(encoder, loader, device, epoch, cache_path, dataset_info=Non
             all_target_tokens.append(tokens.cpu())
 
             if include_predictions:
-                # V12.38/V13.0: Assemble stoich_pred for decoder generation
+                # Assemble stoich_pred for decoder generation: fractions(12) + count(1) = 13 dims
                 _frac = encoder_out.get('fraction_pred')
                 _ecount = encoder_out.get('element_count_pred')
-                _ndpred = encoder_out.get('numden_pred')
                 if _frac is not None and _ecount is not None:
-                    _use_semantic = TRAIN_CONFIG.get('use_semantic_fractions', False)
-                    if _use_semantic:
-                        # V13.0: 13-dim stoich = fractions(12) + count(1)
-                        _stoich = torch.cat([_frac, _ecount.unsqueeze(-1)], dim=-1)
-                    elif _ndpred is not None:
-                        _stoich = torch.cat([_frac, _ndpred, _ecount.unsqueeze(-1)], dim=-1)
-                    else:
-                        _ndpad = torch.zeros(_frac.shape[0], 24, device=_frac.device, dtype=_frac.dtype)
-                        _stoich = torch.cat([_frac, _ndpad, _ecount.unsqueeze(-1)], dim=-1)
+                    _stoich = torch.cat([_frac, _ecount.unsqueeze(-1)], dim=-1)
                 else:
                     _stoich = None
 
@@ -3254,9 +3218,8 @@ def log_training_metrics(epoch, metrics, log_path, true_eval=None):
         'algo_version',  # V12.38: Track which algorithm version produced this row
         'epoch', 'exact_match', 'accuracy', 'loss', 'tc_loss', 'magpie_loss',
         'stoich_loss', 'rl_loss', 'reward', 'entropy', 'entropy_weight',
-        'z_norm', 'tf_ratio', 'contrastive_loss', 'hp_loss', 'sc_loss',
+        'z_norm', 'tf_ratio', 'hp_loss', 'sc_loss',
         'theory_loss',  # V12.22
-        'numden_loss',  # V12.38
         'true_exact', 'epoch_time', 'timestamp'
     ]
 
@@ -3276,11 +3239,9 @@ def log_training_metrics(epoch, metrics, log_path, true_eval=None):
         'entropy_weight': metrics.get('entropy_weight', 0),  # Set by train() if entropy_manager exists
         'z_norm': metrics.get('z_norm', 0),
         'tf_ratio': metrics.get('tf_ratio', 0),
-        'contrastive_loss': metrics.get('contrastive_loss', 0),
         'hp_loss': metrics.get('hp_loss', 0),
         'sc_loss': metrics.get('sc_loss', 0),
         'theory_loss': metrics.get('theory_loss', 0),  # V12.22
-        'numden_loss': metrics.get('numden_loss', 0),  # V12.38
         'true_exact': true_eval['true_exact_match'] if true_eval else '',
         'epoch_time': metrics.get('epoch_time', 0),
         'timestamp': datetime.datetime.now().isoformat(),
@@ -3657,18 +3618,9 @@ def evaluate_true_autoregressive(encoder, decoder, loader, device, max_samples=1
         fraction_pred = encoder_out.get('fraction_pred')
         element_count_pred = encoder_out.get('element_count_pred')
 
-        # V12.38/V13.0: Assemble stoich_pred for decoder generation
-        numden_pred_eval = encoder_out.get('numden_pred')
+        # Assemble stoich_pred for decoder generation: fractions(12) + count(1) = 13 dims
         if fraction_pred is not None and element_count_pred is not None:
-            use_semantic_eval = TRAIN_CONFIG.get('use_semantic_fractions', False)
-            if use_semantic_eval:
-                # V13.0: 13-dim stoich = fractions(12) + count(1)
-                stoich_pred_eval = torch.cat([fraction_pred, element_count_pred.unsqueeze(-1)], dim=-1)
-            elif numden_pred_eval is not None:
-                stoich_pred_eval = torch.cat([fraction_pred, numden_pred_eval, element_count_pred.unsqueeze(-1)], dim=-1)
-            else:
-                numden_pad = torch.zeros(batch_size, 24, device=device, dtype=fraction_pred.dtype)
-                stoich_pred_eval = torch.cat([fraction_pred, numden_pad, element_count_pred.unsqueeze(-1)], dim=-1)
+            stoich_pred_eval = torch.cat([fraction_pred, element_count_pred.unsqueeze(-1)], dim=-1)
         else:
             stoich_pred_eval = None
 
@@ -4154,7 +4106,7 @@ def evaluate_true_autoregressive(encoder, decoder, loader, device, max_samples=1
 def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, device, use_amp,
                 tf_ratio=1.0, tc_weight=10.0, magpie_weight=2.0,
                 focal_loss_fn=None, amp_dtype=torch.float16, accumulation_steps=1,
-                contrastive_loss_fn=None, contrastive_weight=0.0, non_sc_formula_weight=0.5,
+                non_sc_formula_weight=0.5,
                 selective_backprop=False, selective_backprop_threshold=0.33,
                 enable_timing=True, hp_loss_weight=0.0, sc_loss_weight=0.0,
                 theory_loss_fn=None, theory_weight=0.0, norm_stats=None,
@@ -4167,7 +4119,6 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
     V12.8: Added amp_dtype for configurable mixed precision (bfloat16/float16)
            Added accumulation_steps for gradient accumulation (larger effective batch)
            Added REINFORCE support via CombinedLossWithREINFORCE
-    V12.12: Added contrastive loss for mixed SC/non-SC training
     V12.12: Added selective backpropagation - skip backward on easy batches
     V12.15: Added enable_timing for compute/time profiling
     V12.19: Added hp_loss_weight for high-pressure prediction head
@@ -4202,7 +4153,6 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
     total_reward = 0
     total_entropy = 0
     total_z_norm = 0
-    total_contrastive = 0
     total_hp_loss = 0  # V12.19
     total_sc_loss = 0  # V12.21
     total_theory_loss = 0  # V12.22
@@ -4210,7 +4160,6 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
     total_stop_loss = 0  # V12.30
     total_physics_z_loss = 0  # V12.31
     total_family_loss = 0  # V12.32
-    total_numden_loss = 0  # V12.38
     total_constraint_zoo_loss = 0  # V12.43
     total_a5_z_mse = 0  # V12.43
     total_a5_tc_mse = 0  # V12.43
@@ -4246,14 +4195,13 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
         if timing:
             timing.stop('data_load')
 
-        # V12.38: Unpack up to 13 tensors (6 original + is_sc + label + hp + family + num_log + den_log [+ comp_targets])
+        # Unpack batch tensors (6 original + is_sc + label + hp + family [+ comp_targets])
         batch_tensors = [b.to(device) for b in batch]
         elem_idx, elem_frac, elem_mask, tokens, tc, magpie, is_sc, labels = batch_tensors[:8]
         hp_labels = batch_tensors[8] if len(batch_tensors) > 8 else torch.zeros_like(is_sc, dtype=torch.float32)
         family_labels = batch_tensors[9] if len(batch_tensors) > 9 else None
-        elem_num_log_batch = batch_tensors[10] if len(batch_tensors) > 10 else None  # V12.38
-        elem_den_log_batch = batch_tensors[11] if len(batch_tensors) > 11 else None  # V12.38
-        comp_targets = batch_tensors[12] if len(batch_tensors) > 12 else None  # V12.31 (index shifted)
+        # Indices 10, 11 were numden tensors (removed in V13.0) — skip to comp_targets
+        comp_targets = batch_tensors[12] if len(batch_tensors) > 12 else None
 
         sc_mask = is_sc.bool()  # True = superconductor
 
@@ -4289,40 +4237,19 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
             # V12.28: Tc classification logits
             tc_class_logits = encoder_out.get('tc_class_logits')
 
-            # Stoichiometry predictions for loss and conditioning
+            # Stoichiometry predictions for loss and conditioning: fractions(12) + count(1) = 13 dims
             fraction_pred = encoder_out.get('fraction_pred')
             element_count_pred = encoder_out.get('element_count_pred')
-            numden_pred = encoder_out.get('numden_pred')  # V13.0: always None
             if fraction_pred is not None and element_count_pred is not None:
-                # V13.0: Simplified stoich_pred — fractions(12) + count(1) = 13 dims
-                # numden removed (implicit in semantic fraction tokens)
-                use_semantic = TRAIN_CONFIG.get('use_semantic_fractions', False)
-                if use_semantic:
-                    pred_stoich = torch.cat([fraction_pred, element_count_pred.unsqueeze(-1)], dim=-1)  # [batch, 13]
+                pred_stoich = torch.cat([fraction_pred, element_count_pred.unsqueeze(-1)], dim=-1)  # [batch, 13]
 
-                    # V12.41/V13.0: Stoich conditioning teacher forcing
-                    if stoich_cond_tf > 0:
-                        gt_count = elem_mask.sum(dim=1).float()
-                        gt_stoich = torch.cat([elem_frac, gt_count.unsqueeze(-1)], dim=-1)  # [batch, 13]
-                        stoich_pred = stoich_cond_tf * gt_stoich + (1.0 - stoich_cond_tf) * pred_stoich
-                    else:
-                        stoich_pred = pred_stoich
+                # Stoich conditioning teacher forcing
+                if stoich_cond_tf > 0:
+                    gt_count = elem_mask.sum(dim=1).float()
+                    gt_stoich = torch.cat([elem_frac, gt_count.unsqueeze(-1)], dim=-1)  # [batch, 13]
+                    stoich_pred = stoich_cond_tf * gt_stoich + (1.0 - stoich_cond_tf) * pred_stoich
                 else:
-                    # V12.x backward compat: 37-dim stoich with numden
-                    if numden_pred is not None:
-                        pred_stoich = torch.cat([fraction_pred, numden_pred, element_count_pred.unsqueeze(-1)], dim=-1)
-                    else:
-                        numden_pad = torch.zeros(fraction_pred.shape[0], 24,
-                                                 device=fraction_pred.device, dtype=fraction_pred.dtype)
-                        pred_stoich = torch.cat([fraction_pred, numden_pad, element_count_pred.unsqueeze(-1)], dim=-1)
-
-                    if stoich_cond_tf > 0 and elem_num_log_batch is not None and elem_den_log_batch is not None:
-                        gt_numden = torch.cat([elem_num_log_batch, elem_den_log_batch], dim=-1)
-                        gt_count = elem_mask.sum(dim=1).float()
-                        gt_stoich = torch.cat([elem_frac, gt_numden, gt_count.unsqueeze(-1)], dim=-1)
-                        stoich_pred = stoich_cond_tf * gt_stoich + (1.0 - stoich_cond_tf) * pred_stoich
-                    else:
-                        stoich_pred = pred_stoich
+                    stoich_pred = pred_stoich
             else:
                 stoich_pred = None
 
@@ -4360,11 +4287,6 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
                     stop_bce = stop_bce * position_weights
                 # Apply mask and average
                 stop_loss_val = (stop_bce * stop_mask).sum() / stop_mask.sum().clamp(min=1)
-
-            # V12.12: Contrastive loss on full batch (SC + non-SC)
-            contrastive_loss_val = torch.tensor(0.0, device=device)
-            if contrastive_loss_fn is not None and contrastive_weight > 0:
-                contrastive_loss_val = contrastive_loss_fn(z, labels)
 
             # V12.19: High-pressure prediction loss (only on SC samples)
             hp_loss_val = torch.tensor(0.0, device=device)
@@ -4487,13 +4409,10 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
                     stoich_pred_for_reinforce=stoich_pred,
                     tc_class_logits=tc_class_logits,  # V12.28
                     n_elements=elem_mask.bool().sum(dim=1),  # V12.34
-                    numden_pred=numden_pred,  # V12.38
-                    element_num_log=elem_num_log_batch,  # V12.38
-                    element_den_log=elem_den_log_batch,  # V12.38
                     element_indices=elem_idx,  # V12.43: For A3, A6 constraints
                     family_predictions=encoder_out.get('family_composed_14'),  # V12.43: For B-constraints
                 )
-                loss = (loss_dict['total'] + contrastive_weight * contrastive_loss_val
+                loss = (loss_dict['total']
                         + hp_loss_weight * hp_loss_val
                         + sc_loss_weight * sc_loss_val
                         + theory_weight * theory_loss_val
@@ -4522,14 +4441,11 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
                     stoich_pred_for_reinforce=None,
                     tc_class_logits=tc_class_logits,  # V12.28
                     n_elements=elem_mask.bool().sum(dim=1),  # V12.34
-                    numden_pred=numden_pred,  # V12.38
-                    element_num_log=elem_num_log_batch,  # V12.38
-                    element_den_log=elem_den_log_batch,  # V12.38
                     element_indices=elem_idx,  # V12.43: For A3, A6 constraints
                     family_predictions=encoder_out.get('family_composed_14'),  # V12.43
                 )
                 # Scale formula loss by non_sc_formula_weight
-                loss = (non_sc_formula_weight * loss_dict['total'] + contrastive_weight * contrastive_loss_val
+                loss = (non_sc_formula_weight * loss_dict['total']
                         + sc_loss_weight * sc_loss_val
                         + theory_weight * theory_loss_val
                         + stop_loss_weight * stop_loss_val
@@ -4562,9 +4478,6 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
                     stoich_pred_for_reinforce=stoich_pred[sc_mask] if stoich_pred is not None else None,
                     tc_class_logits=tc_class_logits[sc_mask] if tc_class_logits is not None else None,  # V12.28
                     n_elements=elem_mask[sc_mask].bool().sum(dim=1),  # V12.34
-                    numden_pred=numden_pred[sc_mask] if numden_pred is not None else None,  # V12.38
-                    element_num_log=elem_num_log_batch[sc_mask] if elem_num_log_batch is not None else None,  # V12.38
-                    element_den_log=elem_den_log_batch[sc_mask] if elem_den_log_batch is not None else None,  # V12.38
                     element_indices=elem_idx[sc_mask],  # V12.43
                     family_predictions=_family_preds[sc_mask] if _family_preds is not None else None,  # V12.43
                 )
@@ -4589,9 +4502,6 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
                     stoich_pred_for_reinforce=None,
                     tc_class_logits=tc_class_logits[~sc_mask] if tc_class_logits is not None else None,  # V12.28
                     n_elements=elem_mask[~sc_mask].bool().sum(dim=1),  # V12.34
-                    numden_pred=numden_pred[~sc_mask] if numden_pred is not None else None,  # V12.38
-                    element_num_log=elem_num_log_batch[~sc_mask] if elem_num_log_batch is not None else None,  # V12.38
-                    element_den_log=elem_den_log_batch[~sc_mask] if elem_den_log_batch is not None else None,  # V12.38
                     element_indices=elem_idx[~sc_mask],  # V12.43
                     family_predictions=_family_preds[~sc_mask] if _family_preds is not None else None,  # V12.43
                 )
@@ -4603,7 +4513,6 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
                 loss_dict = sc_loss_dict  # Use SC metrics for logging
                 loss = (sc_frac * sc_loss_dict['total'] +
                         non_sc_frac * non_sc_formula_weight * non_sc_loss_dict['total'] +
-                        contrastive_weight * contrastive_loss_val +
                         hp_loss_weight * hp_loss_val +
                         sc_loss_weight * sc_loss_val +
                         theory_weight * theory_loss_val +
@@ -4708,7 +4617,6 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
         total_reinforce += loss_dict['reinforce_loss'].item()
         total_reward += loss_dict['mean_reward'].item() if torch.is_tensor(loss_dict['mean_reward']) else loss_dict['mean_reward']
         total_entropy += loss_dict['entropy'].item()
-        total_contrastive += contrastive_loss_val.item() if torch.is_tensor(contrastive_loss_val) else contrastive_loss_val
         total_hp_loss += hp_loss_val.item() if torch.is_tensor(hp_loss_val) else hp_loss_val
         total_sc_loss += sc_loss_val.item() if torch.is_tensor(sc_loss_val) else sc_loss_val  # V12.21
         total_theory_loss += theory_loss_val.item() if torch.is_tensor(theory_loss_val) else theory_loss_val  # V12.22
@@ -4716,7 +4624,6 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
         total_stop_loss += stop_loss_val.item() if torch.is_tensor(stop_loss_val) else stop_loss_val  # V12.30
         total_physics_z_loss += physics_z_loss_val.item() if torch.is_tensor(physics_z_loss_val) else physics_z_loss_val  # V12.31
         total_family_loss += family_loss_val.item() if torch.is_tensor(family_loss_val) else family_loss_val  # V12.32
-        total_numden_loss += loss_dict.get('numden_loss', torch.tensor(0.0)).item()  # V12.38
         total_constraint_zoo_loss += loss_dict.get('constraint_zoo_loss', torch.tensor(0.0)).item()  # V12.43
         total_a5_z_mse += loss_dict.get('a5_z_mse', torch.tensor(0.0)).item()  # V12.43
         total_a5_tc_mse += loss_dict.get('a5_tc_mse', torch.tensor(0.0)).item()  # V12.43
@@ -4763,11 +4670,10 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
             'loss': float('nan'), 'accuracy': 0, 'exact_match': 0,
             'tc_loss': 0, 'magpie_loss': 0, 'stoich_loss': 0,
             'reinforce_loss': 0, 'mean_reward': 0, 'entropy': 0,
-            'contrastive_loss': 0, 'hp_loss': 0, 'sc_loss': 0, 'theory_loss': 0,
+            'hp_loss': 0, 'sc_loss': 0, 'theory_loss': 0,
             'stop_loss': 0,  # V12.30
             'physics_z_loss': 0,  # V12.31
             'family_loss': 0,  # V12.32
-            'numden_loss': 0,  # V12.38
             'z_norm': 0, 'n_skipped': n_skipped, 'n_total_batches': 0,
         }
 
@@ -4781,7 +4687,6 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
         'reinforce_loss': total_reinforce / n_batches,
         'mean_reward': total_reward / n_batches,
         'entropy': total_entropy / n_batches,
-        'contrastive_loss': total_contrastive / n_batches,
         'hp_loss': total_hp_loss / n_batches,  # V12.19
         'sc_loss': total_sc_loss / n_batches,  # V12.21
         'theory_loss': total_theory_loss / n_batches,  # V12.22
@@ -4789,7 +4694,6 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
         'stop_loss': total_stop_loss / n_batches,  # V12.30
         'physics_z_loss': total_physics_z_loss / n_batches,  # V12.31
         'family_loss': total_family_loss / n_batches,  # V12.32
-        'numden_loss': total_numden_loss / n_batches,  # V12.38
         'constraint_zoo_loss': total_constraint_zoo_loss / n_batches,  # V12.43
         'a5_z_mse': total_a5_z_mse / n_batches,  # V12.43
         'a5_tc_mse': total_a5_tc_mse / n_batches,  # V12.43
@@ -4925,7 +4829,6 @@ def train():
         tc_weight=TRAIN_CONFIG['tc_weight'],
         magpie_weight=TRAIN_CONFIG['magpie_weight'],
         stoich_weight=TRAIN_CONFIG['stoich_weight'],
-        numden_weight=0.0,  # V13.0: numden loss removed
         kl_weight=TRAIN_CONFIG['kl_weight'],
         entropy_weight=TRAIN_CONFIG.get('entropy_weight', 0.01),
         n_samples_rloo=TRAIN_CONFIG.get('n_samples_rloo', 2),
@@ -5020,16 +4923,6 @@ def train():
     if TRAIN_CONFIG.get('constraint_zoo_enabled', False):
         loss_fn.set_constraint_zoo(encoder, decoder, TRAIN_CONFIG,
                                     v13_tokenizer=v13_tokenizer)
-
-    # V12.12: Create contrastive loss function
-    contrastive_loss_fn = None
-    if TRAIN_CONFIG.get('contrastive_mode', False):
-        contrastive_loss_fn = SuperconductorContrastiveLoss(
-            temperature=TRAIN_CONFIG.get('contrastive_temperature', 0.07),
-        ).to(device)
-        print(f"Contrastive Loss: Enabled (weight={TRAIN_CONFIG['contrastive_weight']}, "
-              f"temp={TRAIN_CONFIG['contrastive_temperature']}, "
-              f"warmup={TRAIN_CONFIG['contrastive_warmup_epochs']} epochs)")
 
     # V12.16: Create consistency and theory loss functions
     consistency_loss_fn = None
@@ -5283,7 +5176,6 @@ def train():
     print(f"  Flash SDPA: {TRAIN_CONFIG.get('enable_flash_sdp', True)}")
     print(f"  torch.compile: {TRAIN_CONFIG.get('use_torch_compile', False)}")
     print(f"  Gradient checkpointing: {TRAIN_CONFIG.get('use_gradient_checkpointing', False)}")
-    print(f"  Contrastive mode: {TRAIN_CONFIG.get('contrastive_mode', False)}")
     print(f"  Selective backprop: {TRAIN_CONFIG.get('selective_backprop', False)} "
           f"(threshold={TRAIN_CONFIG.get('selective_backprop_threshold', 0.33)})")
     print(f"  Z-caching: {TRAIN_CONFIG.get('cache_z_vectors', False)} "
@@ -5296,7 +5188,6 @@ def train():
           (" [log1p]" if TRAIN_CONFIG.get('tc_log_transform', False) else ""))
     print(f"  Magpie: {TRAIN_CONFIG['magpie_weight']}")
     print(f"  Stoich: {TRAIN_CONFIG['stoich_weight']}")
-    print(f"  NumDen: {TRAIN_CONFIG.get('numden_weight', 1.0)}")  # V12.38
     print(f"  HP: {TRAIN_CONFIG.get('hp_loss_weight', 0)}")
     print(f"  SC: {TRAIN_CONFIG.get('sc_loss_weight', 0)}")
     print(f"  Family: {TRAIN_CONFIG.get('family_classifier_weight', 0)} "  # V12.33
@@ -5469,7 +5360,6 @@ def train():
         'tc_loss':        (None, None),      # Local var: tc_weight (curriculum)
         'magpie_loss':    (None, None),      # Local var: magpie_weight (curriculum)
         'stoich_loss':    (loss_fn, 'stoich_weight'),
-        'numden_loss':    (loss_fn, 'numden_weight'),
         'tc_class_loss':  (loss_fn, 'tc_class_weight'),
         'physics_z_loss': (None, None),      # Local var: effective_physics_z_weight
         'hp_loss':        (None, None),      # Local var via TRAIN_CONFIG (read inside train_epoch)
@@ -5693,14 +5583,7 @@ def train():
                 else:
                     # Not converged — always compute at full weight
                     setattr(obj, attr, state['base_weight'])
-        # V12.12: Compute contrastive weight with warmup
-        effective_contrastive_weight = 0.0
-        if contrastive_loss_fn is not None:
-            warmup_epochs = TRAIN_CONFIG.get('contrastive_warmup_epochs', 100)
-            warmup_progress = min(1.0, epoch / max(warmup_epochs, 1))
-            effective_contrastive_weight = TRAIN_CONFIG['contrastive_weight'] * warmup_progress
-
-        # V12.22: Compute theory weight with warmup (like contrastive warmup)
+        # V12.22: Compute theory weight with warmup
         effective_theory_weight = 0.0
         if theory_loss_fn is not None:
             theory_warmup = TRAIN_CONFIG.get('theory_warmup_epochs', 50)
@@ -5724,7 +5607,7 @@ def train():
         epoch_family_loss_weight = TRAIN_CONFIG.get('family_classifier_weight', 0.0)
 
         # V12.40: Zero local-var weights for skipped losses (must be AFTER warmup computations)
-        # Note: tc_loss, stoich_loss, numden_loss are NEVER skipped (removed from schedule)
+        # Note: tc_loss, stoich_loss are NEVER skipped
         if loss_skip_enabled and losses_skipped_this_epoch:
             if 'magpie_loss' in losses_skipped_this_epoch:
                 magpie_weight = 0.0
@@ -5746,9 +5629,6 @@ def train():
             focal_loss_fn=focal_loss_fn,
             amp_dtype=amp_dtype,
             accumulation_steps=TRAIN_CONFIG.get('accumulation_steps', 1),
-            # V12.12: Contrastive learning
-            contrastive_loss_fn=contrastive_loss_fn,
-            contrastive_weight=effective_contrastive_weight,
             non_sc_formula_weight=TRAIN_CONFIG.get('non_sc_formula_weight', 0.5),
             # V12.12: Selective backpropagation
             selective_backprop=TRAIN_CONFIG.get('selective_backprop', False),
@@ -5896,7 +5776,6 @@ def train():
                     f"Acc: {metrics['accuracy']*100:.1f}% | Exact: {metrics['exact_match']*100:.1f}% | "
                     f"Tc: {metrics['tc_loss']:.4f} | Magpie: {metrics['magpie_loss']:.4f} | "
                     f"Stoich: {metrics['stoich_loss']:.4f} | "
-                    f"ND: {metrics.get('numden_loss', 0):.4f} | "
                     f"sTF: {TRAIN_CONFIG.get('stoich_cond_tf', 1.0):.1f} | "
                     f"zN: {metrics['z_norm']:.1f}")
 
@@ -5918,13 +5797,11 @@ def train():
         if non_rl_skipped:
             base_msg += f" | Skip: {','.join(k.replace('_loss','') for k in sorted(non_rl_skipped))}"
 
-        # V12.12: Add contrastive metrics if enabled
-        if contrastive_loss_fn is not None:
-            base_msg += f" | Con: {metrics.get('contrastive_loss', 0):.4f} (w={effective_contrastive_weight:.3f})"
-            if 'sc_exact_match' in metrics:
-                base_msg += f" | SC: {metrics['sc_exact_match']*100:.1f}%"
-            if 'non_sc_exact_match' in metrics:
-                base_msg += f" | nSC: {metrics['non_sc_exact_match']*100:.1f}%"
+        # SC/non-SC exact match breakdown
+        if 'sc_exact_match' in metrics:
+            base_msg += f" | SC: {metrics['sc_exact_match']*100:.1f}%"
+        if 'non_sc_exact_match' in metrics:
+            base_msg += f" | nSC: {metrics['non_sc_exact_match']*100:.1f}%"
 
         # V12.19: Show HP loss if enabled
         if TRAIN_CONFIG.get('hp_loss_weight', 0) > 0 and metrics.get('hp_loss', 0) > 0:
