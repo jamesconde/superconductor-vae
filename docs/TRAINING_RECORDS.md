@@ -4,6 +4,31 @@ Chronological record of training runs, architecture changes, and optimization de
 
 ---
 
+## Fix Checkpoint Overwrite Bug, Tc R² Evaluation, Disable Phase A/B (2026-02-19)
+
+### Checkpoint best_exact Overwrite Bug (3 fixes)
+
+When resuming with fresh optimizers (e.g., migrated checkpoint), `best_exact` was reset to 0.0 — causing every subsequent epoch to overwrite `checkpoint_best.pt` with a worse model. The 93.1% best checkpoint was destroyed by progressively worse models (78.7%→67.9%).
+
+**Fixes:**
+1. **Don't reset `best_exact` on fresh optimizer resume** — prior run's best_exact preserved
+2. **Sync `_shutdown_state` after checkpoint load** — interrupt saves now preserve correct best_exact/prev_exact (previously stayed at 0, destroying the value on Ctrl+C)
+3. **Sync optimizers to `_shutdown_state` after Phase A→B transition** — interrupt saves during Phase B no longer write stale Phase A optimizers
+
+### Tc R² Evaluation: Exclude Non-SC Samples
+
+Non-SC samples (Tc=0K) get `tc_weight_override=0.0` during training — the Tc regression loss is never computed for them. But R² evaluation included all ~23K non-SC in the 0-10K bin, measuring untrained noise. A 1.3-unit normalized error on non-SC maps to ~5K Kelvin error, giving R² ≈ -80 due to the tiny SS_tot in that bin.
+
+**Fix:** `sc_tc_mask = tc_true_kelvin > 0` — all R² and MAE metrics now SC-only. The 0-10K bin now contains only actual low-Tc superconductors. Log label changed to "Tc R² (SC-only):".
+
+### Disable Phase A/B (v13_phase: 'A' → None)
+
+Phase A/B was designed for the one-time V12→V13 vocabulary migration (4,212 new fraction embeddings needed warmup). But `v13_phase: 'A'` was hardcoded, causing **every Colab resume** to freeze the encoder for 10 epochs (Phase A), let the decoder adapt to static z, then unfreeze everything with fresh optimizers (Phase B). This deharmonized encoder/decoder on every restart, causing loss divergence (130→170+) as the encoder got hit by competing multi-task gradients with no Adam momentum history.
+
+Set `v13_phase=None` — encoder and decoder co-train normally from the start on all resumes.
+
+---
+
 ## Restore Auxiliary Loss Weights to Full Strength + Remove Dead Code (2026-02-19)
 
 ### Problem: V13.1c Weight Reductions Caused 0-10K Tc R² Collapse
