@@ -4,6 +4,53 @@ Chronological record of training runs, architecture changes, and optimization de
 
 ---
 
+## V13.1b: Phased PhysZ — Disable During CE Learning, Auto-Reactivate on Plateau (2026-02-19)
+
+### Problem
+
+PhysZ gradients compete with formula CE for z-space organization. During the V13.0→V13.1 Colab run (epochs 3596-3674), exact match climbed rapidly from 65%→85.5% but PhysZ loss grew unbounded (total loss: 12→14.9). At epoch 3667, PhysZ gradient pressure destabilized training: exact crashed 85.5%→82.5% in 7 epochs, Tc loss tripled (0.027→0.070), all losses spiked simultaneously.
+
+Root cause: PhysZ tries to reorganize z-space geometry while formula CE is actively learning to use z-space for reconstruction. The two objectives fight over the same 2048 dimensions. During rapid CE learning, PhysZ is counterproductive — the z-space will acquire implicit physics structure naturally through formula reconstruction (similar compositions cluster because they produce similar formulas).
+
+### Solution
+
+Phased training: master formula reconstruction first, then layer PhysZ on top.
+
+**Phase 1 (current):** `use_physics_z: False`. CE drives exact match to its ceiling uncontested.
+
+**Phase 2 (auto-triggered):** PhysZ scheduler detects exact match plateau and reactivates PhysZ with:
+- 20-epoch warmup ramp (existing `physics_z_warmup_epochs`)
+- Regression guard: monitors exact match after activation, halves PhysZ weight if exact drops >2% from activation baseline, pauses entirely if weight reaches floor (0.1)
+- Recovery: restores full PhysZ weight when exact recovers above baseline
+
+### PhysZ Scheduler Config
+```python
+'physics_z_auto_reactivate': True,
+'physics_z_reactivation_min_exact': 0.85,        # Need ≥85% before considering
+'physics_z_reactivation_window': 20,              # Plateau measured over 20 epochs
+'physics_z_reactivation_plateau_threshold': 0.005, # <0.5% improvement = plateau
+'physics_z_reactivation_force_exact': 0.95,       # Force at 95%
+'physics_z_regression_threshold': 0.02,           # 2% drop triggers weight reduction
+'physics_z_regression_check_interval': 5,         # Check every 5 epochs
+'physics_z_weight_floor': 0.1,                    # Pause below this
+```
+
+### Regression Guard Behavior
+```
+PhysZ activates (exact=88%) → warmup ramps over 20 epochs
+  epoch +10: exact=87.5% → still within 2% of 88%, OK
+  epoch +15: exact=85.5% → 2.5% below baseline → weight scale 1.0→0.5
+  epoch +20: exact=84.0% → still regressed → weight scale 0.5→0.25
+  epoch +25: exact=83.5% → weight 0.25→0.125 → below floor → PAUSED
+  --- or ---
+  epoch +15: exact=88.2% → recovered above baseline → weight scale restored to 1.0
+```
+
+### Key Insight
+Once formula reconstruction is mastered, z-space will already have implicit physics structure. PhysZ then refines rather than fights — gradients will be smaller and less disruptive.
+
+---
+
 ## V13.1: Remove Encoder Skip Connection (2026-02-19)
 
 ### Problem

@@ -707,12 +707,13 @@ TRAIN_CONFIG = {
     # Block 12 (512-2047) is unsupervised discovery space.
     # No architectural changes — physics enforced via loss gradient pressure.
     # =========================================================================
-    'use_physics_z': True,                    # Enable physics Z infrastructure
+    'use_physics_z': False,                   # V13.1: Disabled during formula reconstruction phase.
+                                               # Auto-reactivated by PhysZ scheduler when exact plateaus.
     'physics_z_comp_weight': 1.0,             # Block 8 compositional supervision
     'physics_z_magpie_weight': 0.5,           # Block 11 Magpie encoding
     'physics_z_consistency_weight': 0.1,      # GL/BCS/cobordism consistency
     'physics_z_direct_weight': 0.0,           # Direct supervision (placeholder)
-    'physics_z_warmup_epochs': 20,            # Ramp up physics Z losses
+    'physics_z_warmup_epochs': 20,            # Ramp up physics Z losses after (re)activation
     'physics_z_data_path': None,              # Path to optional physics data CSV
 
     # V12.36: Extended consistency losses for previously unsupervised blocks
@@ -722,6 +723,31 @@ TRAIN_CONFIG = {
     # Weight is deliberately lower than existing consistency (0.1) to avoid
     # over-constraining; these blocks have no external supervision data.
     'physics_z_new_consistency_weight': 0.05,
+
+    # V13.1: PhysZ auto-reactivation scheduler
+    # Strategy: Master formula reconstruction first, then add PhysZ regularization.
+    # PhysZ gradients compete with CE for z-space organization — enabling both during
+    # rapid CE learning causes destabilization (observed: 85.5%→82.5% crash at epoch 3667).
+    # Scheduler activates PhysZ only after exact match plateaus, with regression guard.
+    # Conditions (ALL must be true):
+    #   1. TF exact >= physics_z_reactivation_min_exact
+    #   2. Improvement over window < plateau threshold
+    #   3. OR TF exact >= force threshold (unconditional)
+    'physics_z_auto_reactivate': True,
+    'physics_z_reactivation_min_exact': 0.85,    # Don't activate below 85% TF exact
+    'physics_z_reactivation_window': 20,          # Epochs to measure plateau over
+    'physics_z_reactivation_plateau_threshold': 0.005,  # <0.5% improvement = plateau
+    'physics_z_reactivation_force_exact': 0.95,   # Force-activate at 95%
+
+    # V13.1: PhysZ regression guard
+    # After PhysZ activates, monitors exact match for regression. If exact drops
+    # by more than the threshold from the activation baseline, PhysZ weight is
+    # halved. Continues halving on each subsequent regression check until PhysZ
+    # weight reaches floor, then pauses PhysZ entirely. Exact recovery above
+    # baseline re-enables full PhysZ weight.
+    'physics_z_regression_threshold': 0.02,  # 2% drop from activation exact triggers reduction
+    'physics_z_regression_check_interval': 5,  # Check every 5 epochs (not every epoch — noisy)
+    'physics_z_weight_floor': 0.1,            # Minimum PhysZ weight before pausing entirely
 
     # =========================================================================
     # V12.34: Error-Driven Training Refinements
@@ -5465,6 +5491,13 @@ def train():
     rl_reactivated = TRAIN_CONFIG.get('rl_weight', 0.0) > 0  # Already active if weight > 0
     rl_exact_history = []  # Ring buffer of recent TF exact match values
 
+    # V13.1: PhysZ auto-reactivation state
+    physz_reactivated = TRAIN_CONFIG.get('use_physics_z', False)  # Already active if enabled
+    physz_exact_history = []  # TF exact history for plateau detection
+    physz_activation_exact = None  # Exact match when PhysZ was (re)activated — regression baseline
+    physz_current_weight_scale = 1.0  # Regression guard multiplier (1.0 = full, halved on regression)
+    physz_paused = False  # True if regression guard has paused PhysZ entirely
+
     for epoch in range(start_epoch, TRAIN_CONFIG['num_epochs']):
         _shutdown_state['epoch'] = epoch
 
@@ -5538,6 +5571,91 @@ def train():
                 print(f"  Reason: {_reason}")
                 print(f"{'='*70}\n", flush=True)
 
+        # V13.1: PhysZ auto-reactivation scheduler
+        # Phase 1: Activate PhysZ when exact match plateaus
+        if (not physz_reactivated and not physz_paused
+                and TRAIN_CONFIG.get('physics_z_auto_reactivate', False)
+                and epoch > start_epoch):
+            _pz_min = TRAIN_CONFIG.get('physics_z_reactivation_min_exact', 0.85)
+            _pz_force = TRAIN_CONFIG.get('physics_z_reactivation_force_exact', 0.95)
+            _pz_window = TRAIN_CONFIG.get('physics_z_reactivation_window', 20)
+            _pz_thresh = TRAIN_CONFIG.get('physics_z_reactivation_plateau_threshold', 0.005)
+
+            _pz_activate = False
+            _pz_reason = ""
+
+            # Force-activate at high exact
+            if prev_exact >= _pz_force:
+                _pz_activate = True
+                _pz_reason = f"TF exact {prev_exact*100:.1f}% >= force threshold {_pz_force*100:.0f}%"
+
+            # Plateau detection
+            elif prev_exact >= _pz_min and len(physz_exact_history) >= _pz_window:
+                _pz_window_start = physz_exact_history[-_pz_window]
+                _pz_improvement = prev_exact - _pz_window_start
+                if _pz_improvement < _pz_thresh:
+                    _pz_activate = True
+                    _pz_reason = (f"TF exact plateaued: {_pz_window_start*100:.1f}% → {prev_exact*100:.1f}% "
+                                  f"(+{_pz_improvement*100:.2f}%) over {_pz_window} epochs "
+                                  f"< {_pz_thresh*100:.1f}% threshold")
+
+            if _pz_activate:
+                # Enable physics Z and set intro epoch for warmup ramp
+                TRAIN_CONFIG['use_physics_z'] = True
+                physics_z_intro_epoch = epoch  # Warmup ramps from this epoch
+                physz_reactivated = True
+                physz_activation_exact = prev_exact  # Baseline for regression guard
+                physz_current_weight_scale = 1.0
+                # Create PhysZ loss function if not already created
+                if physics_z_loss_fn is None:
+                    from superconductor.losses.z_supervision_loss import PhysicsZLoss
+                    physics_z_config = {
+                        'comp_weight': TRAIN_CONFIG.get('physics_z_comp_weight', 1.0),
+                        'magpie_enc_weight': TRAIN_CONFIG.get('physics_z_magpie_weight', 0.5),
+                        'consistency_weight': TRAIN_CONFIG.get('physics_z_consistency_weight', 0.1),
+                        'direct_weight': TRAIN_CONFIG.get('physics_z_direct_weight', 0.0),
+                        'new_consistency_weight': TRAIN_CONFIG.get('physics_z_new_consistency_weight', 0.05),
+                        'magpie_dim': magpie_dim,
+                    }
+                    physics_z_loss_fn = PhysicsZLoss(physics_z_config).to(device)
+                print(f"\n{'='*70}")
+                print(f"  [PHYSZ SCHEDULER] Reactivating Physics Z supervision")
+                print(f"  Reason: {_pz_reason}")
+                print(f"  Baseline exact: {physz_activation_exact*100:.1f}%")
+                print(f"  Warmup: {TRAIN_CONFIG.get('physics_z_warmup_epochs', 20)} epochs from now")
+                print(f"{'='*70}\n", flush=True)
+
+        # V13.1: PhysZ regression guard — protect formula reconstruction
+        if physz_reactivated and not physz_paused and physz_activation_exact is not None:
+            _pz_reg_interval = TRAIN_CONFIG.get('physics_z_regression_check_interval', 5)
+            _pz_reg_thresh = TRAIN_CONFIG.get('physics_z_regression_threshold', 0.02)
+            _pz_weight_floor = TRAIN_CONFIG.get('physics_z_weight_floor', 0.1)
+            _pz_epochs_since_activation = epoch - physics_z_intro_epoch
+
+            if _pz_epochs_since_activation > 0 and _pz_epochs_since_activation % _pz_reg_interval == 0:
+                _pz_regression = physz_activation_exact - prev_exact
+                if _pz_regression > _pz_reg_thresh:
+                    # Exact has regressed — reduce PhysZ weight
+                    physz_current_weight_scale *= 0.5
+                    if physz_current_weight_scale < _pz_weight_floor:
+                        # Below floor — pause PhysZ entirely
+                        physz_paused = True
+                        physz_current_weight_scale = 0.0
+                        print(f"\n  [PHYSZ GUARD] PAUSED — exact {prev_exact*100:.1f}% dropped "
+                              f"{_pz_regression*100:.1f}% from activation baseline "
+                              f"{physz_activation_exact*100:.1f}% (below weight floor)", flush=True)
+                    else:
+                        print(f"\n  [PHYSZ GUARD] Reducing weight scale: {physz_current_weight_scale*2:.2f} → "
+                              f"{physz_current_weight_scale:.2f} (exact {prev_exact*100:.1f}% dropped "
+                              f"{_pz_regression*100:.1f}% from baseline {physz_activation_exact*100:.1f}%)", flush=True)
+                elif prev_exact >= physz_activation_exact:
+                    # Exact recovered or improved — restore full weight
+                    if physz_current_weight_scale < 1.0:
+                        print(f"  [PHYSZ GUARD] Exact recovered to {prev_exact*100:.1f}% "
+                              f"(>= baseline {physz_activation_exact*100:.1f}%) — "
+                              f"restoring full PhysZ weight", flush=True)
+                        physz_current_weight_scale = 1.0
+
         # Get curriculum weights for this epoch
         tc_weight, magpie_weight = get_curriculum_weights(epoch)
 
@@ -5590,12 +5708,13 @@ def train():
             effective_theory_weight = TRAIN_CONFIG['theory_weight'] * theory_warmup_prog
 
         # V12.31: Compute physics Z weight with warmup (relative to introduction epoch)
+        # V13.1: Apply regression guard scale on top of warmup ramp
         effective_physics_z_weight = 0.0
-        if physics_z_loss_fn is not None:
+        if physics_z_loss_fn is not None and not physz_paused:
             pz_warmup = TRAIN_CONFIG.get('physics_z_warmup_epochs', 20)
             pz_epochs_active = epoch - physics_z_intro_epoch
             pz_warmup_prog = min(1.0, pz_epochs_active / max(pz_warmup, 1))
-            effective_physics_z_weight = max(0.0, pz_warmup_prog)  # Clamp >=0
+            effective_physics_z_weight = max(0.0, pz_warmup_prog) * physz_current_weight_scale
 
         # V12.40: Set local-var weights for losses controlled outside loss_fn
         # These are set from config first, then zeroed if skipped
@@ -5718,8 +5837,9 @@ def train():
             prev_exact = metrics['exact_match']
         _shutdown_state['prev_exact'] = prev_exact  # V12.10: Keep shutdown state current
 
-        # V13.1: Track exact match history for RL reactivation plateau detection
+        # V13.1: Track exact match history for RL and PhysZ reactivation plateau detection
         rl_exact_history.append(metrics['exact_match'])
+        physz_exact_history.append(metrics['exact_match'])
 
         # V12.9: Update entropy manager with this epoch's metrics
         if entropy_manager is not None and TRAIN_CONFIG.get('rl_weight', 0.0) > 0:
