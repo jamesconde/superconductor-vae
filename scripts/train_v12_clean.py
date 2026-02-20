@@ -3910,20 +3910,28 @@ def evaluate_true_autoregressive(encoder, decoder, loader, device, max_samples=1
         else:
             tc_pred_kelvin = tc_denorm_p
         tc_pred_kelvin = np.clip(tc_pred_kelvin, 0, None)
-        # Overall Kelvin-space metrics
-        z_diagnostics['tc_r2_kelvin'] = float(
-            1 - np.sum((tc_pred_kelvin - tc_true_kelvin)**2) /
-            max(np.sum((tc_true_kelvin - tc_true_kelvin.mean())**2), 1e-8))
-        z_diagnostics['tc_mae_kelvin_overall'] = float(np.abs(tc_pred_kelvin - tc_true_kelvin).mean())
+        # SC-only mask: non-SC (Tc=0K) are excluded from Tc regression metrics
+        # because the Tc loss never trains on non-SC samples (tc_weight_override=0.0)
+        sc_tc_mask = tc_true_kelvin > 0
+        # Overall Kelvin-space metrics (SC-only — matches what Tc loss actually trains on)
+        if sc_tc_mask.sum() >= 2:
+            sc_true_k = tc_true_kelvin[sc_tc_mask]
+            sc_pred_k = tc_pred_kelvin[sc_tc_mask]
+            z_diagnostics['tc_r2_kelvin'] = float(
+                1 - np.sum((sc_pred_k - sc_true_k)**2) /
+                max(np.sum((sc_true_k - sc_true_k.mean())**2), 1e-8))
+            z_diagnostics['tc_mae_kelvin_overall'] = float(np.abs(sc_pred_k - sc_true_k).mean())
+            z_diagnostics['tc_r2_n_samples'] = int(sc_tc_mask.sum())
     else:
         # Fallback: use normalized values (pre-V12.34 behavior, known bug)
         tc_true_kelvin = all_tc_true_np
         tc_pred_kelvin = all_tc_pred_np
+        sc_tc_mask = np.ones(len(tc_true_kelvin), dtype=bool)  # No filtering in fallback
 
     tc_ranges = [(0, 10, '0-10K'), (10, 30, '10-30K'), (30, 77, '30-77K'),
                  (77, 120, '77-120K'), (120, 200, '120-200K'), (200, float('inf'), '>200K')]
     for lo, hi, label in tc_ranges:
-        tc_mask = (tc_true_kelvin >= lo) & (tc_true_kelvin < hi)
+        tc_mask = (tc_true_kelvin >= lo) & (tc_true_kelvin < hi) & sc_tc_mask
         if tc_mask.any() and tc_mask.sum() >= 2:
             pred_bin = tc_pred_kelvin[tc_mask]
             true_bin = tc_true_kelvin[tc_mask]
@@ -4047,7 +4055,7 @@ def evaluate_true_autoregressive(encoder, decoder, loader, device, max_samples=1
         for label, info in zd.get('errors_by_tc_range', {}).items():
             if 'tc_r2' in info:
                 r2_parts.append(f"{label}={info['tc_r2']:.3f}")
-        print(f"  Tc R²: {' | '.join(r2_parts)}")
+        print(f"  Tc R² (SC-only): {' | '.join(r2_parts)}")
     print(f"  Correlations: z_norm→err={zd['corr_z_norm_vs_errors']:.3f} | tc_err→err={zd['corr_tc_error_vs_formula_errors']:.3f} | "
           f"magpie→err={zd['corr_magpie_mse_vs_errors']:.3f} | seq_len→err={zd['corr_seq_len_vs_errors']:.3f} | "
           f"n_elem→err={zd['corr_n_elements_vs_errors']:.3f}")
@@ -5267,7 +5275,10 @@ def train():
                 print(f"  [GRACE] Fresh optimizers detected — drop detector suppressed "
                       f"until epoch {drop_grace_until}", flush=True)
                 prev_exact = 0.0  # Disable drop detection during grace
-                best_exact = 0.0  # Don't compare against pre-upgrade performance
+                # KEEP best_exact from checkpoint — fresh optimizers only lose momentum,
+                # not model quality. Resetting best_exact to 0.0 causes every epoch to
+                # overwrite checkpoint_best.pt, destroying the prior run's best model.
+                print(f"  [GRACE] Preserving best_exact={best_exact:.3f} from prior run", flush=True)
 
             # V12.31: Track physics Z introduction epoch for relative warmup
             if resume_state.get('physics_z_is_new', False):
@@ -5281,7 +5292,11 @@ def train():
             if TRAIN_CONFIG.get('retrain_new_data', False):
                 print(f"  [RETRAIN MODE] Resetting drop detector (prev_exact was {prev_exact:.3f})")
                 prev_exact = 0.0
-                best_exact = 0.0
+                best_exact = 0.0  # Deliberate: new data means old metrics are incomparable
+
+            # Sync shutdown state so interrupt checkpoint preserves the correct values
+            _shutdown_state['best_exact'] = best_exact
+            _shutdown_state['prev_exact'] = prev_exact
         else:
             print(f"\nWarning: Checkpoint not found: {checkpoint_path}")
             print("  Starting from scratch...")
@@ -5423,6 +5438,11 @@ def train():
                     dec_opt, T_max=remaining_epochs, eta_min=lr_min)
             print(f"  Phase B LR: {phase_b_lr}, all params unfrozen, schedulers rebuilt")
             v13_phase = 'B'  # Update phase tracking
+            # Sync new optimizers/schedulers to shutdown state
+            _shutdown_state['enc_opt'] = enc_opt
+            _shutdown_state['dec_opt'] = dec_opt
+            _shutdown_state['enc_scheduler'] = enc_scheduler
+            _shutdown_state['dec_scheduler'] = dec_scheduler
 
         # V13.1: RL auto-reactivation scheduler
         # Check if TF exact match has plateaued and RL should be turned on
