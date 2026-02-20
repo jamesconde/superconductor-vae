@@ -845,7 +845,7 @@ TRAIN_CONFIG = {
     'fraction_token_weight': 2.0,  # Upweight fraction tokens in CE loss (optional)
 
     # V13.0: Two-phase training for weight transfer from V12.x
-    'v13_phase': 'A',         # 'A' = frozen warmup (only fraction embeddings train), 'B' = full fine-tuning
+    'v13_phase': None,        # None = co-train encoder+decoder normally. 'A' was for initial V12→V13 migration only.
     'v13_phase_a_epochs': 10, # Number of warmup epochs in Phase A (4,212 fraction tokens need sufficient gradient coverage)
     'v13_phase_a_lr': 1e-4,   # Learning rate for Phase A (higher, new params only)
 }
