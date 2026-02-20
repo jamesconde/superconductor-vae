@@ -537,7 +537,10 @@ TRAIN_CONFIG = {
         # converge_threshold: loss value below which this loss is considered converged
         # spike_delta: absolute increase above converged baseline that triggers resume
         # --- Inside CombinedLossWithREINFORCE ---
-        'reinforce_loss':  (1.0,   0.5),   # RL weighted ~0.5 (raw*0.05) — THE big compute saver
+        # V13.2: reinforce_loss REMOVED from skip schedule — RL is a policy gradient
+        # that fluctuates by design, not a converging loss. Skipping it kills the
+        # learning signal. Previously marked "converged" immediately because rl_weight
+        # was 0.0 → loss was always 0.0 < threshold 1.0.
         # tc_loss: NEVER skip — core prediction capability
         'magpie_loss':     (0.1,   0.1),   # Magpie MSE ~0.06
         # stoich_loss: NEVER skip — directly feeds decoder conditioning
