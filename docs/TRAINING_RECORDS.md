@@ -4,6 +4,35 @@ Chronological record of training runs, architecture changes, and optimization de
 
 ---
 
+## V13.1c: Reduce Auxiliary Loss Weights — Prioritize Formula CE (2026-02-19)
+
+### Problem
+
+Training logs (epochs 3660-3683) showed auxiliary losses producing enormous gradients that compete with formula CE:
+- **SCL** (SC classification): 8-12 raw BCE — pathological for binary classification (ideal ~0.7)
+- **TcCl** (Tc classification): 2.0 × weight 4.0 = **8.0 effective** gradient
+- **Fam** (family classifier): 1.5 × weight 2.0 = **3.0 effective** gradient
+- **HP** (H/pressure): 1.7 × weight 0.5 with 50x pos_weight = volatile
+
+Meanwhile, formula CE was ~1.08 — the auxiliary losses collectively overwhelmed the primary reconstruction signal. Non-SC exact crashed from 69.1% → 47.6% as auxiliary gradients pulled z-space away from formula reconstruction.
+
+### Solution
+
+Reduce auxiliary weights to make them true auxiliaries (gentle guidance, not gradient competition):
+
+| Weight | Old | New | Reasoning |
+|--------|-----|-----|-----------|
+| `tc_class_weight` | 4.0 | 0.5 | 8x reduction — was producing 8.0 effective gradient |
+| `family_classifier_weight` | 2.0 | 0.5 | 4x reduction — was producing 3.0 effective gradient |
+| `sc_loss_weight` | 0.5 | 0.1 | 5x reduction — raw BCE of 8-12 is already pathological |
+| `hp_loss_weight` | 0.5 | 0.1 | 5x reduction — 50x pos_weight amplification makes this volatile |
+
+### Philosophy
+
+These classifier heads exist to guide z-space organization, not to dominate training. At reduced weights, they still provide useful gradient signal (SC clustering, family separation, Tc ordering) without competing with formula reconstruction. The model should master formulas first — auxiliary structure follows naturally.
+
+---
+
 ## V13.1b: Phased PhysZ — Disable During CE Learning, Auto-Reactivate on Plateau (2026-02-19)
 
 ### Problem

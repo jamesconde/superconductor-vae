@@ -462,8 +462,8 @@ TRAIN_CONFIG = {
     # 1.0 = always GT (decoder learns to use stoich tokens), 0.0 = always predicted
     'stoich_cond_tf': 1.0,  # Always use ground truth stoich conditioning during training
     'kl_weight': 0.0001,  # Now L2 regularization weight on z (deterministic encoder)
-    'hp_loss_weight': 0.5,   # V12.26: 0.05→0.5, HP is critical for high-Tc (H3S, LaH10) — model must master this
-    'sc_loss_weight': 0.5,   # V12.21: SC/non-SC classification loss weight (BCE, all samples)
+    'hp_loss_weight': 0.1,   # V13.1b: 0.5→0.1, reduce gradient competition with formula CE
+    'sc_loss_weight': 0.1,   # V13.1b: 0.5→0.1, reduce gradient competition with formula CE
 
     # V12.20: Tc loss improvements (log-transform + Huber)
     'tc_log_transform': True,   # Apply log1p(Tc) before z-score normalization (reduces skew 2.18→-0.17)
@@ -474,7 +474,7 @@ TRAIN_CONFIG = {
     'tc_relative_weight': 0.5,         # V12.24: Blend weight for relative error (0=pure Huber, 1=pure relative)
 
     # V12.28: Tc prediction improvements
-    'tc_class_weight': 4.0,     # V12.33: Boosted from 2.0 to strengthen auxiliary signal
+    'tc_class_weight': 0.5,     # V13.1b: 4.0→0.5, reduce gradient competition with formula CE
     'tc_class_bins': [0, 10, 50, 100],  # Bin edges in Kelvin (creates 5 classes: 0, 0-10, 10-50, 50-100, 100+)
     'tc_bin_weights': {0: 1.0, 10: 1.5, 50: 2.0, 100: 2.5, 150: 3.0},  # Per-bin Tc loss multipliers
     'mc_dropout_samples': 10,   # MC Dropout forward passes at eval time
@@ -682,7 +682,7 @@ TRAIN_CONFIG = {
     'theory_use_soft_constraints': True,   # V12.22: Soft quadratic penalties (no hard caps)
 
     'use_family_classifier': True,          # V12.33: Hierarchical family classification
-    'family_classifier_weight': 2.0,        # V12.33: Boosted from 0.5 to strengthen hierarchical family signal
+    'family_classifier_weight': 0.5,        # V13.1b: 2.0→0.5, reduce gradient competition with formula CE
     'family_coarse_weight': 0.6,            # V12.33: Internal: 7-class coarse CE (SC only)
     'family_cuprate_sub_weight': 0.3,       # V12.33: Internal: 6-class cuprate sub CE
     'family_iron_sub_weight': 0.1,          # V12.33: Internal: 2-class iron sub CE
