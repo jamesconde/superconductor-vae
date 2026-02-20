@@ -115,6 +115,7 @@ from superconductor.losses.constraint_rewards import (
 )
 from superconductor.losses.round_trip_loss import RoundTripConsistencyLoss
 from superconductor.losses.constraint_zoo import SiteOccupancySumLoss, ChargeBalanceLoss
+from superconductor.losses.contrastive import category_to_label  # Dataset label mapping (not the loss itself)
 
 
 # ============================================================================
