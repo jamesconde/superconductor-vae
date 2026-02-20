@@ -4,6 +4,31 @@ Chronological record of training runs, architecture changes, and optimization de
 
 ---
 
+## V13.2: Enable RL (SCST), Tc-Binned Sampling, Fix Decoder Wiring (2026-02-19)
+
+### Enable REINFORCE/SCST for Autoregressive Refinement
+
+CE training converged at 99.6% TF exact match but only 2.0% autoregressive exact. The gap is exposure bias — TF is hardcoded to 1.0 (line 5576), so the decoder never trains on its own output. RL (Self-Critical Sequence Training) is the only mechanism to close this gap.
+
+**Changes:**
+- `rl_weight`: 0.0 → **1.0** (enable SCST)
+- `num_epochs`: 4000 → **5000** (1000 additional epochs for RL refinement)
+
+### Fix Decoder Wiring for RL Auto-Reactivation
+
+The loss function's `set_decoder()` was only called when `rl_weight > 0` at startup. When auto-reactivation set `rl_weight > 0` later, `self._decoder` was still None — SCST fell back to weak logit-based RLOO (sampling from teacher-forced context instead of true autoregressive generation). The decoder is now **always wired** regardless of initial `rl_weight`.
+
+### Tc-Binned Oversampling for High-Tc Superconductors
+
+High-Tc samples (>100K) are <2% of SC data. The balanced sampler only balanced SC/non-SC (50/50), so high-Tc samples appeared ~0-1 per batch. R² suffered: 120-200K=0.945, >200K=0.041 (6 samples).
+
+**New config:** `oversample_high_tc: True`, `oversample_tc_bins: {50: 3.0, 100: 10.0}`
+- SC samples with Tc >= 50K get 3x sampling weight
+- SC samples with Tc >= 100K get 10x sampling weight
+- Expected ~6 high-Tc samples per batch of 42 (vs ~0-1 before)
+
+---
+
 ## Fix Checkpoint Overwrite Bug, Tc R² Evaluation, Disable Phase A/B (2026-02-19)
 
 ### Checkpoint best_exact Overwrite Bug (3 fixes)

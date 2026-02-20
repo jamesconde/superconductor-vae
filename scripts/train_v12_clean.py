@@ -402,7 +402,7 @@ def build_family_lookup_tensors(device):
 ALGO_VERSION = 'V13.0'  # Bump this when making algorithm changes
 
 TRAIN_CONFIG = {
-    'num_epochs': 4000,
+    'num_epochs': 5000,
     'learning_rate': 3e-5,      # Reduced for stable fine-tuning (was 1e-4)
     'lr_warmup_epochs': 0,      # V13.0: Disabled — Phase A/B handle LR transitions; warmup would throttle Phase A fraction embedding training
     'max_formula_len': 30,      # V13.0: Reduced from 60 — semantic tokens shorten sequences (max=24, P99=16, mean=8.9)
@@ -501,7 +501,7 @@ TRAIN_CONFIG = {
     #   - Then enable rl_weight=1.0-2.5 for fine-tuning
     #   - Higher n_samples_rloo = lower variance but slower
     # =========================================================================
-    'rl_weight': 0.0,            # V13.1: Disabled during rapid CE learning. Auto-reactivated by RL scheduler when TF exact plateaus.
+    'rl_weight': 1.0,            # V13.2: Enabled for AR refinement (SCST). CE converged at 99.6% TF exact; RL closes the TF→AR gap.
     'ce_weight': 1.0,            # Cross-entropy weight (keep at 1.0)
     'n_samples_rloo': 4,         # Number of samples for RLOO baseline (A100: 4)
     'rl_temperature': 0.2,       # V12.40: Reduced 0.5→0.2 — at epoch 3000+, exploration hurts more than helps
@@ -785,6 +785,12 @@ TRAIN_CONFIG = {
     # Intervention 3: Hard sequence oversampling
     'oversample_hard_sequences': True,    # Upweight long/complex formulas in sampler
     'oversample_length_base': 15,         # Sequences > this get progressively upweighted
+
+    # V13.2: Tc-binned oversampling — boost high-Tc SC samples in sampler
+    # High-Tc (>100K) is <2% of SC data; without boosted sampling, the model
+    # rarely sees them (R²: 120-200K=0.945, >200K=0.041). Boost ensures ~6/batch.
+    'oversample_high_tc': True,
+    'oversample_tc_bins': {50: 3.0, 100: 10.0},  # Tc threshold (K) → sampling weight multiplier
 
     # Intervention 4: Integer-to-fraction normalization
     # DISABLED: Integer subscripts like '13' are better as single concepts than
@@ -1804,6 +1810,30 @@ def load_and_prepare_data():
             sample_weights = sample_weights * length_boost * elem_boost
             print(f"  Hard sequence oversampling: length_base={length_base}, "
                   f"mean_length_boost={length_boost.mean():.2f}, mean_elem_boost={elem_boost.mean():.2f}")
+
+        # V13.2: Tc-binned oversampling — boost rare high-Tc superconductors
+        if TRAIN_CONFIG.get('oversample_high_tc', False):
+            tc_bins_cfg = TRAIN_CONFIG.get('oversample_tc_bins', {50: 3.0, 100: 10.0})
+            # Denormalize tc_tensor to raw Kelvin for bin assignment
+            tc_train_norm = tc_tensor[train_indices].squeeze(-1).numpy()
+            tc_log_vals = tc_train_norm * norm_stats['tc_std'] + norm_stats['tc_mean']
+            if norm_stats.get('tc_log_transform', False):
+                tc_raw_k = np.expm1(tc_log_vals)
+            else:
+                tc_raw_k = tc_log_vals
+            tc_raw_k = np.maximum(tc_raw_k, 0.0)  # Clamp negative artifacts
+
+            tc_boost = np.ones(len(train_indices))
+            # Apply bins in ascending order so higher thresholds override
+            for threshold in sorted(tc_bins_cfg.keys()):
+                mult = tc_bins_cfg[threshold]
+                mask = (tc_raw_k >= threshold) & (is_sc_train_arr == 1)
+                tc_boost[mask] = mult
+
+            sample_weights = sample_weights * tc_boost
+            n_boosted = {t: int(((tc_raw_k >= t) & (is_sc_train_arr == 1)).sum())
+                         for t in sorted(tc_bins_cfg.keys())}
+            print(f"  Tc-binned oversampling: {n_boosted} (multipliers: {tc_bins_cfg})")
 
         sampler = WeightedRandomSampler(
             weights=torch.from_numpy(sample_weights).double(),
@@ -4901,25 +4931,30 @@ def train():
             draft_model = None
 
     # Wire up decoder for autoregressive REINFORCE/SCST sampling
-    if TRAIN_CONFIG.get('rl_weight', 0.0) > 0 and TRAIN_CONFIG.get('use_autoregressive_reinforce', True):
+    # V13.2: Always wire decoder so auto-reactivation can use true AR SCST
+    # (previously only wired when rl_weight>0 at startup, causing auto-reactivation
+    # to fall back to weak logit-based RLOO instead of proper SCST)
+    if TRAIN_CONFIG.get('use_autoregressive_reinforce', True):
         loss_fn.set_decoder(decoder, max_len=TRAIN_CONFIG['max_formula_len'], draft_model=draft_model,
                             stop_boost=TRAIN_CONFIG.get('stop_boost', 0.0),
                             hard_stop_threshold=TRAIN_CONFIG.get('hard_stop_threshold', 0.0))  # V12.37
+    if TRAIN_CONFIG.get('rl_weight', 0.0) > 0:
         rl_method = TRAIN_CONFIG.get('rl_method', 'scst')
         method_name = 'SCST (Self-Critical)' if rl_method == 'scst' else 'RLOO (Leave-One-Out)'
-        print(f"RL: {method_name}, rl_weight={TRAIN_CONFIG['rl_weight']}, "
-              f"autoregressive=True (KV-cached)")
-        if rl_method == 'scst':
-            print(f"  Baseline: greedy decode reward (2 passes per batch)")
+        if TRAIN_CONFIG.get('use_autoregressive_reinforce', True):
+            print(f"RL: {method_name}, rl_weight={TRAIN_CONFIG['rl_weight']}, "
+                  f"autoregressive=True (KV-cached)")
+            if rl_method == 'scst':
+                print(f"  Baseline: greedy decode reward (2 passes per batch)")
+            else:
+                print(f"  Baseline: leave-one-out ({TRAIN_CONFIG.get('n_samples_rloo', 2)} samples)")
         else:
-            print(f"  Baseline: leave-one-out ({TRAIN_CONFIG.get('n_samples_rloo', 2)} samples)")
-    elif TRAIN_CONFIG.get('rl_weight', 0.0) > 0:
-        print(f"RL: RLOO, rl_weight={TRAIN_CONFIG['rl_weight']}, "
-              f"n_samples={TRAIN_CONFIG.get('n_samples_rloo', 2)}, "
-              f"autoregressive=False (logit sampling)")
+            print(f"RL: RLOO, rl_weight={TRAIN_CONFIG['rl_weight']}, "
+                  f"n_samples={TRAIN_CONFIG.get('n_samples_rloo', 2)}, "
+                  f"autoregressive=False (logit sampling)")
     else:
         if TRAIN_CONFIG.get('rl_auto_reactivate', False):
-            print(f"RL: Disabled (rl_weight=0) — auto-reactivation scheduled")
+            print(f"RL: Disabled (rl_weight=0) — auto-reactivation scheduled (decoder pre-wired)")
             print(f"  Will activate at: exact >= {TRAIN_CONFIG.get('rl_reactivation_force_exact', 0.92)*100:.0f}% "
                   f"OR plateau (< {TRAIN_CONFIG.get('rl_reactivation_plateau_threshold', 0.01)*100:.1f}% gain "
                   f"over {TRAIN_CONFIG.get('rl_reactivation_window', 20)} epochs) "
