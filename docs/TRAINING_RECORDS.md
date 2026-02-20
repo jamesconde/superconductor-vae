@@ -4,6 +4,54 @@ Chronological record of training runs, architecture changes, and optimization de
 
 ---
 
+## V14.0: Isotope Token Expansion (2026-02-20)
+
+### Isotope-Aware Vocabulary
+
+Added 292 new tokens to the decoder vocabulary (1 ISO_UNK + 291 isotope tokens), enabling the model to generate formulas with specific isotopes using `{mass}Element` notation (e.g., `{18}O`, `{2}H`, `{10}B`).
+
+**Vocabulary layout** (4355 → 4647 tokens):
+| Range | Content | Count |
+|-------|---------|-------|
+| 0-4 | Special: PAD, BOS, EOS, UNK, FRAC_UNK | 5 |
+| 5-122 | Elements: H, He, ..., Og | 118 |
+| 123-142 | Integers: 1-20 | 20 |
+| 143-4354 | Fractions: FRAC:1/2, FRAC:1/4, ... | 4212 |
+| **4355** | **ISO_UNK: unknown isotope fallback** | **1** |
+| **4356-4646** | **Isotopes: ISO:1H, ISO:2H, ..., ISO:238U** | **291** |
+
+**Source**: 291 isotopes across 84 elements from `src/superconductor/encoders/isotope_properties.py` (ISOTOPE_DATABASE). Sorted by atomic number then mass number for deterministic ordering.
+
+### Why Isotopes Matter
+
+The BCS isotope effect (Tc proportional to M^(-alpha), alpha ~ 0.5) is a key signature of phonon-mediated superconductivity. Isotope substitution studies (e.g., O-16 vs O-18 in cuprates, B-10 vs B-11 in MgB2) provide critical evidence about pairing mechanisms. The `estimate_isotope_effect()` function already exists in the codebase — these tokens connect the decoder to that physics.
+
+### Changes
+
+**New files:**
+- `scripts/build_isotope_vocab.py` — generates `data/isotope_vocab.json` from ISOTOPE_DATABASE
+- `data/isotope_vocab.json` — 291 isotope tokens in deterministic order
+- `scripts/migrate_v13_to_v14.py` — checkpoint migration (expand embeddings 4355 → 4647)
+
+**Modified files:**
+- `src/superconductor/tokenizer/fraction_tokenizer.py` — extended with isotope encoding/decoding, ISO_UNK token, isotope-aware regex pattern
+- `scripts/train_v12_clean.py` — ALGO_VERSION V13.0 → V14.0, isotope config (`use_isotope_tokens`, `isotope_vocab_path`), tokenizer construction updated
+
+### Embedding Initialization
+
+Isotope token embeddings initialized from parent element embedding + mass-aware noise:
+- `embed(ISO:18O) = embed(O) + noise * scale`
+- Scale proportional to `|mass - natural_mass| / natural_mass`
+- Common isotopes (16O) start near parent; exotic isotopes (18O) get more perturbation
+
+### Training Data Gap
+
+No training data contains isotope tokens yet. This is infrastructure for future theory-guided generation using the BCS isotope effect function. The 291 isotope embeddings will learn from:
+1. Theory-guided synthetic data (planned)
+2. Isotope substitution studies from literature (planned)
+
+---
+
 ## V13.2: Enable RL (SCST), Tc-Binned Sampling, Fix Decoder Wiring (2026-02-19)
 
 ### Enable REINFORCE/SCST for Autoregressive Refinement

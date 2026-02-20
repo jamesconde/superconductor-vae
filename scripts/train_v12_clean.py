@@ -399,7 +399,7 @@ def build_family_lookup_tensors(device):
     return fine_to_coarse, fine_to_cuprate_sub, fine_to_iron_sub
 
 
-ALGO_VERSION = 'V13.0'  # Bump this when making algorithm changes
+ALGO_VERSION = 'V14.0'  # Bump this when making algorithm changes
 
 TRAIN_CONFIG = {
     'num_epochs': 5000,
@@ -858,6 +858,16 @@ TRAIN_CONFIG = {
     'v13_phase': None,        # None = co-train encoder+decoder normally. 'A' was for initial V12→V13 migration only.
     'v13_phase_a_epochs': 10, # Number of warmup epochs in Phase A (4,212 fraction tokens need sufficient gradient coverage)
     'v13_phase_a_lr': 1e-4,   # Learning rate for Phase A (higher, new params only)
+
+    # =========================================================================
+    # V14.0: Isotope Tokenization
+    # =========================================================================
+    # Add 291 isotope tokens (ISO:massSymbol) to decoder vocabulary.
+    # Each {mass}Element in a formula becomes a single semantic token.
+    # No training data exists yet — infrastructure for future theory-guided generation.
+    # =========================================================================
+    'use_isotope_tokens': True,       # V14.0: Isotope-aware tokenization
+    'isotope_vocab_path': 'data/isotope_vocab.json',
 }
 
 CONTRASTIVE_DATA_PATH = PROJECT_ROOT / 'data/processed/supercon_fractions_contrastive.csv'
@@ -1578,8 +1588,13 @@ def load_and_prepare_data():
         use_semantic = TRAIN_CONFIG.get('use_semantic_fractions', False)
         if use_semantic:
             frac_vocab_path = PROJECT_ROOT / TRAIN_CONFIG.get('fraction_vocab_path', 'data/fraction_vocab.json')
-            v13_tokenizer = FractionAwareTokenizer(str(frac_vocab_path), max_len=max_len)
-            print(f"Tokenizing formulas (V13.0 semantic fractions, vocab_size={v13_tokenizer.vocab_size})...")
+            # V14.0: Pass isotope vocab path if isotope tokens are enabled
+            iso_vocab_path = None
+            if TRAIN_CONFIG.get('use_isotope_tokens', False):
+                iso_vocab_path = str(PROJECT_ROOT / TRAIN_CONFIG.get('isotope_vocab_path', 'data/isotope_vocab.json'))
+            v13_tokenizer = FractionAwareTokenizer(str(frac_vocab_path), max_len=max_len,
+                                                   isotope_vocab_path=iso_vocab_path)
+            print(f"Tokenizing formulas (V14.0 semantic fractions+isotopes, vocab_size={v13_tokenizer.vocab_size})...")
             all_tokens = []
             for formula in formulas:
                 indices = v13_tokenizer.encode(formula, add_bos_eos=True, pad=True)
@@ -1896,14 +1911,19 @@ def create_models(magpie_dim: int, device: torch.device):
         dropout=0.1
     ).to(device)
 
-    # V13.0: Determine vocab size and stoich input dim based on tokenizer mode
+    # V14.0: Determine vocab size and stoich input dim based on tokenizer mode
     use_semantic = TRAIN_CONFIG.get('use_semantic_fractions', False)
     if use_semantic:
         frac_vocab_path = PROJECT_ROOT / TRAIN_CONFIG.get('fraction_vocab_path', 'data/fraction_vocab.json')
-        v13_tokenizer = FractionAwareTokenizer(str(frac_vocab_path), max_len=TRAIN_CONFIG['max_formula_len'])
+        # V14.0: Pass isotope vocab path if isotope tokens are enabled
+        iso_vocab_path = None
+        if TRAIN_CONFIG.get('use_isotope_tokens', False):
+            iso_vocab_path = str(PROJECT_ROOT / TRAIN_CONFIG.get('isotope_vocab_path', 'data/isotope_vocab.json'))
+        v13_tokenizer = FractionAwareTokenizer(str(frac_vocab_path), max_len=TRAIN_CONFIG['max_formula_len'],
+                                               isotope_vocab_path=iso_vocab_path)
         decoder_vocab_size = v13_tokenizer.vocab_size
         decoder_stoich_input_dim = 13  # fractions(12) + count(1)
-        print(f"V13.0: Decoder vocab_size={decoder_vocab_size}, stoich_input_dim={decoder_stoich_input_dim}")
+        print(f"V14.0: Decoder vocab_size={decoder_vocab_size}, stoich_input_dim={decoder_stoich_input_dim}")
     else:
         decoder_vocab_size = None  # Use default VOCAB_SIZE (148)
         decoder_stoich_input_dim = None  # Use default (37)
@@ -5931,11 +5951,15 @@ def train():
         is_final_epoch = (epoch == TRAIN_CONFIG['num_epochs'] - 1)
         if epoch % 4 == 0 or is_final_epoch:
             eval_max = 0 if is_final_epoch else 2000  # 0 = all samples
-            # V13.0: Pass tokenizer for decoding if using semantic fractions
+            # V14.0: Pass tokenizer for decoding if using semantic fractions/isotopes
             _eval_tokenizer = None
             if TRAIN_CONFIG.get('use_semantic_fractions', False):
                 _fvp = PROJECT_ROOT / TRAIN_CONFIG.get('fraction_vocab_path', 'data/fraction_vocab.json')
-                _eval_tokenizer = FractionAwareTokenizer(str(_fvp), max_len=TRAIN_CONFIG['max_formula_len'])
+                _ivp = None
+                if TRAIN_CONFIG.get('use_isotope_tokens', False):
+                    _ivp = str(PROJECT_ROOT / TRAIN_CONFIG.get('isotope_vocab_path', 'data/isotope_vocab.json'))
+                _eval_tokenizer = FractionAwareTokenizer(str(_fvp), max_len=TRAIN_CONFIG['max_formula_len'],
+                                                         isotope_vocab_path=_ivp)
             true_eval = evaluate_true_autoregressive(
                 encoder, decoder, train_loader, device, max_samples=eval_max,
                 log_errors=True, epoch=epoch,
