@@ -547,6 +547,14 @@ TRAIN_CONFIG = {
     'rl_warmup_epochs': 20,              # Linear ramp from start to 1.0
     'rl_warmup_start': 0.1,             # Start rl_weight at 10%
 
+    # V14.1: RL auto-scaling — dynamically set rl_weight so |RL contribution| ≈ target
+    # After the first epoch, measure |raw_rl_loss| and compute:
+    #   rl_weight = rl_auto_scale_target / |raw_rl_loss|
+    # This ensures RL is a gentle correction signal regardless of model state.
+    # Gradients still flow correctly — only magnitude changes, not direction.
+    'rl_auto_scale': True,               # Enable dynamic RL weight scaling
+    'rl_auto_scale_target': 10.0,        # Target |rl_weight * raw_rl_loss| magnitude
+
     # V14.0: RL safety guard — protect TF exact from RL destabilization
     'rl_safety_exact_drop': 0.02,        # Halve rl_weight if TF exact drops >2%
     'rl_safety_check_interval': 5,       # Check every 5 epochs
@@ -666,7 +674,8 @@ TRAIN_CONFIG = {
     'entropy_plateau_relative': True,    # If True, threshold scales with performance
 
     # Resume from checkpoint (set to None to train from scratch)
-    'resume_checkpoint': 'outputs/checkpoint_v13_migrated.pt',  # V13.0: Resume from migrated checkpoint
+    # V14.1: Can resume from ANY checkpoint — isotope init happens inline in load_checkpoint()
+    'resume_checkpoint': 'outputs/checkpoint_best.pt',
 
     # V12.12: Retrain on new/combined data - resets catastrophic drop detector
     # Set to True when training data has changed (new normalization stats)
@@ -3385,8 +3394,16 @@ def _strip_compiled_prefix(state_dict):
 
 def load_checkpoint(encoder, decoder, checkpoint_path, entropy_manager=None,
                     enc_opt=None, dec_opt=None, enc_scheduler=None, dec_scheduler=None,
-                    theory_loss_fn=None, physics_z_loss_fn=None):
+                    theory_loss_fn=None, physics_z_loss_fn=None,
+                    v13_tokenizer=None):
     """Load model checkpoint with full training state for proper resumption.
+
+    Args:
+        v13_tokenizer: Optional FractionAwareTokenizer. When provided and a vocab
+            expansion is detected (e.g., V13→V14 isotope tokens), new token rows
+            in token_embedding and output_proj are initialized from parent element
+            embeddings instead of zeros. This avoids the need for a separate
+            migration script.
 
     Returns:
         dict with keys: 'start_epoch', 'prev_exact', 'best_exact'
@@ -3476,13 +3493,103 @@ def load_checkpoint(encoder, decoder, checkpoint_path, entropy_manager=None,
         print("  [Checkpoint] Applied Net2Net weight transfer for Tc head upgrade", flush=True)
 
     # V12.38: Shape-mismatch handling for decoder (stoich_to_memory input dim change 13→37)
+    # V14.1: Isotope-aware vocab expansion — when tokenizer is available and the first
+    # dimension grew (vocab expansion), initialize new rows from parent element embeddings
+    # instead of zeros. This handles V13→V14 isotope token expansion inline.
     dec_model_state = decoder.state_dict()
+
+    # Detect vocab expansion: tokenizer present and token_embedding rows grew
+    _vocab_expanded = False
+    _old_vocab = 0
+    if (v13_tokenizer is not None
+            and 'token_embedding.weight' in dec_state
+            and 'token_embedding.weight' in dec_model_state):
+        _old_vocab = dec_state['token_embedding.weight'].shape[0]
+        _new_vocab = dec_model_state['token_embedding.weight'].shape[0]
+        if _new_vocab > _old_vocab and v13_tokenizer.n_isotope_tokens > 0:
+            _vocab_expanded = True
+            print(f"  [Checkpoint] Vocab expansion detected: {_old_vocab} → {_new_vocab} "
+                  f"(+{_new_vocab - _old_vocab} tokens, {v13_tokenizer.n_isotope_tokens} isotopes)",
+                  flush=True)
+
     for key in list(dec_state.keys()):
         if key in dec_model_state and dec_state[key].shape != dec_model_state[key].shape:
             old_shape = dec_state[key].shape
             new_shape = dec_model_state[key].shape
             preserved = False
-            if len(old_shape) == 2 and len(new_shape) == 2:
+
+            # V14.1: Physics-informed isotope initialization for vocab-expansion layers
+            if _vocab_expanded and key == 'token_embedding.weight':
+                d_model = old_shape[1]
+                new_embed = torch.zeros(new_shape, dtype=dec_state[key].dtype)
+                new_embed[:_old_vocab] = dec_state[key]  # Copy all existing rows
+
+                # ISO_UNK: mean of special tokens + small noise
+                iso_unk_idx = v13_tokenizer.iso_unk_idx
+                if iso_unk_idx is not None and iso_unk_idx >= _old_vocab:
+                    special_mean = dec_state[key][:5].mean(dim=0)
+                    new_embed[iso_unk_idx] = special_mean + torch.randn(d_model) * 0.01
+
+                # Isotope tokens: parent element embedding + mass-aware noise
+                _scripts_dir = str(Path(__file__).parent)
+                if _scripts_dir not in sys.path:
+                    sys.path.insert(0, _scripts_dir)
+                from migrate_v13_to_v14 import initialize_isotope_embeddings
+                iso_embeds = initialize_isotope_embeddings(
+                    v13_tokenizer, dec_state[key], d_model)
+                iso_start = v13_tokenizer.isotope_token_start
+                n_iso = v13_tokenizer.n_isotope_tokens
+                new_embed[iso_start:iso_start + n_iso] = iso_embeds
+
+                dec_state[key] = new_embed
+                preserved = True
+                print(f"  [Checkpoint] Isotope-init token_embedding: {old_shape}→{new_shape} "
+                      f"(parent-element init for {n_iso} isotope rows)", flush=True)
+
+            elif _vocab_expanded and key == 'output_proj.4.weight':
+                d_model = old_shape[1]
+                new_weight = torch.zeros(new_shape, dtype=dec_state[key].dtype)
+                new_weight[:_old_vocab] = dec_state[key]
+
+                # ISO_UNK: xavier init
+                iso_unk_idx = v13_tokenizer.iso_unk_idx
+                if iso_unk_idx is not None and iso_unk_idx >= _old_vocab:
+                    nn.init.xavier_uniform_(new_weight[iso_unk_idx:iso_unk_idx + 1])
+
+                # Isotope rows: parent element row + small noise
+                iso_start = v13_tokenizer.isotope_token_start
+                for i in range(v13_tokenizer.n_isotope_tokens):
+                    token_id = iso_start + i
+                    elem_idx = v13_tokenizer.element_idx_for_isotope(token_id)
+                    if elem_idx < _old_vocab:
+                        new_weight[token_id] = dec_state[key][elem_idx] + torch.randn(d_model) * 0.01
+                    else:
+                        nn.init.xavier_uniform_(new_weight[token_id:token_id + 1])
+
+                dec_state[key] = new_weight
+                preserved = True
+                print(f"  [Checkpoint] Isotope-init output_proj weight: {old_shape}→{new_shape} "
+                      f"(parent-element init for isotope rows)", flush=True)
+
+            elif _vocab_expanded and key == 'output_proj.4.bias':
+                new_bias = torch.zeros(new_shape, dtype=dec_state[key].dtype)
+                new_bias[:_old_vocab] = dec_state[key]
+
+                # Isotope biases: copy parent element bias
+                iso_start = v13_tokenizer.isotope_token_start
+                for i in range(v13_tokenizer.n_isotope_tokens):
+                    token_id = iso_start + i
+                    elem_idx = v13_tokenizer.element_idx_for_isotope(token_id)
+                    if elem_idx < _old_vocab:
+                        new_bias[token_id] = dec_state[key][elem_idx]
+
+                dec_state[key] = new_bias
+                preserved = True
+                print(f"  [Checkpoint] Isotope-init output_proj bias: {old_shape}→{new_shape} "
+                      f"(parent-element init for isotope rows)", flush=True)
+
+            # Generic fallback for non-vocab layers (e.g., stoich_to_memory)
+            elif len(old_shape) == 2 and len(new_shape) == 2:
                 min_r, min_c = min(old_shape[0], new_shape[0]), min(old_shape[1], new_shape[1])
                 new_w = torch.zeros(new_shape, dtype=dec_state[key].dtype)
                 new_w[:min_r, :min_c] = dec_state[key][:min_r, :min_c]
@@ -5030,6 +5137,9 @@ def train():
             print(f"RL: RLOO, rl_weight={TRAIN_CONFIG['rl_weight']}, "
                   f"n_samples={TRAIN_CONFIG.get('n_samples_rloo', 2)}, "
                   f"autoregressive=False (logit sampling)")
+        if TRAIN_CONFIG.get('rl_auto_scale', False):
+            print(f"  [V14.1] Auto-scale: will calibrate rl_weight after epoch 1 "
+                  f"(target |RL contribution|={TRAIN_CONFIG.get('rl_auto_scale_target', 10.0)})")
     else:
         if TRAIN_CONFIG.get('rl_auto_reactivate', False):
             print(f"RL: Disabled (rl_weight=0) — auto-reactivation scheduled (decoder pre-wired)")
@@ -5368,6 +5478,7 @@ def train():
             del _raw_checkpoint  # Free memory before full load
 
             # V12.10: Load full training state including optimizer/scheduler
+            # V14.1: Pass tokenizer for inline isotope initialization on vocab expansion
             resume_state = load_checkpoint(
                 encoder, decoder, checkpoint_path,
                 entropy_manager=entropy_manager,
@@ -5375,6 +5486,7 @@ def train():
                 enc_scheduler=enc_scheduler, dec_scheduler=dec_scheduler,
                 theory_loss_fn=theory_loss_fn,  # V12.22
                 physics_z_loss_fn=physics_z_loss_fn,  # V12.31
+                v13_tokenizer=v13_tokenizer,  # V14.1: Isotope-aware vocab expansion
             )
             start_epoch = resume_state['start_epoch']
             prev_exact = resume_state['prev_exact']
@@ -5517,6 +5629,9 @@ def train():
     rl_activation_exact = prev_exact if rl_reactivated else None   # TF exact at RL activation (safety baseline)
     rl_target_weight = TRAIN_CONFIG.get('rl_weight', 0.0)         # Target rl_weight (warmup ramps toward this)
     rl_warmup_done = rl_reactivated  # Skip warmup when RL was already active at startup (resume)
+
+    # V14.1: RL auto-scaling state — calibrate rl_weight from first epoch's raw RL loss
+    rl_auto_scale_done = False  # True after first calibration
 
     # V13.1: PhysZ auto-reactivation state
     physz_reactivated = TRAIN_CONFIG.get('use_physics_z', False)  # Already active if enabled
@@ -5924,6 +6039,28 @@ def train():
             stop_loss_weight=epoch_stop_loss_weight,  # V12.40: For skip scheduling
             stoich_cond_tf=TRAIN_CONFIG.get('stoich_cond_tf', 1.0),  # V12.41: Stoich conditioning TF
         )
+
+        # V14.1: RL auto-scaling — after first epoch with RL active, measure raw RL loss
+        # and set rl_weight so |rl_weight * raw_rl_loss| ≈ target. Gradients still flow
+        # correctly (direction preserved, only magnitude scaled). This replaces manual tuning.
+        if (not rl_auto_scale_done
+                and TRAIN_CONFIG.get('rl_auto_scale', False)
+                and rl_reactivated
+                and loss_fn.rl_weight > 0
+                and abs(metrics.get('reinforce_loss', 0.0)) > 1e-6):
+            _raw_rl = abs(metrics['reinforce_loss'])
+            _target = TRAIN_CONFIG.get('rl_auto_scale_target', 10.0)
+            _auto_w = _target / _raw_rl
+            # Clamp to reasonable range to avoid pathological values
+            _auto_w = max(0.01, min(_auto_w, 10.0))
+            _old_w = loss_fn.rl_weight
+            loss_fn.rl_weight = _auto_w
+            TRAIN_CONFIG['rl_weight'] = _auto_w
+            rl_target_weight = _auto_w  # Update target so warmup/safety use calibrated value
+            rl_auto_scale_done = True
+            print(f"  [V14.1 RL AUTO-SCALE] Calibrated rl_weight from first epoch: "
+                  f"|raw_rl|={_raw_rl:.2f}, target={_target:.1f} → rl_weight={_auto_w:.4f} "
+                  f"(was {_old_w:.4f})", flush=True)
 
         # V12.11: Catastrophic drop detection - rollback to best checkpoint and halve LR
         # This protects against scheduler bugs, gradient explosions, or other instabilities

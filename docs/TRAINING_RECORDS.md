@@ -4,6 +4,40 @@ Chronological record of training runs, architecture changes, and optimization de
 
 ---
 
+## V14.1: Inline Isotope Init + RL Auto-Scaling (2026-02-21)
+
+### Inline Isotope Initialization in `load_checkpoint()`
+
+Previously, resuming from a pre-isotope checkpoint (e.g., V12.41/V13) into a V14+ model required running a separate migration script (`scripts/migrate_v13_to_v14.py`) to properly initialize isotope token embeddings. Without migration, the generic partial-preserve fallback zero-filled new token rows, causing 99.4% → 0.0% exact match collapse.
+
+**Fix**: `load_checkpoint()` now accepts a `v13_tokenizer` parameter. When vocab expansion is detected (checkpoint vocab < model vocab and isotope tokens exist), it automatically:
+- Initializes isotope `token_embedding` rows from parent element embeddings + mass-aware noise
+- Initializes `output_proj.4.weight` isotope rows from parent element rows + noise
+- Copies parent element biases to `output_proj.4.bias` isotope rows
+- Initializes `ISO_UNK` from mean of special tokens
+
+This means `resume_checkpoint` can point to ANY checkpoint (including `checkpoint_best.pt`) — no separate migration step needed.
+
+### RL Auto-Scaling
+
+New config: `rl_auto_scale=True`, `rl_auto_scale_target=10.0`
+
+After the first training epoch with RL active, measures `|raw_rl_loss|` and sets:
+```
+rl_weight = rl_auto_scale_target / |raw_rl_loss|
+```
+
+This ensures the RL gradient contribution is always at a reasonable magnitude (target ≈ 10) regardless of model state. Prevents the -117 reward catastrophe when resuming from a different architecture. Gradients flow correctly at any scale — only magnitude changes, not direction.
+
+Weight is clamped to [0.01, 10.0] to prevent pathological values from near-zero RL losses.
+
+### Config Changes
+- `resume_checkpoint` → `'outputs/checkpoint_best.pt'` (no longer requires pre-migrated checkpoint)
+- `rl_auto_scale: True` — enable dynamic RL weight calibration
+- `rl_auto_scale_target: 10.0` — target |RL contribution| magnitude
+
+---
+
 ## V15.0: Data Expansion — 5 External Datasets + Vocab Rebuild (2026-02-20)
 
 ### Dataset Merge
