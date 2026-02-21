@@ -180,7 +180,7 @@ def migrate_checkpoint(
         # --- Token embedding ---
         if key == 'token_embedding.weight':
             old_embed = value  # [old_vocab, d_model]
-            new_embed = torch.zeros(new_vocab_size, d_model)
+            new_embed = torch.zeros(new_vocab_size, d_model, dtype=value.dtype)
 
             # Copy mapped weights
             for old_idx, new_idx in idx_map.items():
@@ -193,7 +193,7 @@ def migrate_checkpoint(
             n_initialized = 0
             for frac_str in new_frac_strs:
                 new_idx = new_frac_to_idx[frac_str]
-                new_embed[new_idx] = frac_unk_embed + torch.randn(d_model) * 0.02
+                new_embed[new_idx] = frac_unk_embed + torch.randn(d_model, dtype=value.dtype) * 0.02
                 n_initialized += 1
             print(f"  {key}: [{old_vocab_size}, {d_model}] -> [{new_vocab_size}, {d_model}]")
             print(f"    Initialized {n_initialized} new fraction embeddings from FRAC_UNK")
@@ -204,7 +204,7 @@ def migrate_checkpoint(
         # --- Output projection weight ---
         if key == 'output_proj.4.weight':
             old_weight = value  # [old_vocab, d_model]
-            new_weight = torch.zeros(new_vocab_size, d_model)
+            new_weight = torch.zeros(new_vocab_size, d_model, dtype=value.dtype)
 
             for old_idx, new_idx in idx_map.items():
                 if old_idx < old_weight.shape[0]:
@@ -223,7 +223,7 @@ def migrate_checkpoint(
         # --- Output projection bias ---
         if key == 'output_proj.4.bias':
             old_bias = value  # [old_vocab]
-            new_bias = torch.zeros(new_vocab_size)
+            new_bias = torch.zeros(new_vocab_size, dtype=value.dtype)
 
             for old_idx, new_idx in idx_map.items():
                 if old_idx < old_bias.shape[0]:

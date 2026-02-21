@@ -65,7 +65,7 @@ def initialize_isotope_embeddings(
         Tensor of shape [n_isotope_tokens, d_model] with initialized embeddings
     """
     n_isotopes = tokenizer.n_isotope_tokens
-    iso_embeddings = torch.zeros(n_isotopes, d_model)
+    iso_embeddings = torch.zeros(n_isotopes, d_model, dtype=base_embedding.dtype)
 
     # Try to load natural abundances for mass-aware scaling
     try:
@@ -93,7 +93,7 @@ def initialize_isotope_embeddings(
                 mass_deviation = abs(mass - most_abundant.mass_number) / most_abundant.mass_number
                 scale = noise_scale * (1.0 + mass_deviation)
 
-        noise = torch.randn(d_model) * scale
+        noise = torch.randn(d_model, dtype=base_embedding.dtype) * scale
         iso_embeddings[i] = parent_embed + noise
 
     return iso_embeddings
@@ -173,7 +173,7 @@ def migrate_checkpoint(
     for key, value in dec_state.items():
         # --- Token embedding: expand with isotope rows ---
         if key == 'token_embedding.weight':
-            new_embed = torch.zeros(new_vocab_size, d_model)
+            new_embed = torch.zeros(new_vocab_size, d_model, dtype=value.dtype)
             # Copy all existing V13 rows as-is
             new_embed[:old_vocab_size] = value
 
@@ -181,7 +181,7 @@ def migrate_checkpoint(
             iso_unk_idx = tokenizer.iso_unk_idx
             if iso_unk_idx is not None:
                 special_mean = value[:5].mean(dim=0)
-                new_embed[iso_unk_idx] = special_mean + torch.randn(d_model) * 0.01
+                new_embed[iso_unk_idx] = special_mean + torch.randn(d_model, dtype=value.dtype) * 0.01
 
             # Initialize isotope tokens from parent element embeddings
             iso_embeds = initialize_isotope_embeddings(tokenizer, value, d_model)
@@ -194,7 +194,7 @@ def migrate_checkpoint(
 
         # --- Output projection final layer weight: expand rows ---
         if key == 'output_proj.4.weight':
-            new_weight = torch.zeros(new_vocab_size, d_model)
+            new_weight = torch.zeros(new_vocab_size, d_model, dtype=value.dtype)
             new_weight[:old_vocab_size] = value
 
             # ISO_UNK: small random init
@@ -208,7 +208,7 @@ def migrate_checkpoint(
                 token_id = iso_start + i
                 elem_idx = tokenizer.element_idx_for_isotope(token_id)
                 if elem_idx < old_vocab_size:
-                    new_weight[token_id] = value[elem_idx] + torch.randn(d_model) * 0.01
+                    new_weight[token_id] = value[elem_idx] + torch.randn(d_model, dtype=value.dtype) * 0.01
                 else:
                     nn.init.xavier_uniform_(new_weight[token_id:token_id + 1])
 
@@ -218,7 +218,7 @@ def migrate_checkpoint(
 
         # --- Output projection final layer bias: expand ---
         if key == 'output_proj.4.bias':
-            new_bias = torch.zeros(new_vocab_size)
+            new_bias = torch.zeros(new_vocab_size, dtype=value.dtype)
             new_bias[:old_vocab_size] = value
 
             # Isotope biases: copy parent element bias

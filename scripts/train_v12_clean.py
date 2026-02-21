@@ -3530,7 +3530,7 @@ def load_checkpoint(encoder, decoder, checkpoint_path, entropy_manager=None,
                 iso_unk_idx = v13_tokenizer.iso_unk_idx
                 if iso_unk_idx is not None and iso_unk_idx >= _old_vocab:
                     special_mean = dec_state[key][:5].mean(dim=0)
-                    new_embed[iso_unk_idx] = special_mean + torch.randn(d_model) * 0.01
+                    new_embed[iso_unk_idx] = special_mean + torch.randn(d_model, dtype=dec_state[key].dtype) * 0.01
 
                 # Isotope tokens: parent element embedding + mass-aware noise
                 _scripts_dir = str(Path(__file__).parent)
@@ -3564,7 +3564,7 @@ def load_checkpoint(encoder, decoder, checkpoint_path, entropy_manager=None,
                     token_id = iso_start + i
                     elem_idx = v13_tokenizer.element_idx_for_isotope(token_id)
                     if elem_idx < _old_vocab:
-                        new_weight[token_id] = dec_state[key][elem_idx] + torch.randn(d_model) * 0.01
+                        new_weight[token_id] = dec_state[key][elem_idx] + torch.randn(d_model, dtype=dec_state[key].dtype) * 0.01
                     else:
                         nn.init.xavier_uniform_(new_weight[token_id:token_id + 1])
 
