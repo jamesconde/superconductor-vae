@@ -82,7 +82,8 @@ from superconductor.encoders.element_properties import get_atomic_number
 
 # V12.8: REINFORCE support with GPU-native rewards
 from superconductor.losses.reward_gpu_native import (
-    compute_reward_gpu_native, GPURewardConfig, get_default_gpu_reward_config
+    compute_reward_gpu_native, GPURewardConfig, get_default_gpu_reward_config,
+    GPURewardConfigV14, get_v14_gpu_reward_config,
 )
 
 # V12.9: Entropy maintenance for REINFORCE (prevents entropy collapse)
@@ -522,6 +523,44 @@ TRAIN_CONFIG = {
     'rl_reactivation_window': 20,             # Epochs to measure plateau over
     'rl_reactivation_plateau_threshold': 0.01, # <1% improvement over window = plateau
     'rl_reactivation_force_exact': 0.92,      # Force-activate at 92% regardless of plateau
+
+    # =========================================================================
+    # V14.0: RL Curriculum Redesign
+    # =========================================================================
+    # Addresses the 3→4 error cliff that killed gradient for 72% of population.
+    # Continuous power-law reward, token-type penalties, warmup, safety guard,
+    # PhysZ staggering, temperature schedule.
+    # =========================================================================
+    'use_v14_reward': True,              # Use GPURewardConfigV14 (continuous reward)
+
+    # V14.0: Continuous reward parameters
+    'v14_sharpness': 4.0,               # Power-law exponent (higher = steeper near-exact bonus)
+    'v14_max_reward': 100.0,            # Maximum reward for exact match
+
+    # V14.0: Token-type-aware penalties (overlaid on continuous base)
+    'v14_element_error_penalty': -3.0,   # Wrong element = wrong compound
+    'v14_integer_error_penalty': -1.0,   # Wrong integer = wrong stoichiometry
+    'v14_fraction_error_penalty': -0.5,  # Wrong fraction
+    'v14_special_error_penalty': -0.5,   # Wrong BOS/EOS/PAD
+
+    # V14.0: RL warmup schedule (after reactivation)
+    'rl_warmup_epochs': 20,              # Linear ramp from start to 1.0
+    'rl_warmup_start': 0.1,             # Start rl_weight at 10%
+
+    # V14.0: RL safety guard — protect TF exact from RL destabilization
+    'rl_safety_exact_drop': 0.02,        # Halve rl_weight if TF exact drops >2%
+    'rl_safety_check_interval': 5,       # Check every 5 epochs
+
+    # V14.0: PhysZ staggering — don't start RL until PhysZ warmup complete
+    'rl_requires_physz_stable': True,
+
+    # V14.0: Temperature schedule (exploration → exploitation)
+    'rl_temperature_start': 0.5,         # More exploration early in RL
+    'rl_temperature_end': 0.2,           # Focus exploitation later
+    'rl_temperature_decay_epochs': 50,   # Gradual decay over 50 epochs
+
+    # V14.0: Phased reward curriculum (STRETCH GOAL — disabled by default)
+    'rl_use_phased_curriculum': False,    # Phase 1: elements only, Phase 2: +integers, Phase 3: full
 
     # V12.40: Smart loss skip scheduling — skip converged losses to save compute
     # Each loss is tracked independently. When a loss drops below its converge_threshold,
@@ -2060,7 +2099,22 @@ class CombinedLossWithREINFORCE(nn.Module):
         self._hard_stop_threshold = 0.0  # V12.37: Set via set_decoder()
 
         # GPU-native reward config
-        self.gpu_reward_config = get_default_gpu_reward_config()
+        # V14.0: Use continuous reward config when enabled
+        if TRAIN_CONFIG.get('use_v14_reward', False):
+            self.gpu_reward_config = get_v14_gpu_reward_config(
+                use_continuous_reward=True,
+                max_reward=TRAIN_CONFIG.get('v14_max_reward', 100.0),
+                sharpness=TRAIN_CONFIG.get('v14_sharpness', 4.0),
+                element_error_penalty=TRAIN_CONFIG.get('v14_element_error_penalty', -3.0),
+                integer_error_penalty=TRAIN_CONFIG.get('v14_integer_error_penalty', -1.0),
+                fraction_error_penalty=TRAIN_CONFIG.get('v14_fraction_error_penalty', -0.5),
+                special_error_penalty=TRAIN_CONFIG.get('v14_special_error_penalty', -0.5),
+                use_phased_curriculum=TRAIN_CONFIG.get('rl_use_phased_curriculum', False),
+            )
+            print(f"  [V14] Continuous reward: sharpness={self.gpu_reward_config.sharpness}, "
+                  f"element_penalty={self.gpu_reward_config.element_error_penalty}")
+        else:
+            self.gpu_reward_config = get_default_gpu_reward_config()
 
         # Focal loss or standard CE
         self.use_focal_loss = use_focal_loss
@@ -5454,6 +5508,14 @@ def train():
     # V13.1: RL auto-reactivation state
     rl_reactivated = TRAIN_CONFIG.get('rl_weight', 0.0) > 0  # Already active if weight > 0
     rl_exact_history = []  # Ring buffer of recent TF exact match values
+    # V14.0: RL warmup and safety guard state
+    # rl_activation_epoch: When RL was freshly activated. Used for warmup ramp, safety guard,
+    #   and temperature schedule. On resume with RL already active, set to start_epoch so
+    #   safety guard and temp schedule work, but warmup is skipped (see rl_warmup_done).
+    rl_activation_epoch = start_epoch if rl_reactivated else None
+    rl_activation_exact = prev_exact if rl_reactivated else None   # TF exact at RL activation (safety baseline)
+    rl_target_weight = TRAIN_CONFIG.get('rl_weight', 0.0)         # Target rl_weight (warmup ramps toward this)
+    rl_warmup_done = rl_reactivated  # Skip warmup when RL was already active at startup (resume)
 
     # V13.1: PhysZ auto-reactivation state
     physz_reactivated = TRAIN_CONFIG.get('use_physics_z', False)  # Already active if enabled
@@ -5508,37 +5570,88 @@ def train():
         if (not rl_reactivated
                 and TRAIN_CONFIG.get('rl_auto_reactivate', False)
                 and epoch > start_epoch):
-            _rl_min = TRAIN_CONFIG.get('rl_reactivation_min_exact', 0.80)
-            _rl_force = TRAIN_CONFIG.get('rl_reactivation_force_exact', 0.92)
-            _rl_window = TRAIN_CONFIG.get('rl_reactivation_window', 20)
-            _rl_thresh = TRAIN_CONFIG.get('rl_reactivation_plateau_threshold', 0.01)
 
-            _activate = False
-            _reason = ""
+            # V14.0: PhysZ staggering — don't start RL until PhysZ warmup is complete
+            _physz_blocks_rl = False
+            if TRAIN_CONFIG.get('rl_requires_physz_stable', False):
+                _pz_warmup = TRAIN_CONFIG.get('physics_z_warmup_epochs', 20)
+                if physz_reactivated and (epoch - physics_z_intro_epoch) < _pz_warmup:
+                    _physz_blocks_rl = True
+                    # Only log once per PhysZ warmup period
+                    if (epoch - physics_z_intro_epoch) == 0:
+                        print(f"  [V14 STAGGER] RL blocked — PhysZ warmup in progress "
+                              f"({_pz_warmup} epochs remaining)", flush=True)
 
-            # Condition 3: Force-activate at high exact regardless of plateau
-            if prev_exact >= _rl_force:
-                _activate = True
-                _reason = f"TF exact {prev_exact*100:.1f}% >= force threshold {_rl_force*100:.0f}%"
+            if not _physz_blocks_rl:
+                _rl_min = TRAIN_CONFIG.get('rl_reactivation_min_exact', 0.80)
+                _rl_force = TRAIN_CONFIG.get('rl_reactivation_force_exact', 0.92)
+                _rl_window = TRAIN_CONFIG.get('rl_reactivation_window', 20)
+                _rl_thresh = TRAIN_CONFIG.get('rl_reactivation_plateau_threshold', 0.01)
 
-            # Conditions 1+2: Plateau detection
-            elif prev_exact >= _rl_min and len(rl_exact_history) >= _rl_window:
-                _window_start = rl_exact_history[-_rl_window]
-                _improvement = prev_exact - _window_start
-                if _improvement < _rl_thresh:
+                _activate = False
+                _reason = ""
+
+                # Condition 3: Force-activate at high exact regardless of plateau
+                if prev_exact >= _rl_force:
                     _activate = True
-                    _reason = (f"TF exact plateaued: {_window_start*100:.1f}% → {prev_exact*100:.1f}% "
-                              f"(+{_improvement*100:.2f}%) over {_rl_window} epochs < {_rl_thresh*100:.1f}% threshold")
+                    _reason = f"TF exact {prev_exact*100:.1f}% >= force threshold {_rl_force*100:.0f}%"
 
-            if _activate:
-                _rl_w = TRAIN_CONFIG.get('rl_reactivation_weight', 1.0)
-                loss_fn.rl_weight = _rl_w
-                TRAIN_CONFIG['rl_weight'] = _rl_w  # Update config so logging/skip logic sees it
-                rl_reactivated = True
-                print(f"\n{'='*70}")
-                print(f"  [RL SCHEDULER] Reactivating REINFORCE (rl_weight={_rl_w})")
-                print(f"  Reason: {_reason}")
-                print(f"{'='*70}\n", flush=True)
+                # Conditions 1+2: Plateau detection
+                elif prev_exact >= _rl_min and len(rl_exact_history) >= _rl_window:
+                    _window_start = rl_exact_history[-_rl_window]
+                    _improvement = prev_exact - _window_start
+                    if _improvement < _rl_thresh:
+                        _activate = True
+                        _reason = (f"TF exact plateaued: {_window_start*100:.1f}% → {prev_exact*100:.1f}% "
+                                  f"(+{_improvement*100:.2f}%) over {_rl_window} epochs < {_rl_thresh*100:.1f}% threshold")
+
+                if _activate:
+                    _rl_w = TRAIN_CONFIG.get('rl_reactivation_weight', 1.0)
+                    rl_target_weight = _rl_w  # V14.0: Store target for warmup
+                    rl_activation_epoch = epoch  # V14.0: Track when RL started
+                    rl_activation_exact = prev_exact  # V14.0: Baseline for safety guard
+
+                    # V14.0: Apply warmup — start at reduced weight
+                    _warmup_epochs = TRAIN_CONFIG.get('rl_warmup_epochs', 0)
+                    _warmup_start = TRAIN_CONFIG.get('rl_warmup_start', 0.1)
+                    if _warmup_epochs > 0:
+                        _initial_w = _rl_w * _warmup_start
+                    else:
+                        _initial_w = _rl_w
+
+                    loss_fn.rl_weight = _initial_w
+                    TRAIN_CONFIG['rl_weight'] = _initial_w  # Update config so logging/skip logic sees it
+                    rl_reactivated = True
+                    rl_warmup_done = False  # Fresh activation — warmup ramp starts now
+
+                    # Create entropy manager if not already initialized (RL was off at startup)
+                    if entropy_manager is None:
+                        entropy_config = EntropyConfig(
+                            strategy=TRAIN_CONFIG.get('entropy_strategy', 'causal'),
+                            target_entropy=TRAIN_CONFIG.get('entropy_target', 0.5),
+                            min_entropy=TRAIN_CONFIG.get('entropy_min', 0.1),
+                            entropy_weight_base=TRAIN_CONFIG.get('entropy_weight', 0.2),
+                            entropy_weight_min=TRAIN_CONFIG.get('entropy_weight_min', 0.05),
+                            entropy_weight_max=TRAIN_CONFIG.get('entropy_weight_max', 1.0),
+                            plateau_window=TRAIN_CONFIG.get('entropy_plateau_window', 10),
+                            plateau_threshold=TRAIN_CONFIG.get('entropy_plateau_threshold', 0.01),
+                            plateau_relative=TRAIN_CONFIG.get('entropy_plateau_relative', True),
+                            temperature_base=TRAIN_CONFIG.get('rl_temperature_start',
+                                                              TRAIN_CONFIG.get('rl_temperature', 0.8)),
+                        )
+                        entropy_manager = EntropyManager(
+                            strategy=TRAIN_CONFIG.get('entropy_strategy', 'causal'),
+                            config=entropy_config,
+                            max_len=TRAIN_CONFIG['max_formula_len'],
+                        )
+                        _shutdown_state['entropy_manager'] = entropy_manager
+
+                    print(f"\n{'='*70}")
+                    print(f"  [RL SCHEDULER] Reactivating REINFORCE (target={_rl_w}, initial={_initial_w})")
+                    if _warmup_epochs > 0:
+                        print(f"  [V14 WARMUP] {_warmup_start*100:.0f}% → 100% over {_warmup_epochs} epochs")
+                    print(f"  Reason: {_reason}")
+                    print(f"{'='*70}\n", flush=True)
 
         # V13.1: PhysZ auto-reactivation scheduler
         # Phase 1: Activate PhysZ when exact match plateaus
@@ -5624,6 +5737,85 @@ def train():
                               f"(>= baseline {physz_activation_exact*100:.1f}%) — "
                               f"restoring full PhysZ weight", flush=True)
                         physz_current_weight_scale = 1.0
+
+        # V14.0: RL warmup ramp — gradually increase rl_weight after activation
+        # Skipped when RL was already active at startup (rl_warmup_done=True on resume)
+        if rl_reactivated and rl_activation_epoch is not None and not rl_warmup_done:
+            _warmup_epochs = TRAIN_CONFIG.get('rl_warmup_epochs', 0)
+            _warmup_start = TRAIN_CONFIG.get('rl_warmup_start', 0.1)
+            _rl_epochs_since = epoch - rl_activation_epoch
+
+            if _warmup_epochs > 0 and _rl_epochs_since < _warmup_epochs:
+                # Linear ramp from warmup_start to 1.0
+                _progress = _rl_epochs_since / _warmup_epochs
+                _warmup_factor = _warmup_start + (1.0 - _warmup_start) * _progress
+                _ramped_w = rl_target_weight * _warmup_factor
+                loss_fn.rl_weight = _ramped_w
+                TRAIN_CONFIG['rl_weight'] = _ramped_w
+                if _rl_epochs_since % 5 == 0:
+                    print(f"  [V14 WARMUP] rl_weight={_ramped_w:.3f} "
+                          f"({_warmup_factor*100:.0f}% of target {rl_target_weight})", flush=True)
+            elif _warmup_epochs > 0 and _rl_epochs_since == _warmup_epochs:
+                # Warmup complete — set to full target weight
+                loss_fn.rl_weight = rl_target_weight
+                TRAIN_CONFIG['rl_weight'] = rl_target_weight
+                rl_warmup_done = True
+                print(f"  [V14 WARMUP] Complete — rl_weight={rl_target_weight}", flush=True)
+            elif _warmup_epochs == 0:
+                rl_warmup_done = True  # No warmup configured
+
+        # V14.0: RL safety guard — protect TF exact from RL destabilization
+        if rl_reactivated and rl_activation_exact is not None and rl_activation_epoch is not None:
+            _rl_safety_interval = TRAIN_CONFIG.get('rl_safety_check_interval', 5)
+            _rl_safety_drop = TRAIN_CONFIG.get('rl_safety_exact_drop', 0.02)
+            _rl_epochs_since = epoch - rl_activation_epoch
+
+            if _rl_epochs_since > 0 and _rl_epochs_since % _rl_safety_interval == 0:
+                _rl_regression = rl_activation_exact - prev_exact
+                if _rl_regression > _rl_safety_drop:
+                    # TF exact has regressed — halve rl_weight
+                    _old_w = loss_fn.rl_weight
+                    _new_w = _old_w * 0.5
+                    if _new_w < 0.05:
+                        # Below floor — pause RL entirely
+                        _new_w = 0.0
+                        print(f"\n  [V14 RL GUARD] PAUSED — TF exact {prev_exact*100:.1f}% dropped "
+                              f"{_rl_regression*100:.1f}% from activation baseline "
+                              f"{rl_activation_exact*100:.1f}% (rl_weight → 0)", flush=True)
+                    else:
+                        print(f"\n  [V14 RL GUARD] Reducing rl_weight: {_old_w:.3f} → {_new_w:.3f} "
+                              f"(TF exact {prev_exact*100:.1f}% dropped "
+                              f"{_rl_regression*100:.1f}% from baseline {rl_activation_exact*100:.1f}%)", flush=True)
+                    loss_fn.rl_weight = _new_w
+                    TRAIN_CONFIG['rl_weight'] = _new_w
+                    rl_target_weight = _new_w  # Update target so warmup doesn't override
+                elif prev_exact >= rl_activation_exact:
+                    # Exact recovered — log but don't restore (warmup handles ramp-up)
+                    pass
+
+        # V14.0: Temperature schedule — decay from exploration to exploitation
+        if rl_reactivated and rl_activation_epoch is not None and entropy_manager is not None:
+            _temp_start = TRAIN_CONFIG.get('rl_temperature_start', 0.5)
+            _temp_end = TRAIN_CONFIG.get('rl_temperature_end', 0.2)
+            _temp_decay_epochs = TRAIN_CONFIG.get('rl_temperature_decay_epochs', 50)
+            _rl_epochs_since = epoch - rl_activation_epoch
+
+            if _temp_decay_epochs > 0 and _temp_start != _temp_end:
+                _temp_progress = min(1.0, _rl_epochs_since / _temp_decay_epochs)
+                _current_base_temp = _temp_start + (_temp_end - _temp_start) * _temp_progress
+                entropy_manager.set_base_temperature(_current_base_temp)
+
+        # V14.0: Phased reward curriculum — update reward_phase based on RL epoch
+        if (rl_reactivated and rl_activation_epoch is not None
+                and TRAIN_CONFIG.get('rl_use_phased_curriculum', False)):
+            _rl_epochs_since = epoch - rl_activation_epoch
+            if hasattr(loss_fn, 'gpu_reward_config') and hasattr(loss_fn.gpu_reward_config, 'reward_phase'):
+                if _rl_epochs_since < 15:
+                    loss_fn.gpu_reward_config.reward_phase = 1
+                elif _rl_epochs_since < 30:
+                    loss_fn.gpu_reward_config.reward_phase = 2
+                else:
+                    loss_fn.gpu_reward_config.reward_phase = 3
 
         # Get curriculum weights for this epoch
         tc_weight, magpie_weight = get_curriculum_weights(epoch)

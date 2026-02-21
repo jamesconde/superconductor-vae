@@ -1226,6 +1226,19 @@ class EntropyManager:
         if position_errors is not None and position_mask is not None:
             self.position_weighter.update(position_errors, position_mask)
 
+    def set_base_temperature(self, new_base: float):
+        """V14.0: Set the base temperature for the temperature scheduler.
+
+        This allows the RL temperature schedule to work WITH the existing entropy
+        management (cyclical boosts, etc.) rather than bypassing it. The schedule
+        sets the base, and the entropy manager adds its adjustments on top.
+
+        Args:
+            new_base: New base temperature value
+        """
+        self.config.temperature_base = new_base
+        self.temperature_scheduler.base_temperature = new_base
+
     def get_info(self, epoch: int, current_entropy: Optional[float] = None) -> Dict:
         """
         Get detailed info about current entropy maintenance state.

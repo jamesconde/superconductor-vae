@@ -52,6 +52,34 @@ No training data contains isotope tokens yet. This is infrastructure for future 
 
 ---
 
+## Data Acquisition: High-Tc Dataset Download (2026-02-20)
+
+Downloaded 6 external superconductor datasets to augment the 100-200K and >200K Tc bins per `docs/high_tc_data_acquisition.md`.
+
+| Dataset | Location | Entries | Tc>=100K | Type |
+|---------|----------|---------|---------|------|
+| MDR SuperCon primary.tsv | `data/mdr_supercon/` | 26,358 | 910 | Experimental |
+| SuperCon2 cleanup | `data/supercon2_repo/` | 18,943 | 1,180* | NLP-extracted |
+| 3DSC_MP | `data/3DSC_repo/` | 5,773 | 23 | Experimental |
+| SODNet | `data/SODNet_repo/` | 11,949 + 1,578 | 136 + 35 | Experimental |
+| JARVIS (4 datasets) | `data/jarvis_hydrides/` | 25,886 | 159 | Mixed DFT/Exp |
+| HTSC-2025 | `data/HTSC2025_repo/` | 140 | 4 | DFT predictions |
+
+\* SuperCon2 has severe data quality issues — many entries with Tc>=200K are Curie/structural temperatures, not superconducting Tc. Aggressive filtering required.
+
+**Key findings:**
+- MDR primary.tsv is most useful for immediate training augmentation (910 entries at Tc>=100K)
+- JARVIS alex_supercon (8,253 entries with lambda, wlog, Debye temp, DOS) is ideal for future Theory Networks
+- JARVIS supercon_3d (1,058 entries with Eliashberg spectral functions) is ideal for Eliashberg Theory Network
+- No dataset contains reliable high-pressure hydride data with pressure annotations — the manually curated Source 7 from `docs/high_tc_data_acquisition.md` remains the best source for >200K entries
+- MDR top Tc entries include 2 retracted Nature papers (Dias Lu-hydride 294K, Snider C-S-H 287.7K)
+
+**Reports:** Individual analysis reports in `scratch/` (*_report.txt). Master summary: `scratch/dataset_acquisition_master_summary.md`
+
+**Next steps:** Deduplicate MDR vs existing training data, clean SuperCon2, build unified merge pipeline.
+
+---
+
 ## V13.2: Enable RL (SCST), Tc-Binned Sampling, Fix Decoder Wiring (2026-02-19)
 
 ### Enable REINFORCE/SCST for Autoregressive Refinement

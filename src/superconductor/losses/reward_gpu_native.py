@@ -16,7 +16,14 @@ possible). A new fraction-value penalty replaces the old digit penalty — it
 scales by the difference in float values between predicted and target fraction
 tokens. Basic token-match and exact-match rewards are tokenizer-agnostic.
 
-December 2025
+V14.0 UPDATE: Continuous reward function eliminates the 3→4 error cliff that
+killed gradient for 72% of the population. Power-law reward = max_reward *
+(n_correct / n_total) ^ sharpness gives smooth, monotonic signal for all error
+counts. Token-type-aware penalties differentiate element errors (most harmful)
+from stoichiometry errors. Symmetric too-short detection mirrors too-long handling.
+Phased curriculum option (disabled by default) for staged reward complexity.
+
+December 2025 / February 2026
 """
 
 import torch
@@ -72,9 +79,66 @@ class GPURewardConfig:
     length_only_floor: float = 10.0         # Minimum reward for length-only errors
 
 
+@dataclass
+class GPURewardConfigV14(GPURewardConfig):
+    """V14.0: Extended reward config with continuous reward and token-type penalties.
+
+    Key changes from GPURewardConfig:
+    - Continuous power-law reward eliminates the 3→4 error cliff
+    - Token-type-aware penalties differentiate element vs stoichiometry errors
+    - Symmetric too-short detection mirrors too-long handling
+    - Optional phased curriculum for staged reward complexity
+
+    When use_continuous_reward=True, the tiered reward (exact/near_exact_1/2/3/partial)
+    is replaced with: reward = max_reward * (n_correct / n_total) ^ sharpness
+    This gives smooth, monotonic gradient for ALL error counts.
+
+    When use_continuous_reward=False, falls back to the original tiered logic
+    (full backward compatibility).
+    """
+
+    # V14.0: Continuous reward (replaces tiered near-exact + partial credit)
+    use_continuous_reward: bool = True
+    max_reward: float = 100.0
+    sharpness: float = 4.0       # Power-law exponent — higher = steeper near-exact bonus
+
+    # V14.0: Token-type-aware penalties (overlaid on continuous base reward)
+    # V13 vocab layout: elements 5-122, integers 123-142, fractions 143+
+    element_error_penalty: float = -3.0   # Wrong element = wrong compound entirely
+    integer_error_penalty: float = -1.0   # Wrong integer = wrong stoichiometry
+    fraction_error_penalty: float = -0.5  # Wrong fraction (value-scaled penalty already exists)
+    special_error_penalty: float = -0.5   # Wrong BOS/EOS/PAD
+
+    # V14.0: Symmetric too-short handling (mirrors too-long at lines 401-420)
+    too_short_base_reward: float = 50.0   # Symmetric with length_only_base_reward
+    too_short_per_missing: float = 5.0    # Penalty per missing token
+    too_short_floor: float = 10.0         # Minimum reward for too-short errors
+
+    # V14.0: Phased reward curriculum (STRETCH GOAL — disabled by default)
+    # Phase 1 (epochs 0-15): Only element correctness counts
+    # Phase 2 (epochs 15-30): Add integer + fraction accuracy
+    # Phase 3 (epochs 30+): Full reward with increased sharpness
+    use_phased_curriculum: bool = False
+    reward_phase: int = 3  # Set externally each epoch (1, 2, or 3)
+    phase3_sharpness: float = 6.0  # Increased sharpness for phase 3
+
+    # V14.0: Token type boundaries (V13 vocab layout)
+    # These are used for token-type classification in the reward
+    v14_element_start: int = 5
+    v14_element_end: int = 122
+    v14_integer_start: int = 123
+    v14_integer_end: int = 142
+    v14_fraction_start: int = 143
+
+
 def get_default_gpu_reward_config() -> GPURewardConfig:
     """Get default GPU-native reward config."""
     return GPURewardConfig()
+
+
+def get_v14_gpu_reward_config(**kwargs) -> 'GPURewardConfigV14':
+    """Get V14 GPU-native reward config with optional overrides."""
+    return GPURewardConfigV14(**kwargs)
 
 
 @torch.no_grad()
@@ -279,6 +343,109 @@ def compute_fraction_value_penalty(
 
 
 @torch.no_grad()
+def _compute_token_type_penalties(
+    sampled_tokens: torch.Tensor,      # [batch, seq_len]
+    target_tokens: torch.Tensor,       # [batch, seq_len]
+    mask: torch.Tensor,                # [batch, seq_len]
+    config: 'GPURewardConfigV14',
+    skip_fraction_penalty: bool = False,
+) -> torch.Tensor:
+    """V14.0: Compute token-type-aware penalties for mismatched tokens.
+
+    Different token types get different penalties:
+    - Element errors (-3.0): Wrong element = completely wrong compound
+    - Integer errors (-1.0): Wrong stoichiometry integer
+    - Fraction errors (-0.5): Wrong fraction (skipped when fraction_penalty already applied)
+    - Special errors (-0.5): Wrong BOS/EOS/PAD
+
+    All pure tensor ops on GPU — negligible overhead.
+
+    Args:
+        sampled_tokens: [batch, seq_len] predicted tokens
+        target_tokens: [batch, seq_len] ground truth tokens
+        mask: [batch, seq_len] valid position mask
+        config: V14 reward config with token type boundaries
+        skip_fraction_penalty: If True, skip fraction type penalty (because
+            fraction_penalty from compute_fraction_value_penalty is already
+            applied separately). Prevents double-penalizing fraction mismatches.
+
+    Returns:
+        penalties: [batch] total token-type penalty per sample
+    """
+    mask = mask.bool()
+    mismatches = (sampled_tokens != target_tokens) & mask
+
+    if not mismatches.any():
+        return torch.zeros(sampled_tokens.shape[0], device=sampled_tokens.device)
+
+    # Classify TARGET token types at mismatch positions
+    target = target_tokens
+    is_element = (target >= config.v14_element_start) & (target <= config.v14_element_end) & mismatches
+    is_integer = (target >= config.v14_integer_start) & (target <= config.v14_integer_end) & mismatches
+    is_fraction = (target >= config.v14_fraction_start) & mismatches
+    # Special = everything else that mismatched (BOS, EOS, PAD, etc.)
+    is_special = mismatches & ~is_element & ~is_integer & ~is_fraction
+
+    # Compute weighted penalty per sample
+    penalties = (
+        is_element.float().sum(dim=1) * config.element_error_penalty +
+        is_integer.float().sum(dim=1) * config.integer_error_penalty +
+        is_special.float().sum(dim=1) * config.special_error_penalty
+    )
+
+    # Only add fraction type penalty when fraction_penalty is NOT already applied.
+    # When use_semantic_fractions=True, compute_fraction_value_penalty() already
+    # penalizes fraction mismatches by value difference — adding fraction_error_penalty
+    # on top would double-penalize.
+    if not skip_fraction_penalty:
+        penalties = penalties + is_fraction.float().sum(dim=1) * config.fraction_error_penalty
+
+    return penalties
+
+
+@torch.no_grad()
+def _compute_continuous_reward(
+    n_correct: torch.Tensor,    # [batch] number of correct tokens
+    n_total: torch.Tensor,      # [batch] total valid tokens
+    config: 'GPURewardConfigV14',
+) -> torch.Tensor:
+    """V14.0: Continuous power-law reward.
+
+    reward = max_reward * (n_correct / n_total) ^ sharpness
+
+    | Errors (15-token seq) | Old Reward | New Reward (sharpness=4) |
+    |----------------------|-----------|-------------------------|
+    | 0 (exact)            | 100.0     | 100.0                   |
+    | 1                    | 50.0      | 75.8                    |
+    | 2                    | 25.0      | 56.4                    |
+    | 3                    | 10.0      | 41.0                    |
+    | 4 (THE CLIFF)        | max 5.0   | 28.9                    |
+    | 5                    | max 5.0   | 19.8                    |
+    | 7                    | max 5.0   | 7.7                     |
+
+    The 3→4 transition becomes 41→29 (smooth 30% drop) instead of 10→5 (cliff).
+
+    Args:
+        n_correct: [batch] number of correct tokens per sample
+        n_total: [batch] total valid tokens per sample
+        config: V14 reward config
+
+    Returns:
+        rewards: [batch] continuous reward per sample
+    """
+    # Avoid division by zero
+    ratio = n_correct / n_total.clamp(min=1.0)
+    ratio = ratio.clamp(0.0, 1.0)
+
+    # Support phased curriculum sharpness
+    sharpness = config.sharpness
+    if config.use_phased_curriculum and config.reward_phase >= 3:
+        sharpness = config.phase3_sharpness
+
+    return config.max_reward * torch.pow(ratio, sharpness)
+
+
+@torch.no_grad()
 def compute_reward_gpu_native(
     sampled_tokens: torch.Tensor,      # [batch, seq_len]
     target_tokens: torch.Tensor,       # [batch, seq_len]
@@ -391,6 +558,112 @@ def compute_reward_gpu_native(
         fraction_penalty = digit_penalty + structure_errors * config.fraction_structure_penalty
     # ========== END FRACTION PENALTY COMPUTATION ==========
 
+    # ========== V14.0: CONTINUOUS REWARD BRANCH ==========
+    # When use_continuous_reward=True (GPURewardConfigV14), use smooth power-law
+    # reward instead of tiered near-exact + partial credit. This eliminates the
+    # 3→4 error cliff that killed gradient for 72% of the population.
+    _is_v14 = isinstance(config, GPURewardConfigV14) and config.use_continuous_reward
+    if _is_v14:
+        rewards = torch.zeros(batch_size, device=device)
+
+        # Exact match gets full bonus (same as before)
+        rewards = torch.where(exact_match,
+                              torch.full_like(rewards, config.exact_match),
+                              rewards)
+
+        not_exact = ~exact_match
+
+        # V12.37: Length-only error detection — "perfect formula, just too long"
+        target_end_col = target_end_pos.unsqueeze(1).long()
+        seq_len = sampled_tokens.size(1)
+        positions = torch.arange(seq_len, device=device).unsqueeze(0)
+        before_target_end = positions < target_end_col
+        prefix_correct = ((sampled_tokens == target_tokens) | ~before_target_end | ~mask).all(dim=1)
+        too_long = sampled_end_pos > target_end_pos
+        length_only_error = prefix_correct & too_long & not_exact
+
+        extra_tokens = (sampled_end_pos - target_end_pos).clamp(min=0)
+        length_only_reward = config.length_only_base_reward - extra_tokens * config.length_only_per_extra
+        length_only_reward = length_only_reward.clamp(min=config.length_only_floor)
+        rewards = torch.where(length_only_error, length_only_reward, rewards)
+
+        # V14.0: Symmetric too-short detection — "correct prefix, stopped too early"
+        # Sampled END before target END, all tokens up to sampled END are correct.
+        # Must verify sampled sequence actually HAS an END token (not just truncated/padded).
+        sampled_end_col = sampled_end_pos.unsqueeze(1).long()
+        before_sampled_end = positions < sampled_end_col
+        prefix_before_sampled_end_correct = (
+            (sampled_tokens == target_tokens) | ~before_sampled_end | ~mask
+        ).all(dim=1)
+        # Verify sampled actually produced an END token (not just ran out of tokens)
+        sampled_actually_has_end = sampled_has_end.any(dim=1)
+        too_short = (sampled_end_pos < target_end_pos) & sampled_actually_has_end
+        too_short_error = prefix_before_sampled_end_correct & too_short & not_exact & ~length_only_error
+
+        missing_tokens = (target_end_pos - sampled_end_pos).clamp(min=0)
+        too_short_reward = config.too_short_base_reward - missing_tokens * config.too_short_per_missing
+        too_short_reward = too_short_reward.clamp(min=config.too_short_floor)
+        rewards = torch.where(too_short_error, too_short_reward, rewards)
+
+        # V14.0: Continuous reward for all other non-exact samples
+        not_handled = not_exact & ~length_only_error & ~too_short_error
+
+        # Determine which tokens to count based on phased curriculum
+        if config.use_phased_curriculum and config.reward_phase < 3:
+            # Phase 1: Only element correctness
+            # Phase 2: Element + integer + fraction correctness
+            target = target_tokens
+            if config.reward_phase == 1:
+                # Only count element token positions
+                position_mask = (
+                    (target >= config.v14_element_start) &
+                    (target <= config.v14_element_end) &
+                    mask
+                )
+            elif config.reward_phase == 2:
+                # Count element + integer + fraction positions
+                position_mask = (
+                    ((target >= config.v14_element_start) & (target <= config.v14_element_end)) |
+                    ((target >= config.v14_integer_start) & (target <= config.v14_integer_end)) |
+                    (target >= config.v14_fraction_start)
+                ) & mask
+            else:
+                position_mask = mask
+
+            phase_matches = ((sampled_tokens == target_tokens) & position_mask).sum(dim=1).float()
+            phase_total = position_mask.sum(dim=1).float()
+            continuous_base = _compute_continuous_reward(phase_matches, phase_total, config)
+        else:
+            # Phase 3 or no curriculum: all tokens count
+            # Use target_end_pos as content length (excludes trailing PAD)
+            # to avoid deflating reward ratio for padded sequences.
+            # +1 to include END token itself in the count.
+            content_length = (target_end_pos + 1).clamp(min=1.0)
+            # Count matches only up to target END (ignore padding matches)
+            before_or_at_target_end = positions <= target_end_col
+            content_matches = ((sampled_tokens == target_tokens) & before_or_at_target_end & mask).sum(dim=1).float()
+            continuous_base = _compute_continuous_reward(content_matches, content_length, config)
+
+        # Overlay token-type penalties on the continuous base
+        # Skip fraction type penalty when fraction_penalty is already applied
+        # (use_semantic_fractions=True gives value-scaled fraction penalty)
+        _has_fraction_penalty = use_semantic_fractions and fraction_values is not None
+        type_penalties = _compute_token_type_penalties(
+            sampled_tokens, target_tokens, mask, config,
+            skip_fraction_penalty=_has_fraction_penalty,
+        )
+
+        # Also add length penalty and fraction penalty
+        length_penalty = length_diff * config.length_mismatch_penalty
+        continuous_reward = continuous_base + type_penalties + fraction_penalty + length_penalty
+        continuous_reward = continuous_reward.clamp(min=-100.0)
+
+        rewards = torch.where(not_handled, continuous_reward, rewards)
+
+        return rewards
+    # ========== END V14.0 CONTINUOUS REWARD BRANCH ==========
+
+    # ========== ORIGINAL TIERED REWARD LOGIC (V12/V13) ==========
     rewards = torch.zeros(batch_size, device=device)
 
     # Exact match gets full bonus

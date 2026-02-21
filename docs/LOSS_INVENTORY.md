@@ -1,6 +1,6 @@
-# Loss Inventory — Superconductor VAE (V12.40)
+# Loss Inventory — Superconductor VAE (V14.0)
 
-Complete inventory of every loss component in `scripts/train_v12_clean.py`. Updated 2026-02-17.
+Complete inventory of every loss component in `scripts/train_v12_clean.py`. Updated 2026-02-20.
 
 ---
 
@@ -9,7 +9,7 @@ Complete inventory of every loss component in `scripts/train_v12_clean.py`. Upda
 | # | Loss | Status | Weight | Typical Value | Skip Schedule |
 |---|------|--------|--------|---------------|---------------|
 | 1 | Formula CE (Focal) | **ACTIVE** | `ce_weight: 1.0` | ~0.7 | Never skip |
-| 2 | REINFORCE/SCST | **ACTIVE** | `rl_weight: 0.05` | ~18.6 raw | Yes (1.0, 0.5) |
+| 2 | REINFORCE/SCST | **ACTIVE** | `rl_weight: 1.0` | ~18.6 raw | Never skip (V13.2) |
 | 3 | Tc MSE | **ACTIVE** | `tc_weight: 10.0` | ~0.43 | Yes (0.5, 0.1) |
 | 4 | Magpie MSE | **ACTIVE** | `magpie_weight: 2.0` | ~0.06 | Yes (0.1, 0.1) |
 | 5 | Stoichiometry MSE | **ACTIVE** | `stoich_weight: 2.0` | ~0.001 | Yes (0.01, 0.05) |
@@ -40,14 +40,25 @@ Complete inventory of every loss component in `scripts/train_v12_clean.py`. Upda
 - **Skip schedule**: NEVER skip — this is the primary learning signal
 
 ### 2. REINFORCE / SCST (Self-Critical Sequence Training)
-- **Version**: V12.8
-- **Config**: `rl_weight: 0.05`, `rl_temperature: 0.2`, `n_samples_rloo: 4`, `rl_method: 'scst'`
+- **Version**: V12.8, **V14.0 reward redesign**
+- **Config**: `rl_weight: 1.0`, `rl_temperature: 0.2`, `n_samples_rloo: 4`, `rl_method: 'scst'`
+- **V14.0 Config**: `use_v14_reward: True`, `v14_sharpness: 4.0`, `v14_max_reward: 100.0`
 - **Computed in**: `CombinedLossWithREINFORCE.compute_scst()` (line ~2099)
 - **What it does**: Sequence-level reinforcement learning. Generates 4 complete formula sequences autoregressively, computes reward (similarity to target), and uses SCST baseline (greedy decode reward) to compute advantages. Provides sequence-level signal that CE alone cannot — rewards whole correct formulas, not just individual tokens.
+- **V14.0 Reward Changes**:
+  - **Continuous power-law reward**: `max_reward * (n_correct / n_total) ^ sharpness` eliminates the 3→4 error cliff that killed gradient for 72% of the population. The 3→4 transition becomes 41→29 (smooth 30% drop) instead of 10→5 (cliff).
+  - **Token-type-aware penalties**: Element errors get -3.0 penalty (wrong compound), integer errors -1.0 (wrong stoichiometry), fractions -0.5, specials -0.5. Overlaid on continuous base reward.
+  - **Symmetric too-short detection**: Mirrors too-long handling. Premature EOS with correct prefix gets high reward (50 base minus 5 per missing token, floor 10).
+  - **Phased curriculum** (disabled by default): Phase 1 = elements only, Phase 2 = +integers, Phase 3 = full reward with sharpness=6.0.
+- **V14.0 Training Controls**:
+  - **RL warmup**: Linear ramp from 10% to 100% over 20 epochs (`rl_warmup_epochs`, `rl_warmup_start`)
+  - **RL safety guard**: Halves rl_weight if TF exact drops >2% from activation baseline. Pauses RL if weight drops below 0.05 (`rl_safety_exact_drop`, `rl_safety_check_interval`)
+  - **PhysZ staggering**: Blocks RL activation until PhysZ warmup is complete (`rl_requires_physz_stable`)
+  - **Temperature schedule**: Decays from 0.5 (exploration) to 0.2 (exploitation) over 50 epochs (`rl_temperature_start/end/decay_epochs`). Works WITH entropy manager via `set_base_temperature()`.
 - **Applied to**: SC samples only (non-SC get z=None → skipped)
 - **Weight mechanism**: `loss_fn.rl_weight` attribute. Guard: `if self.rl_weight > 0` skips all sampling.
 - **Compute cost**: **91% of loss computation time** (4x full autoregressive decode per batch)
-- **Skip schedule**: Yes — (threshold=1.0, delta=0.5). THE big compute saver.
+- **Skip schedule**: Never skip (V13.2) — RL is a policy gradient that fluctuates by design, not a converging loss. Skipping kills the learning signal.
 
 ### 3. Tc MSE (Critical Temperature Prediction)
 - **Version**: V1+ (core)
@@ -217,7 +228,7 @@ Each loss is independently tracked. When converged (below threshold), it's compu
 ```python
 'loss_skip_schedule': {
     # metric_key:      (converge_threshold, spike_delta)
-    'reinforce_loss':  (1.0,   0.5),   # 91% compute savings when skipped
+    # reinforce_loss: REMOVED in V13.2 — RL fluctuates by design, skipping kills signal
     'tc_loss':         (0.5,   0.1),
     'magpie_loss':     (0.1,   0.1),
     'stoich_loss':     (0.01,  0.05),
@@ -236,3 +247,53 @@ Losses NOT in skip schedule (always active):
 - KL/L2 regularization — stability
 - Element count MSE — tiny, always useful
 - Z-norm penalty — tiny, stability
+
+---
+
+## V14.0 RL Curriculum Redesign
+
+### Problem
+After 24 epochs of SCST RL (rl_weight=1.0), AR exact match was stuck at ~1.2% despite TF exact being 99.4%. Error analysis revealed:
+- 26.7% of AR samples have 1-3 errors (RL-tractable) — RL was moving the distribution but couldn't push across the 0-error threshold
+- 72.1% have 4+ errors — reward cliff at 3→4 errors (10.0→5.0) killed gradient for these samples
+- 87% of compute was in RL sampling, for near-zero gradient signal on most samples
+
+### Continuous Reward (eliminates the cliff)
+
+Formula: `reward = max_reward * (n_correct / n_total) ^ sharpness`
+
+| Errors (15-token seq) | Old Reward | New Reward (sharpness=4) |
+|----------------------|-----------|-------------------------|
+| 0 (exact)            | 100.0     | 100.0                   |
+| 1                    | 50.0      | 75.8                    |
+| 2                    | 25.0      | 56.4                    |
+| 3                    | 10.0      | 41.0                    |
+| **4 (THE CLIFF)**    | **max 5.0** | **28.9**              |
+| 5                    | max 5.0   | 19.8                    |
+| 7                    | max 5.0   | 7.7                     |
+
+Config: `GPURewardConfigV14` in `src/superconductor/losses/reward_gpu_native.py`, gated by `use_v14_reward` in TRAIN_CONFIG.
+
+### Token-Type Penalties
+
+| Token Type | Penalty | Rationale |
+|-----------|---------|-----------|
+| Element   | -3.0    | Wrong element = wrong compound entirely |
+| Integer   | -1.0    | Wrong stoichiometry |
+| Fraction  | -0.5    | Wrong fraction (value-scaled penalty already exists) |
+| Special   | -0.5    | Wrong BOS/EOS/PAD |
+
+### Training Controls
+
+| Control | Config Key | Default | Description |
+|---------|-----------|---------|-------------|
+| RL Warmup | `rl_warmup_epochs`, `rl_warmup_start` | 20, 0.1 | Linear ramp from 10% to 100% |
+| RL Safety Guard | `rl_safety_exact_drop`, `rl_safety_check_interval` | 0.02, 5 | Halve weight on >2% TF regression |
+| PhysZ Stagger | `rl_requires_physz_stable` | True | Block RL until PhysZ warmup done |
+| Temp Schedule | `rl_temperature_start/end/decay_epochs` | 0.5, 0.2, 50 | Exploration → exploitation |
+| Phased Curriculum | `rl_use_phased_curriculum` | False | Staged reward complexity |
+
+### Key Files
+- `src/superconductor/losses/reward_gpu_native.py` — `GPURewardConfigV14`, continuous reward, token-type penalties
+- `src/superconductor/training/entropy_maintenance.py` — `set_base_temperature()` for temp schedule
+- `scripts/train_v12_clean.py` — TRAIN_CONFIG keys, warmup/safety/stagger/schedule logic
