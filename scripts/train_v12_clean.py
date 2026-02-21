@@ -681,10 +681,10 @@ TRAIN_CONFIG = {
     'entropy_plateau_relative': True,    # If True, threshold scales with performance
 
     # Resume from checkpoint (set to None to train from scratch)
-    # V14.1: Isotope init happens inline in load_checkpoint() for vocab EXPANSION.
-    # But if fraction vocab was REORDERED (V15 rebuild), use the pre-migrated checkpoint
-    # that has fraction embeddings remapped to new indices.
-    'resume_checkpoint': 'outputs/checkpoint_v15_expanded.pt',
+    # V14.2: Auto-migration — point directly at ANY checkpoint (even pre-V14).
+    # The training script detects if the checkpoint vocab is smaller than the model
+    # vocab and automatically runs the V13→V14→V15 migration chain before loading.
+    'resume_checkpoint': 'outputs/checkpoint_epoch_3999.pt',
 
     # V12.12: Retrain on new/combined data - resets catastrophic drop detector
     # Set to True when training data has changed (new normalization stats)
@@ -5482,6 +5482,74 @@ def train():
         checkpoint_path = PROJECT_ROOT / TRAIN_CONFIG['resume_checkpoint']
         if checkpoint_path.exists():
             print(f"\nResuming from checkpoint: {checkpoint_path}")
+
+            # V14.2: Auto-migration — detect if checkpoint needs vocab migration
+            # Peeks at checkpoint vocab size vs current model vocab. If checkpoint is
+            # smaller, runs the V13→V14 (isotope) and V14→V15 (fraction reorder)
+            # migration chain automatically, so you never need manual migration steps.
+            _peek = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
+            _peek_vocab = None
+            if 'decoder_state_dict' in _peek and 'token_embedding.weight' in _peek['decoder_state_dict']:
+                _peek_vocab = _peek['decoder_state_dict']['token_embedding.weight'].shape[0]
+            elif 'model_state_dict' in _peek:
+                for k, v in _peek['model_state_dict'].items():
+                    if 'token_embedding.weight' in k:
+                        _peek_vocab = v.shape[0]
+                        break
+            _model_vocab = decoder.token_embedding.num_embeddings
+            del _peek
+
+            if _peek_vocab is not None and _peek_vocab < _model_vocab:
+                print(f"\n  [AUTO-MIGRATE] Checkpoint vocab ({_peek_vocab}) < model vocab ({_model_vocab})")
+                print(f"  Running automatic migration chain...", flush=True)
+
+                _scripts_dir = str(Path(__file__).parent)
+                if _scripts_dir not in sys.path:
+                    sys.path.insert(0, _scripts_dir)
+
+                _frac_vocab = str(PROJECT_ROOT / TRAIN_CONFIG.get('fraction_vocab_path', 'data/fraction_vocab.json'))
+                _iso_vocab = str(PROJECT_ROOT / TRAIN_CONFIG.get('isotope_vocab_path', 'data/isotope_vocab.json'))
+                _max_len = TRAIN_CONFIG.get('max_formula_len', 30)
+                _v14_path = str(PROJECT_ROOT / 'outputs' / 'checkpoint_v14_auto_migrated.pt')
+                _v15_path = str(PROJECT_ROOT / 'outputs' / 'checkpoint_v15_auto_migrated.pt')
+
+                # Check if fraction vocab was also reordered (V15 expansion)
+                _old_frac_vocab = str(PROJECT_ROOT / 'data' / 'fraction_vocab_old.json')
+                _needs_frac_reorder = Path(_old_frac_vocab).exists()
+
+                # Step 1: V13 → V14 (isotope token expansion)
+                if TRAIN_CONFIG.get('use_isotope_tokens', False):
+                    from migrate_v13_to_v14 import migrate_checkpoint as migrate_v13_v14
+                    print(f"\n  [AUTO-MIGRATE] Step 1/2: V13 → V14 (isotope tokens)", flush=True)
+                    migrate_v13_v14(
+                        checkpoint_path=str(checkpoint_path),
+                        output_path=_v14_path,
+                        fraction_vocab_path=_frac_vocab,
+                        isotope_vocab_path=_iso_vocab,
+                        max_formula_len=_max_len,
+                    )
+                    _next_input = _v14_path
+                else:
+                    _next_input = str(checkpoint_path)
+
+                # Step 2: V14 → V15 (fraction vocab reorder + expansion)
+                if _needs_frac_reorder:
+                    from migrate_vocab_expansion import migrate_checkpoint as migrate_v14_v15
+                    print(f"\n  [AUTO-MIGRATE] Step 2/2: V14 → V15 (fraction vocab expansion)", flush=True)
+                    migrate_v14_v15(
+                        checkpoint_path=_next_input,
+                        output_path=_v15_path,
+                        fraction_vocab_path=_frac_vocab,
+                        isotope_vocab_path=_iso_vocab,
+                        max_formula_len=_max_len,
+                    )
+                    checkpoint_path = Path(_v15_path)
+                elif _next_input != str(checkpoint_path):
+                    checkpoint_path = Path(_next_input)
+
+                print(f"\n  [AUTO-MIGRATE] Migration complete → loading {checkpoint_path}", flush=True)
+            elif _peek_vocab is not None:
+                print(f"  Checkpoint vocab ({_peek_vocab}) matches model vocab ({_model_vocab}) — no migration needed")
 
             # V12.29: Check manifest for config drift before loading weights
             _raw_checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
