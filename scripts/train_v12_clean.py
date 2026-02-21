@@ -674,8 +674,10 @@ TRAIN_CONFIG = {
     'entropy_plateau_relative': True,    # If True, threshold scales with performance
 
     # Resume from checkpoint (set to None to train from scratch)
-    # V14.1: Can resume from ANY checkpoint — isotope init happens inline in load_checkpoint()
-    'resume_checkpoint': 'outputs/checkpoint_best.pt',
+    # V14.1: Isotope init happens inline in load_checkpoint() for vocab EXPANSION.
+    # But if fraction vocab was REORDERED (V15 rebuild), use the pre-migrated checkpoint
+    # that has fraction embeddings remapped to new indices.
+    'resume_checkpoint': 'outputs/checkpoint_v15_expanded.pt',
 
     # V12.12: Retrain on new/combined data - resets catastrophic drop detector
     # Set to True when training data has changed (new normalization stats)
