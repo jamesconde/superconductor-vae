@@ -3738,6 +3738,15 @@ def load_checkpoint(encoder, decoder, checkpoint_path, entropy_manager=None,
 
     if 'prev_exact' in checkpoint:
         print(f"  Restored prev_exact={result['prev_exact']:.3f}, best_exact={result['best_exact']:.3f}", flush=True)
+    else:
+        # V14.1: Migrated checkpoints may lack prev_exact/best_exact.
+        # Default to 1.0 so checkpoint_best isn't overwritten by a degraded first epoch.
+        if start_epoch > 100:
+            result['best_exact'] = 1.0  # Protect: don't overwrite until model proves itself
+            print(f"  [WARNING] Migrated checkpoint (epoch {start_epoch-1}) has no best_exact — "
+                  f"setting best_exact=1.0 to protect checkpoint_best.pt from overwrite. "
+                  f"Model must exceed 100% (i.e., match prior best) before saving new best.",
+                  flush=True)
 
     return result
 

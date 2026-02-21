@@ -268,10 +268,12 @@ def migrate_checkpoint(
     if 'optimizer_state_dict' in checkpoint:
         print("\n  NOTE: Optimizer state NOT transferred (will be reinitialized for V14.0)")
 
-    # Copy manifest metadata if present
-    for key in ['manifest']:
+    # V14.1: Carry over training metadata so checkpoint_best isn't overwritten on resume
+    for key in ['prev_exact', 'best_exact', 'manifest', 'scheduler_type']:
         if key in checkpoint:
             new_checkpoint[key] = checkpoint[key]
+            if key in ('prev_exact', 'best_exact'):
+                print(f"  Preserved {key}={checkpoint[key]}")
 
     print(f"\nSaving V14.0 checkpoint to {output_path}...")
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
