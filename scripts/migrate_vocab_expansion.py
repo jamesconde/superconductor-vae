@@ -81,19 +81,20 @@ def migrate_checkpoint(
     if any('_orig_mod.' in k for k in dec_state):
         dec_state = strip_orig_mod(dec_state)
 
-    # Load OLD fraction vocab to build index mapping
+    # Load OLD fraction vocab to build index mapping.
+    # fraction_vocab_old.json must exist (checked into repo) for correct index remapping.
+    # Without it, old and new fraction lists are identical and migration silently fails.
     old_frac_vocab_path = PROJECT_ROOT / "data" / "fraction_vocab_old.json"
     if not old_frac_vocab_path.exists():
-        # Save current vocab as backup before rebuild
-        import shutil
-        current_vocab = PROJECT_ROOT / "data" / "fraction_vocab.json"
-        if current_vocab.exists() and str(current_vocab) != str(fraction_vocab_path):
-            shutil.copy2(current_vocab, old_frac_vocab_path)
-            print(f"  Backed up current fraction vocab to {old_frac_vocab_path}")
+        raise FileNotFoundError(
+            f"fraction_vocab_old.json not found at {old_frac_vocab_path}. "
+            f"This file is required for fraction index remapping during migration. "
+            f"It should be checked into the repo (git pull to restore)."
+        )
 
-    # Load OLD tokenizer (with current vocab)
+    # Load OLD tokenizer (with pre-expansion vocab)
     old_tokenizer = FractionAwareTokenizer(
-        str(old_frac_vocab_path) if old_frac_vocab_path.exists() else fraction_vocab_path,
+        str(old_frac_vocab_path),
         max_len=max_formula_len,
         isotope_vocab_path=isotope_vocab_path
     )
