@@ -5688,6 +5688,41 @@ def train():
     physz_current_weight_scale = 1.0  # Regression guard multiplier (1.0 = full, halved on regression)
     physz_paused = False  # True if regression guard has paused PhysZ entirely
 
+    # V14.2: Pre-training baseline eval — verify loaded model quality before any training
+    # This catches migration/loading problems before wasting an epoch.
+    if start_epoch > 0 and TRAIN_CONFIG.get('pre_train_eval', True):
+        print(f"\n{'='*70}")
+        print(f"PRE-TRAINING BASELINE EVAL (no training, just measuring loaded model)")
+        print(f"{'='*70}", flush=True)
+        _eval_tokenizer_pre = None
+        if TRAIN_CONFIG.get('use_semantic_fractions', False):
+            _fvp = PROJECT_ROOT / TRAIN_CONFIG.get('fraction_vocab_path', 'data/fraction_vocab.json')
+            _ivp = None
+            if TRAIN_CONFIG.get('use_isotope_tokens', False):
+                _ivp = str(PROJECT_ROOT / TRAIN_CONFIG.get('isotope_vocab_path', 'data/isotope_vocab.json'))
+            _eval_tokenizer_pre = FractionAwareTokenizer(str(_fvp), max_len=TRAIN_CONFIG['max_formula_len'],
+                                                          isotope_vocab_path=_ivp)
+        pre_eval = evaluate_true_autoregressive(
+            encoder, decoder, train_loader, device, max_samples=500,
+            log_errors=False, epoch=start_epoch - 1,
+            stop_boost=TRAIN_CONFIG.get('stop_boost', 0.0),
+            hard_stop_threshold=TRAIN_CONFIG.get('hard_stop_threshold', 0.0),
+            norm_stats=norm_stats,
+            family_lookup_tables=family_lookup_tables,
+            v13_tokenizer=_eval_tokenizer_pre,
+        )
+        err_dist = pre_eval['error_distribution']
+        print(f"  Loaded model baseline (500 samples): "
+              f"{pre_eval['true_exact_match']*100:.1f}% exact "
+              f"({pre_eval['exact_count']}/{pre_eval['total_samples']})")
+        print(f"  Error distribution: 0={err_dist[0]}, 1={err_dist[1]}, "
+              f"2={err_dist[2]}, 3={err_dist[3]}, >3={err_dist['more']}")
+        print(f"  best_exact={best_exact:.3f}, prev_exact={prev_exact:.3f}")
+        print(f"  LR: enc={enc_opt.param_groups[0]['lr']:.2e}, dec={dec_opt.param_groups[0]['lr']:.2e}")
+        if migration_lr_boost_end > 0:
+            print(f"  LR boost active: x{migration_lr_boost_factor:.1f} until epoch {migration_lr_boost_end}")
+        print(f"{'='*70}\n", flush=True)
+
     for epoch in range(start_epoch, TRAIN_CONFIG['num_epochs']):
         _shutdown_state['epoch'] = epoch
 
