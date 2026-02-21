@@ -555,6 +555,13 @@ TRAIN_CONFIG = {
     'rl_auto_scale': True,               # Enable dynamic RL weight scaling
     'rl_auto_scale_target': 10.0,        # Target |rl_weight * raw_rl_loss| magnitude
 
+    # V14.2: Migration LR boost — temporarily increase LR after vocab expansion
+    # At epoch 4001/5000, cosine schedule gives only ~10% of initial LR.
+    # After migration, new token embeddings need more gradient to recover.
+    # Multiplies the scheduler's LR by a factor that decays linearly to 1.0.
+    'migration_lr_boost': 5.0,           # Peak LR multiplier (5x → 1x over boost window)
+    'migration_lr_boost_epochs': 100,    # Epochs over which boost decays to 1.0
+
     # V14.0: RL safety guard — protect TF exact from RL destabilization
     'rl_safety_exact_drop': 0.02,        # Halve rl_weight if TF exact drops >2%
     'rl_safety_check_interval': 5,       # Check every 5 epochs
@@ -3734,6 +3741,7 @@ def load_checkpoint(encoder, decoder, checkpoint_path, entropy_manager=None,
         'best_exact': checkpoint.get('best_exact', 0),
         'fresh_optimizers': fresh_optimizers,        # V12.31: Grace period needed
         'physics_z_is_new': physics_z_is_new,        # V12.31: Warmup from introduction
+        'vocab_expanded': _vocab_expanded,            # V14.2: Migration LR boost needed
     }
 
     if 'prev_exact' in checkpoint:
@@ -5467,6 +5475,8 @@ def train():
     best_exact = 0
     prev_exact = 0  # Track previous epoch's exact match for adaptive TF
     prev_entropy = 0.5  # Track previous epoch's entropy for entropy manager (V12.9)
+    migration_lr_boost_end = 0  # V14.2: No boost unless vocab expansion detected
+    migration_lr_boost_factor = 1.0
 
     if TRAIN_CONFIG.get('resume_checkpoint'):
         checkpoint_path = PROJECT_ROOT / TRAIN_CONFIG['resume_checkpoint']
@@ -5530,6 +5540,20 @@ def train():
                 print(f"  [RETRAIN MODE] Resetting drop detector (prev_exact was {prev_exact:.3f})")
                 prev_exact = 0.0
                 best_exact = 0.0  # Deliberate: new data means old metrics are incomparable
+
+            # V14.2: Migration LR boost — temporarily increase LR after vocab expansion
+            # At late cosine schedule epochs, LR is very low (~10% of initial).
+            # New token embeddings need more gradient to recover, so we boost LR
+            # by a factor that linearly decays back to 1.0 over boost_epochs.
+            if resume_state.get('vocab_expanded', False):
+                boost = TRAIN_CONFIG.get('migration_lr_boost', 1.0)
+                boost_epochs = TRAIN_CONFIG.get('migration_lr_boost_epochs', 100)
+                if boost > 1.0 and boost_epochs > 0:
+                    migration_lr_boost_end = start_epoch + boost_epochs
+                    migration_lr_boost_factor = boost
+                    print(f"  [LR BOOST] Vocab expansion detected — LR x{boost:.1f} "
+                          f"decaying to x1.0 over {boost_epochs} epochs "
+                          f"(until epoch {migration_lr_boost_end})", flush=True)
 
             # Sync shutdown state so interrupt checkpoint preserves the correct values
             _shutdown_state['best_exact'] = best_exact
@@ -6203,6 +6227,21 @@ def train():
         # Learning rate scheduling
         enc_scheduler.step()
         dec_scheduler.step()
+
+        # V14.2: Migration LR boost — override optimizer LR with boosted value
+        if migration_lr_boost_end > 0 and epoch < migration_lr_boost_end:
+            # Linear decay: boost_factor at start → 1.0 at migration_lr_boost_end
+            boost_start_epoch = migration_lr_boost_end - TRAIN_CONFIG.get('migration_lr_boost_epochs', 100)
+            progress = (epoch - boost_start_epoch) / max(1, migration_lr_boost_end - boost_start_epoch)
+            current_boost = migration_lr_boost_factor + (1.0 - migration_lr_boost_factor) * progress
+            current_boost = max(1.0, current_boost)
+            for pg in enc_opt.param_groups:
+                pg['lr'] = pg['lr'] * current_boost
+            for pg in dec_opt.param_groups:
+                pg['lr'] = pg['lr'] * current_boost
+            if epoch == boost_start_epoch or epoch % 25 == 0:
+                actual_lr = dec_opt.param_groups[0]['lr']
+                print(f"  [LR BOOST] epoch {epoch}: x{current_boost:.2f} → LR={actual_lr:.2e}", flush=True)
 
         # Print progress with all metrics including TF ratio and curriculum weights
         base_msg = (f"[{ALGO_VERSION}] Epoch {epoch:4d} | TF: {tf_ratio:.2f} | Loss: {metrics['loss']:.4f} | "
