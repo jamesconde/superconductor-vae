@@ -5513,10 +5513,6 @@ def train():
                 _v14_path = str(PROJECT_ROOT / 'outputs' / 'checkpoint_v14_auto_migrated.pt')
                 _v15_path = str(PROJECT_ROOT / 'outputs' / 'checkpoint_v15_auto_migrated.pt')
 
-                # Check if fraction vocab was also reordered (V15 expansion)
-                _old_frac_vocab = str(PROJECT_ROOT / 'data' / 'fraction_vocab_old.json')
-                _needs_frac_reorder = Path(_old_frac_vocab).exists()
-
                 # Step 1: V13 → V14 (isotope token expansion)
                 if TRAIN_CONFIG.get('use_isotope_tokens', False):
                     from migrate_v13_to_v14 import migrate_checkpoint as migrate_v13_v14
@@ -5533,9 +5529,15 @@ def train():
                     _next_input = str(checkpoint_path)
 
                 # Step 2: V14 → V15 (fraction vocab reorder + expansion)
-                if _needs_frac_reorder:
+                # Check intermediate vocab — if still smaller than model, fraction migration needed.
+                # fraction_vocab_old.json must exist for remapping (checked in repo).
+                _intermediate = torch.load(_next_input, map_location='cpu', weights_only=False)
+                _intermediate_vocab = _intermediate['decoder_state_dict']['token_embedding.weight'].shape[0]
+                del _intermediate
+                if _intermediate_vocab < _model_vocab:
                     from migrate_vocab_expansion import migrate_checkpoint as migrate_v14_v15
-                    print(f"\n  [AUTO-MIGRATE] Step 2/2: V14 → V15 (fraction vocab expansion)", flush=True)
+                    print(f"\n  [AUTO-MIGRATE] Step 2/2: V14 → V15 (fraction vocab expansion: "
+                          f"{_intermediate_vocab} → {_model_vocab})", flush=True)
                     migrate_v14_v15(
                         checkpoint_path=_next_input,
                         output_path=_v15_path,
@@ -5627,8 +5629,13 @@ def train():
             _shutdown_state['best_exact'] = best_exact
             _shutdown_state['prev_exact'] = prev_exact
         else:
-            print(f"\nWarning: Checkpoint not found: {checkpoint_path}")
-            print("  Starting from scratch...")
+            print(f"\n{'='*70}")
+            print(f"WARNING: Checkpoint not found: {checkpoint_path}")
+            print(f"  If resuming on Colab, copy your checkpoint from Google Drive:")
+            print(f"    !cp '/content/drive/My Drive/outputs/{checkpoint_path.name}' '{checkpoint_path}'")
+            print(f"  Or change TRAIN_CONFIG['resume_checkpoint'] to match your file.")
+            print(f"  Starting from scratch...")
+            print(f"{'='*70}")
 
     # V12.10: torch.compile AFTER checkpoint loading (allows loading non-compiled checkpoints)
     # V12.11: Auto-disable on older GPUs (Triton requires compute capability 7.0+)
