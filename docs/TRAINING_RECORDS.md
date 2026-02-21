@@ -4,6 +4,27 @@ Chronological record of training runs, architecture changes, and optimization de
 
 ---
 
+## V14.2: Migration LR Boost + dtype Fixes (2026-02-21)
+
+### Migration LR Boost
+
+At epoch 4001/5000, the cosine annealing schedule gives only ~10% of the initial LR (3.13e-6 vs 3e-5). After vocab expansion migration, new token embeddings need stronger gradients to recover. Without a boost, recovery from 81.5% → 99%+ would take hundreds of epochs at the reduced LR.
+
+**Fix**: When `load_checkpoint()` detects vocab expansion, a temporary LR multiplier is applied:
+- Peak boost: 5x (so 3.13e-6 × 5 = 1.56e-5, ~52% of initial LR)
+- Decays linearly to 1.0x over 100 epochs
+- Config: `migration_lr_boost=5.0`, `migration_lr_boost_epochs=100`
+- Only activates when `vocab_expanded=True` (migration detected)
+- Normal resumes (no vocab change) are completely unaffected
+
+### dtype Fixes in Migration Scripts
+
+All migration scripts (`migrate_v13_to_v14.py`, `migrate_vocab_expansion.py`) and the inline loader in `train_v12_clean.py` had a dtype bug: `torch.zeros()` and `torch.randn()` default to float32, but checkpoint tensors may be bfloat16 (training uses AMP). This caused silent dtype mixing in all 397 expanded vocab rows. Fixed by passing `dtype=value.dtype` to all allocation/noise tensors.
+
+**Action required**: Re-run migration on Colab from the best checkpoint to get a clean V15 checkpoint.
+
+---
+
 ## V14.1: Inline Isotope Init + RL Auto-Scaling (2026-02-21)
 
 ### Inline Isotope Initialization in `load_checkpoint()`
