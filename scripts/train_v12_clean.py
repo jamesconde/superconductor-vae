@@ -5634,6 +5634,19 @@ def train():
 
     # V14.1: RL auto-scaling state — calibrate rl_weight from first epoch's raw RL loss
     rl_auto_scale_done = False  # True after first calibration
+    # When auto-scale is pending, use a tiny probe weight for the calibration epoch
+    # so RL gradients don't dominate before we know the right scale.
+    # The raw RL loss is measured at this probe weight, then scaled to the target.
+    if (not rl_auto_scale_done
+            and TRAIN_CONFIG.get('rl_auto_scale', False)
+            and rl_reactivated
+            and loss_fn.rl_weight > 0):
+        _probe_weight = 0.01  # Tiny weight — RL contributes ~1% during calibration
+        rl_target_weight = loss_fn.rl_weight  # Remember the original configured weight
+        loss_fn.rl_weight = _probe_weight
+        TRAIN_CONFIG['rl_weight'] = _probe_weight
+        print(f"  [V14.1 RL AUTO-SCALE] Probe mode: rl_weight={_probe_weight} for calibration epoch "
+              f"(target configured was {rl_target_weight})", flush=True)
 
     # V13.1: PhysZ auto-reactivation state
     physz_reactivated = TRAIN_CONFIG.get('use_physics_z', False)  # Already active if enabled
