@@ -4,6 +4,82 @@ Chronological record of training runs, architecture changes, and optimization de
 
 ---
 
+## V15.0: Data Expansion — 5 External Datasets + Vocab Rebuild (2026-02-20)
+
+### Dataset Merge
+
+Merged 5 external superconductor datasets + 12 manual high-Tc hydrides into the training CSV using `scripts/ingest_new_datasets.py`. DFT-predicted data saved separately for future Theory Network use via `scripts/export_dft_datasets.py`.
+
+**Training data: 51,003 → 52,813 rows (+1,810 new unique entries)**
+
+| Source Dataset | Raw Rows | After Dedup | New Rows Added |
+|----------------|----------|-------------|----------------|
+| MDR SuperCon (NIMS) | 26,356 | — | 419 |
+| SuperCon2 (NLP-extracted) | 18,742 | — | 1,382 |
+| SODNet (NeurIPS 2024) | 11,949 | — | 364 |
+| 3DSC (crystal structures) | 5,773 | — | 33 |
+| Manual hydrides (literature) | 12 | — | 3 |
+| **Total** | **62,832** | **2,201** | **1,810** |
+
+391 entries dropped due to failed Magpie featurization. JARVIS supercon_chem.json skipped (already ingested by `ingest_jarvis.py` in prior run).
+
+### Tc Distribution Improvement
+
+| Tc Range | Before | After | Change |
+|----------|--------|-------|--------|
+| Tc >= 100K | 984 | 1,117 | +133 |
+| Tc >= 150K | 7 | 58 | +51 |
+| Tc >= 200K | 6 | 36 | +30 |
+
+### Data Quality Measures
+
+- **Retracted entries filtered**: Lu-H (Dias 250-300K), C-S-H (Snider 280-295K), PbCO3 (>300K)
+- **SuperCon2 contamination filter**: Removed manganite Curie temps, ZnO ferromagnetic, non-hydride >200K entries
+- **Deduplication**: Canonical formula matching (pymatgen alphabetical_formula) against existing 50,630 keys + 45 holdout samples
+- **IonProperty timeout**: 30s per-composition timeout (1,413 compositions used defaults)
+- **High-pressure labeling**: 112 entries flagged as `requires_high_pressure=1`
+
+### Fraction Vocab Expansion
+
+Rebuilt fraction vocab: 4,212 → 4,317 fractions (+105 new). This shifts ISO_UNK and isotope token indices.
+
+**Vocabulary layout** (4647 → 4752 tokens):
+| Range | Content | Count |
+|-------|---------|-------|
+| 0-4 | Special: PAD, BOS, EOS, UNK, FRAC_UNK | 5 |
+| 5-122 | Elements | 118 |
+| 123-142 | Integers: 1-20 | 20 |
+| 143-4459 | Fractions (expanded from 4212 to 4317) | 4317 |
+| 4460 | ISO_UNK | 1 |
+| 4461-4751 | Isotopes | 291 |
+
+### Checkpoint Migration
+
+`scripts/migrate_vocab_expansion.py` migrated `checkpoint_v14_migrated.pt` → `checkpoint_v15_expanded.pt`:
+- Existing fraction embeddings remapped to new indices (order may change when rebuilding vocab by frequency)
+- 105 new fraction embeddings initialized from FRAC_UNK + noise
+- ISO_UNK and 291 isotope embeddings remapped to shifted indices
+- Optimizer state NOT transferred (will be reinitialized on training resume)
+
+### DFT Data (Separate, Not in Training)
+
+Saved to `data/processed/dft_superconductors.csv` (9,612 entries) for future Theory Network:
+- JARVIS 3D: 1,058 entries (Eliashberg spectral functions)
+- JARVIS 2D: 161 entries
+- JARVIS alex_supercon: 8,253 entries (BCS params: lambda, wlog, Debye, DOS)
+- HTSC-2025: 140 entries (ambient-pressure predictions)
+
+### New Files
+
+- `scripts/ingest_new_datasets.py` — main ingestion pipeline for 5 external datasets
+- `scripts/export_dft_datasets.py` — DFT data export for future use
+- `scripts/migrate_vocab_expansion.py` — checkpoint migration for expanded vocab
+- `data/processed/new_sc_datasets.csv` — new entries only (1,810 rows, for inspection)
+- `data/processed/dft_superconductors.csv` — DFT data (9,612 rows)
+- `data/fraction_vocab_old.json` — backup of pre-expansion vocab
+
+---
+
 ## V14.0: Isotope Token Expansion (2026-02-20)
 
 ### Isotope-Aware Vocabulary

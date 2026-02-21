@@ -2180,7 +2180,8 @@ class CombinedLossWithREINFORCE(nn.Module):
         if v13_tokenizer is not None:
             # Create on GPU directly to avoid per-call CPU->GPU transfer
             _frac_values = torch.zeros(v13_tokenizer.vocab_size, device=_device)
-            for tid in range(v13_tokenizer.fraction_token_start, v13_tokenizer.vocab_size):
+            frac_end = v13_tokenizer.fraction_token_start + v13_tokenizer.n_fraction_tokens
+            for tid in range(v13_tokenizer.fraction_token_start, frac_end):
                 _frac_values[tid] = v13_tokenizer.fraction_token_to_value(tid)
             self._v13_fraction_values = _frac_values
             self._v13_fraction_token_start = v13_tokenizer.fraction_token_start

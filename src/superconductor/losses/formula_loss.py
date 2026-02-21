@@ -60,8 +60,9 @@ def _build_token_type_mask_v13(tokenizer) -> torch.Tensor:
     # Integers 1-20 (123-142) -> DIGIT
     for idx in range(123, 143):
         type_mask[idx] = TokenType.DIGIT.value
-    # Fraction tokens (143+) -> STRUCTURE (closest semantic category)
-    for idx in range(tokenizer.fraction_token_start, tokenizer.vocab_size):
+    # Fraction tokens -> STRUCTURE (closest semantic category)
+    frac_end = tokenizer.fraction_token_start + tokenizer.n_fraction_tokens
+    for idx in range(tokenizer.fraction_token_start, frac_end):
         type_mask[idx] = TokenType.STRUCTURE.value
     return type_mask
 
