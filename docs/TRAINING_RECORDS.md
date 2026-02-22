@@ -53,6 +53,11 @@ Chronological record of training runs, architecture changes, and optimization de
 
 New layers (`token_type_head`, `heads_to_memory`) are missing from pre-V14.3 checkpoints. `load_checkpoint()` uses `strict=False` — new layers initialize randomly, existing layers load from checkpoint. No migration needed.
 
+### Bug Fixes (2026-02-22)
+
+- **Mixed SC/non-SC batch crash**: `loss_fn._heads_pred` was set to full batch (e.g. 252 samples) but RLOO/SCST received `z=z[sc_mask]` (e.g. 176 SC samples). The stale full-batch `_heads_pred` reference caused `_create_memory` to attempt reshape `[176, 4, 1024]` from 252×4×1024 elements → `RuntimeError`. Fixed by slicing `heads_pred_dict` by `sc_mask` before the SC loss call in the mixed-batch path, and clearing it to `None` before the non-SC call.
+- **Batch validation assertions**: Added explicit batch-size checks in `_create_memory()` for all `heads_pred` tensors vs z batch size, with clear error messages identifying the mismatched tensor.
+
 ### Rollout Strategy
 
 1. **V14.3**: Train with type loss + heads memory (training signal only, no AR masking)

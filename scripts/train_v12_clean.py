@@ -4754,6 +4754,9 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
                 timing.start('loss_compute')
 
             # V14.3: Set per-batch heads_pred for RLOO enriched memory
+            # NOTE: For mixed SC/non-SC batches, _heads_pred is re-sliced below
+            # to match the SC subset passed to loss_fn. Otherwise RLOO/SCST would
+            # use stale full-batch heads_pred while z is only the SC subset.
             loss_fn._heads_pred = heads_pred_dict
             loss_fn._type_masks = None  # Type masking in RLOO disabled for V14.3
 
@@ -4829,6 +4832,15 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
                 n_sc = sc_mask.sum().item()
                 n_non_sc = (~sc_mask).sum().item()
 
+                # V14.3: Slice heads_pred to SC subset so RLOO/SCST see
+                # matching batch dims (z[sc_mask] has n_sc samples, not full batch)
+                if heads_pred_dict is not None:
+                    loss_fn._heads_pred = {
+                        k: v[sc_mask] for k, v in heads_pred_dict.items()
+                    }
+                else:
+                    loss_fn._heads_pred = None
+
                 # SC portion: full loss
                 _family_preds = encoder_out.get('family_composed_14')
                 sc_loss_dict = loss_fn(
@@ -4853,6 +4865,9 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
                     element_indices=elem_idx[sc_mask],  # V12.43
                     family_predictions=_family_preds[sc_mask] if _family_preds is not None else None,  # V12.43
                 )
+
+                # V14.3: Non-SC doesn't use REINFORCE (z=None), clear heads_pred
+                loss_fn._heads_pred = None
 
                 # Non-SC portion: formula-only, lower weight
                 non_sc_loss_dict = loss_fn(
