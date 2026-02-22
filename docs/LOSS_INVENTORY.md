@@ -1,238 +1,377 @@
-# Loss Inventory — Superconductor VAE (V14.0)
+# Loss Inventory — Superconductor VAE (V14.3)
 
-Complete inventory of every loss component in `scripts/train_v12_clean.py`. Updated 2026-02-20.
+Complete inventory of every loss component in the training system. Updated 2026-02-22.
+
+The system has **17 differentiable loss terms** that contribute to the backward pass (14 active, 1 auto-reactivatable, 2 removed), plus **REINFORCE reward signals** (non-differentiable) that shape the policy gradient loss indirectly.
+
+> **Note on weights**: The loss weights listed below are the current values in `TRAIN_CONFIG` as of V14.3. These are **not fixed constants** — they have changed over the course of training based on model performance, gradient budget analysis, and curriculum scheduling. For example, `tc_weight` was 10.0 in V12.26 and increased to 20.0 to focus gradients on Tc accuracy; `family_classifier_weight` was 2.0 in V12.33 and reduced to 0.5 in V13.1b to reduce gradient competition with formula CE; `hp_loss_weight` and `sc_loss_weight` were 0.5 and increased to 1.0 in V13.2. Some weights also change dynamically during a run via curriculum scheduling (Tc, Magpie ramp up over 30 epochs), smart loss skipping (converged losses computed every 4th epoch), and RL auto-scaling (V14.1). Treat the weights here as a snapshot, not as permanent values.
 
 ---
 
-## Summary
+## Quick Reference
 
-| # | Loss | Status | Weight | Typical Value | Skip Schedule |
-|---|------|--------|--------|---------------|---------------|
-| 1 | Formula CE (Focal) | **ACTIVE** | `ce_weight: 1.0` | ~0.7 | Never skip |
-| 2 | REINFORCE/SCST | **ACTIVE** | `rl_weight: 1.0` | ~18.6 raw | Never skip (V13.2) |
-| 3 | Tc MSE | **ACTIVE** | `tc_weight: 10.0` | ~0.43 | Yes (0.5, 0.1) |
-| 4 | Magpie MSE | **ACTIVE** | `magpie_weight: 2.0` | ~0.06 | Yes (0.1, 0.1) |
-| 5 | Stoichiometry MSE | **ACTIVE** | `stoich_weight: 2.0` | ~0.001 | Yes (0.01, 0.05) |
-| 6 | NumDen MSE | **ACTIVE** | `numden_weight: 1.0` | ~2.96 | Yes (3.0, 0.5) |
-| 7 | KL / L2 Regularization | **ACTIVE** | `kl_weight: 0.0001` | tiny | Never skip |
-| 8 | Element Count MSE | **ACTIVE** | hardcoded 0.5 | tiny | Never skip |
-| 9 | Z-Norm Penalty | **ACTIVE** | `z_norm_penalty_weight: 0.001` | tiny | Never skip |
-| 10 | Tc Classification | **ACTIVE** | `tc_class_weight: 4.0` | varies | Yes (0.5, 0.2) |
-| 11 | Physics Z | **ACTIVE** | warmup → 1.0 | ~0.32 | Yes (0.5, 0.2) |
-| 12 | High-Pressure (HP) | **ACTIVE** | `hp_loss_weight: 0.5` | varies | Yes (0.3, 0.1) |
-| 13 | SC Classification | **ACTIVE** | `sc_loss_weight: 0.5` | varies | Yes (0.3, 0.1) |
-| 14 | Stop Prediction | **ACTIVE** | `stop_loss_weight: 5.0` | varies | Yes (0.1, 0.1) |
-| 15 | Family Classifier | **ACTIVE** | `family_classifier_weight: 2.0` | varies | Yes (0.5, 0.2) |
-| 16 | Contrastive | **DISABLED** | `contrastive_weight: 0.0` | was ~5.06 | N/A |
-| 17 | Theory Consistency | **DISABLED** | `theory_weight: 0.0` | was ~1.43 | N/A |
+| # | Loss | Status | Weight | SC-Only? | Computed In | Skip? |
+|---|------|--------|--------|----------|-------------|-------|
+| 1 | Formula CE (Focal) | **ACTIVE** | `ce_weight: 1.0` | No | CombinedLoss | Never |
+| 2 | REINFORCE/SCST | **ACTIVE** | `rl_weight: 1.0` | Yes | CombinedLoss | Never |
+| 3 | Tc Regression | **ACTIVE** | `tc_weight: 20.0` | Yes | CombinedLoss | (0.5, 0.1) |
+| 4 | Magpie Reconstruction | **ACTIVE** | `magpie_weight: 2.0` | Yes | CombinedLoss | (0.1, 0.1) |
+| 5 | KL / L2 Regularization | **ACTIVE** | `kl_weight: 0.0001` | No | Encoder | Never |
+| 6 | Stoichiometry MSE | **ACTIVE** | `stoich_weight: 2.0` | No | CombinedLoss | (0.01, 0.05) |
+| 7 | Element Count MSE | **ACTIVE** | hardcoded `0.5` | No | CombinedLoss | Never |
+| 8 | Tc Bucket Classification | **ACTIVE** | `tc_class_weight: 1.0` | No | CombinedLoss | (0.5, 0.2) |
+| 9 | Z-Norm Penalty | **ACTIVE** | `z_norm_penalty_weight: 0.001` | No | CombinedLoss | Never |
+| 10 | Constraint Zoo (A3+A5+A6) | **ACTIVE** | `constraint_zoo_weight: 0.5` | No | CombinedLoss | Never |
+| 11 | High-Pressure (HP) | **ACTIVE** | `hp_loss_weight: 1.0` | Yes | train_epoch | (0.3, 0.1) |
+| 12 | SC Classification | **ACTIVE** | `sc_loss_weight: 1.0` | No | train_epoch | (0.3, 0.1) |
+| 13 | Family Classifier | **ACTIVE** | `family_classifier_weight: 0.5` | Yes | train_epoch | (0.5, 0.2) |
+| 14 | Stop Prediction | **ACTIVE** | `stop_loss_weight: 5.0` | No | train_epoch | (0.1, 0.1) |
+| 15 | Token Type Classification | **ACTIVE** | `token_type_loss_weight: 0.1` | No | train_epoch | Never |
+| 16 | Physics Z Supervision | **DORMANT** | `use_physics_z: False` | No | train_epoch | (0.5, 0.2) |
+| 17 | Theory Consistency | **REMOVED** | `theory_weight: 0.0` | Yes | train_epoch | N/A |
+
+**REMOVED** (code deleted): Contrastive loss (V12.26), NumDen MSE (V13.0).
+
+---
+
+## Architecture: Two-Layer Loss Assembly
+
+Losses are computed in two places and combined into a single backward pass target.
+
+### Layer 1: Inside `CombinedLossWithREINFORCE.forward()` → `loss_dict['total']`
+
+Contains the core reconstruction losses and REINFORCE. This is the loss function object that knows about the decoder, tokenizer, and RL sampling.
+
+```
+total = ce_weight * formula_CE
+      + rl_weight * reinforce_loss
+      + tc_weight * tc_loss
+      + magpie_weight * magpie_loss
+      + kl_weight * kl_loss
+      + stoich_weight * stoich_loss
+      + 0.5 * element_count_loss
+      + tc_class_weight * tc_class_loss
+      + constraint_zoo_weight * constraint_zoo_loss
+      + z_norm_penalty_weight * z_norm_penalty
+```
+
+### Layer 2: External losses added in `train_epoch()` batch loop
+
+Auxiliary classification and prediction heads computed outside the loss function.
+
+```
+loss = loss_dict['total']                          # Layer 1
+     + hp_loss_weight * hp_loss                    # High-pressure prediction
+     + sc_loss_weight * sc_loss                    # SC/non-SC classification
+     + theory_weight * theory_loss                 # Family-specific physics (weight=0)
+     + stop_loss_weight * stop_loss                # Stop prediction head
+     + token_type_loss_weight * type_loss          # Token type classification (V14.3)
+     + physics_z_loss_val                          # Physics Z (weight already applied)
+     + family_loss_weight * family_loss            # Hierarchical family classification
+```
+
+### Mixed SC/non-SC Batch Handling
+
+For mixed batches (the common case with contrastive dataset):
+```
+loss = sc_frac * sc_loss_dict['total']
+     + non_sc_frac * non_sc_formula_weight * non_sc_loss_dict['total']
+     + <all auxiliary losses above>
+```
+
+- SC portion: Full loss (all weights active, REINFORCE enabled)
+- Non-SC portion: Formula CE only (`tc_weight=0`, `magpie_weight=0`, `z=None` → no REINFORCE), scaled by `non_sc_formula_weight=0.5`
 
 ---
 
 ## Detailed Descriptions
 
 ### 1. Formula Cross-Entropy (Focal Loss)
-- **Version**: V1+ (core), V12.5 focal
+
+The **primary training signal** — token-by-token reconstruction of formula sequences.
+
+- **Type**: Focal Loss with Label Smoothing
 - **Config**: `ce_weight: 1.0`, `focal_gamma: 2.0`, `label_smoothing: 0.05`
-- **Computed in**: `CombinedLossWithREINFORCE.forward()` (line ~2270)
-- **What it does**: Per-token cross-entropy between decoder output logits and target formula tokens. Focal loss variant (gamma=2.0) down-weights easy tokens and focuses gradients on hard tokens. This is the **core training signal** — it teaches the decoder to produce correct formula token sequences.
+- **Where**: `CombinedLossWithREINFORCE.forward()` (line ~2719)
+- **Inputs**: `formula_logits [batch, seq, vocab]` vs `formula_targets [batch, seq]`
 - **Applied to**: All samples (SC + non-SC)
-- **Weight mechanism**: `loss_fn.ce_weight` attribute
-- **Skip schedule**: NEVER skip — this is the primary learning signal
+- **Details**:
+  - Focal `(1-p)^gamma` weighting focuses gradients on hard-to-predict tokens
+  - V13.0: Fraction tokens upweighted by `fraction_token_weight=2.0` (semantic fractions are harder)
+  - V12.34: Per-sample weighting by sequence length (`length_weight_base=8`, `length_weight_alpha=1.0`) and element count (`element_count_base=3`, `element_count_beta=0.5`)
+- **Why**: Without this, the decoder has no signal to produce correct formula tokens. Everything else is auxiliary.
 
 ### 2. REINFORCE / SCST (Self-Critical Sequence Training)
-- **Version**: V12.8, **V14.0 reward redesign**
-- **Config**: `rl_weight: 1.0`, `rl_temperature: 0.2`, `n_samples_rloo: 4`, `rl_method: 'scst'`
-- **V14.0 Config**: `use_v14_reward: True`, `v14_sharpness: 4.0`, `v14_max_reward: 100.0`
-- **Computed in**: `CombinedLossWithREINFORCE.compute_scst()` (line ~2099)
-- **What it does**: Sequence-level reinforcement learning. Generates 4 complete formula sequences autoregressively, computes reward (similarity to target), and uses SCST baseline (greedy decode reward) to compute advantages. Provides sequence-level signal that CE alone cannot — rewards whole correct formulas, not just individual tokens.
-- **V14.0 Reward Changes**:
-  - **Continuous power-law reward**: `max_reward * (n_correct / n_total) ^ sharpness` eliminates the 3→4 error cliff that killed gradient for 72% of the population. The 3→4 transition becomes 41→29 (smooth 30% drop) instead of 10→5 (cliff).
-  - **Token-type-aware penalties**: Element errors get -3.0 penalty (wrong compound), integer errors -1.0 (wrong stoichiometry), fractions -0.5, specials -0.5. Overlaid on continuous base reward.
-  - **Symmetric too-short detection**: Mirrors too-long handling. Premature EOS with correct prefix gets high reward (50 base minus 5 per missing token, floor 10).
-  - **Phased curriculum** (disabled by default): Phase 1 = elements only, Phase 2 = +integers, Phase 3 = full reward with sharpness=6.0.
-- **V14.0 Training Controls**:
-  - **RL warmup**: Linear ramp from 10% to 100% over 20 epochs (`rl_warmup_epochs`, `rl_warmup_start`)
-  - **RL safety guard**: Halves rl_weight if TF exact drops >2% from activation baseline. Pauses RL if weight drops below 0.05 (`rl_safety_exact_drop`, `rl_safety_check_interval`)
-  - **PhysZ staggering**: Blocks RL activation until PhysZ warmup is complete (`rl_requires_physz_stable`)
-  - **Temperature schedule**: Decays from 0.5 (exploration) to 0.2 (exploitation) over 50 epochs (`rl_temperature_start/end/decay_epochs`). Works WITH entropy manager via `set_base_temperature()`.
-- **Applied to**: SC samples only (non-SC get z=None → skipped)
-- **Weight mechanism**: `loss_fn.rl_weight` attribute. Guard: `if self.rl_weight > 0` skips all sampling.
-- **Compute cost**: **91% of loss computation time** (4x full autoregressive decode per batch)
-- **Skip schedule**: Never skip (V13.2) — RL is a policy gradient that fluctuates by design, not a converging loss. Skipping kills the learning signal.
 
-### 3. Tc MSE (Critical Temperature Prediction)
-- **Version**: V1+ (core)
-- **Config**: `tc_weight: 10.0` (curriculum-controlled)
-- **Computed in**: `CombinedLossWithREINFORCE.forward()` (line ~2358)
-- **What it does**: MSE between encoder's Tc prediction and true normalized Tc value. Teaches the encoder to predict critical temperature from composition.
-- **Applied to**: SC samples only (non-SC get `tc_weight_override=0.0`)
-- **Weight mechanism**: Local variable `tc_weight` from `get_curriculum_weights()`, passed as `tc_weight_override`
-- **Skip schedule**: Yes — (threshold=0.5, delta=0.1)
+Closes the teacher-forcing → autoregressive gap with sequence-level reward.
 
-### 4. Magpie MSE (Feature Reconstruction)
-- **Version**: V12+ (full materials)
-- **Config**: `magpie_weight: 2.0` (curriculum-controlled)
-- **Computed in**: `CombinedLossWithREINFORCE.forward()` (line ~2370)
-- **What it does**: MSE between encoder's Magpie feature predictions (145 dims) and true Magpie compositional features. Forces the latent space to encode materials science knowledge.
-- **Applied to**: SC samples only (non-SC get `magpie_weight_override=0.0`)
-- **Weight mechanism**: Local variable `magpie_weight` from `get_curriculum_weights()`
-- **Skip schedule**: Yes — (threshold=0.1, delta=0.1)
+- **Type**: Policy gradient (SCST or RLOO)
+- **Config**: `rl_weight: 1.0`, `rl_method: 'scst'`, `n_samples_rloo: 4`, `rl_temperature: 0.2`
+- **Where**: `CombinedLossWithREINFORCE.compute_scst()` (line ~2522) / `compute_rloo_autoregressive()` (line ~2296)
+- **Inputs**: Latent `z`, `formula_targets`, `stoich_pred`, `heads_pred` (V14.3)
+- **Applied to**: SC samples only
+- **Details**:
+  - SCST: Generates sample autoregressively, computes reward vs greedy baseline, `loss = -(advantage * log_prob).mean()`
+  - RLOO: K samples, each uses the other K-1 as baseline (lower variance)
+  - V14.0 continuous power-law reward: `max_reward * (n_correct / n_total)^sharpness` with `max_reward=100.0`, `sharpness=4.0`
+  - Token-type penalties: element -3.0, integer -1.0, fraction -0.5, special -0.5
+  - V14.1 auto-scaling: dynamically calibrates rl_weight so `|rl_weight * raw_rl_loss| ~ 10.0`
+  - Entropy bonus: `combined_reward = task_reward + entropy_weight * seq_entropy`
+  - RL warmup: 10%→100% over 20 epochs. Safety guard halves weight on >2% TF regression.
+- **Compute cost**: ~91% of loss computation time (4x full autoregressive decode per batch)
+- **Why**: CE teaches token-level prediction. RL teaches whole-sequence generation quality — it rewards producing complete, correct formulas autoregressively.
 
-### 5. Stoichiometry MSE
-- **Version**: V12.4
-- **Config**: `stoich_weight: 2.0`
-- **Computed in**: `CombinedLossWithREINFORCE.forward()` (line ~2410)
-- **What it does**: MSE between encoder's fraction predictions (12 mole fractions) and true element fractions. Teaches encoder to predict composition ratios that the decoder uses as conditioning.
-- **Applied to**: All samples
-- **Weight mechanism**: `loss_fn.stoich_weight` attribute
-- **Skip schedule**: Yes — (threshold=0.01, delta=0.05)
+### 3. Tc Regression
 
-### 6. Numerator/Denominator MSE
-- **Version**: V12.38
-- **Config**: `numden_weight: 1.0`
-- **Computed in**: `CombinedLossWithREINFORCE.forward()` (line ~2426)
-- **What it does**: Masked MSE between encoder's numden predictions (12 log-numerators + 12 log-denominators) and true values in log1p space. Gives the decoder explicit integer fraction information instead of just continuous mole fractions.
-- **Applied to**: All samples (masked by element_mask)
-- **Weight mechanism**: `loss_fn.numden_weight` attribute
-- **Skip schedule**: Yes — (threshold=3.0, delta=0.5)
+Accurate critical temperature prediction from the latent space.
 
-### 7. KL / L2 Regularization
-- **Version**: V1+ (core), repurposed as L2 in V12
+- **Type**: Huber + asymmetric penalty + Kelvin weighting + relative error blending + binned multipliers
+- **Config**: `tc_weight: 20.0` (curriculum: ramps from 5.0 to 20.0 over 30 epochs)
+- **Where**: `CombinedLossWithREINFORCE.forward()` (line ~2801)
+- **Inputs**: `tc_pred [batch]` vs `tc_true [batch]` (log1p + z-score normalized)
+- **Applied to**: SC samples only (weight=0 for non-SC)
+- **Details**:
+  - Base: `F.huber_loss(delta=1.0)` — robust to outliers
+  - Asymmetric: underprediction penalized 1.5x (`tc_underpred_penalty=1.5`) — discovery bias (missing a high-Tc material is worse than overestimating)
+  - Kelvin weighting: `weight = 1 + tc_kelvin / 20.0` — high-Tc samples get up to 11x weight at 200K, counteracting log1p gradient compression
+  - Relative error blending: 50% Huber + 50% relative error in Kelvin space — treats 80% error uniformly regardless of Tc scale
+  - Binned multipliers: `{0K: 1.0, 10K: 1.5, 50K: 2.0, 100K: 2.5, 150K: 3.0}` — progressive upweighting by Tc range
+- **Why**: Tc is the single most important property for superconductor discovery. The elaborate weighting scheme ensures the model doesn't ignore rare high-Tc materials in favor of the abundant low-Tc majority.
+
+### 4. Magpie Reconstruction
+
+Forces the latent space to encode materials science knowledge.
+
+- **Type**: MSE
+- **Config**: `magpie_weight: 2.0` (curriculum: ramps from 1.0 to 2.0 over 30 epochs)
+- **Where**: `CombinedLossWithREINFORCE.forward()` (line ~2869)
+- **Inputs**: `magpie_pred [batch, 145]` vs `magpie_true [batch, 145]`
+- **Applied to**: SC samples only (weight=0 for non-SC)
+- **Why**: The 145 Magpie features encode elemental properties (electronegativity, atomic radius, etc.). Reconstructing them forces z to capture composition-property relationships, not just string patterns.
+
+### 5. KL / L2 Regularization
+
+Keeps latent vectors bounded.
+
+- **Type**: `mean(z^2)` — L2 regularization (NOT KL divergence despite the name)
 - **Config**: `kl_weight: 0.0001`
-- **Computed in**: Encoder forward pass (line ~1094 in attention_vae.py)
-- **What it does**: Originally KL divergence for VAE. Now the encoder is deterministic (no reparameterization), so this is effectively L2 regularization on z-vectors: `(z ** 2).sum(dim=1).mean()`. Prevents latent space from growing unbounded.
+- **Where**: `FullMaterialsVAE.forward()` in `attention_vae.py` (line ~1138)
+- **Inputs**: `z [batch, 2048]`
 - **Applied to**: All samples
-- **Weight mechanism**: `loss_fn.kl_weight` attribute
-- **Skip schedule**: Never skip — regularization should always be active
+- **Why**: Named `kl_loss` for legacy compatibility but the encoder is deterministic (no reparameterization trick). This prevents z-norms from growing unbounded. Works alongside the Z-Norm Penalty (#9) which is one-sided.
 
-### 8. Element Count MSE
-- **Version**: V12.4
-- **Config**: Hardcoded weight 0.5 (line ~2456)
-- **Computed in**: `CombinedLossWithREINFORCE.forward()` (line ~2411)
-- **What it does**: MSE between predicted element count (from fraction_head's last output) and true number of elements. Helps decoder know how many elements to generate.
+### 6. Stoichiometry MSE
+
+Teaches the encoder to predict composition ratios used as decoder conditioning.
+
+- **Type**: Masked MSE
+- **Config**: `stoich_weight: 2.0`
+- **Where**: `CombinedLossWithREINFORCE.forward()` (line ~2871)
+- **Inputs**: `fraction_pred [batch, max_elements]` vs `element_fractions [batch, max_elements]`, masked by `element_mask`
 - **Applied to**: All samples
-- **Weight mechanism**: Hardcoded 0.5 in total loss formula
-- **Skip schedule**: Never skip — tiny cost, always useful
+- **Why**: The decoder receives 4 stoichiometry memory tokens derived from this prediction. Better fraction predictions → better decoder conditioning → more accurate stoichiometry in generated formulas.
+
+### 7. Element Count MSE
+
+Helps the decoder know how many elements to generate.
+
+- **Type**: MSE
+- **Config**: Hardcoded weight `0.5`
+- **Where**: `CombinedLossWithREINFORCE.forward()` (line ~2883)
+- **Inputs**: `element_count_pred [batch]` vs `element_mask.sum(dim=1) [batch]`
+- **Applied to**: All samples
+- **Why**: A formula with 3 elements should generate exactly 3 element-stoich pairs before EOS. This auxiliary signal helps the model learn formula length.
+
+### 8. Tc Bucket Classification
+
+Auxiliary discrete signal for z-space structure.
+
+- **Type**: Cross-Entropy (5 classes)
+- **Config**: `tc_class_weight: 1.0`
+- **Where**: `CombinedLossWithREINFORCE.forward()` (line ~2854)
+- **Inputs**: `tc_class_logits [batch, 5]` vs `tc_bins [batch]`
+- **Buckets**: 0=non-SC(Tc=0), 1=low(0-10K), 2=medium(10-50K), 3=high(50-100K), 4=very-high(100K+)
+- **Applied to**: All samples
+- **Why**: Classification converges faster than regression. This gives the encoder a coarse Tc signal early in training before the MSE loss (#3) has converged, helping structure the z-space by Tc range.
 
 ### 9. Z-Norm Soft Penalty
-- **Version**: V12.34
-- **Config**: `use_z_norm_penalty: True`, `z_norm_target: 22.0`, `z_norm_penalty_weight: 0.001`
-- **Computed in**: `CombinedLossWithREINFORCE.forward()` (line ~2465)
-- **What it does**: Penalizes z-vector norms that exceed the target (22.0). One-sided: only penalizes excess, not deficit. Prevents outlier z-norms that decode poorly.
+
+Prevents outlier z-norms that correlate with poor decoding.
+
+- **Type**: One-sided quadratic penalty
+- **Config**: `z_norm_penalty_weight: 0.001`, `z_norm_target: 22.0`
+- **Where**: `CombinedLossWithREINFORCE.forward()` (line ~2958)
+- **Formula**: `penalty = (clamp(||z|| - 22.0, min=0))^2`
 - **Applied to**: All samples with z != None
-- **Weight mechanism**: Hardcoded from TRAIN_CONFIG inside loss function
-- **Skip schedule**: Never skip — tiny cost, stability measure
+- **Why**: Analysis showed z-norms > 30 correlate with 36pp lower exact match. This is a softer complement to the L2 reg (#5) — it only penalizes excess, not deficit.
 
-### 10. Tc Bucket Classification
-- **Version**: V12.28
-- **Config**: `tc_class_weight: 4.0`
-- **Computed in**: `CombinedLossWithREINFORCE.forward()` (line ~2393)
-- **What it does**: Cross-entropy classification of Tc into discrete buckets (0-10K, 10-50K, 50-100K, 100K+). Auxiliary signal that helps encoder learn Tc range even before precise MSE converges.
-- **Applied to**: All samples with tc_class_logits != None
-- **Weight mechanism**: `loss_fn.tc_class_weight` attribute
-- **Skip schedule**: Yes — (threshold=0.5, delta=0.2)
+### 10. Constraint Zoo (Composite: A3 + A5 + A6)
 
-### 11. Physics Z Consistency
-- **Version**: V12.31
-- **Config**: Warmup to 1.0, sub-weights: `physics_z_comp_weight: 1.0`, `physics_z_magpie_weight: 0.5`, `physics_z_consistency_weight: 0.1`
-- **Computed in**: `PhysicsZLoss.forward()` (separate module, line ~4029)
-- **What it does**: Multi-component loss ensuring z-vectors encode physically meaningful information. Components: composition prediction from z, Magpie feature encoding, z-space consistency under composition perturbations, thermodynamic consistency (V12.36).
+Differentiable physics constraints on generated formulas.
+
+- **Config**: `constraint_zoo_weight: 0.5` (overall), individual sub-weights below
+- **Where**: `CombinedLossWithREINFORCE.forward()` (line ~2888)
+
+#### 10a. A5 Round-Trip Consistency
+
+- **Type**: MSE on z-space and Tc reconstruction
+- **Config**: `a5_round_trip_weight: 1.0`, `a5_z_weight: 1.0`, `a5_tc_weight: 5.0`
+- **File**: `src/superconductor/losses/round_trip_loss.py`
+- **What**: Decode z→formula→re-encode→z'. Penalizes `||z - z'||`. Ensures z-space is semantically meaningful.
+- **Applied to**: 10% random subset per batch (`a5_subset_fraction=0.1`)
+
+#### 10b. A3 Site Occupancy Sum
+
+- **Type**: L1 deviation from target occupancy
+- **Config**: `a3_site_occupancy_weight: 1.0`
+- **File**: `src/superconductor/losses/constraint_zoo.py`
+- **What**: Crystallographic site occupancy sums (e.g., YBCO Y-site → 1.0, LSCO La/Sr-site → 2.0)
+- **Applied to**: Only when family classifier confidence > 0.8 and family has defined sites
+
+#### 10c. A6 Charge Balance
+
+- **Type**: tanh penalty on charge imbalance (bounded [0, 1))
+- **Config**: `a6_charge_balance_weight: 1.0`, `a6_charge_tolerance: 0.5`
+- **File**: `src/superconductor/losses/constraint_zoo.py`
+- **What**: Charge neutrality using common oxidation states. Tolerance of 0.5 for mixed-valence materials.
+- **Applied to**: All samples with valid element data
+
+**Why constraint zoo exists**: These are chemistry priors that the model can't easily learn from token sequences alone. Site occupancy and charge balance are hard constraints in real crystals.
+
+### 11. High-Pressure (HP) Prediction
+
+Predicts whether a superconductor requires high pressure.
+
+- **Type**: Binary Cross-Entropy with Logits (positive class weighted)
+- **Config**: `hp_loss_weight: 1.0`
+- **Where**: `train_epoch()` (line ~4661)
+- **Inputs**: `encoder_out['hp_pred'] [batch]` vs `hp_labels [batch]`
+- **Applied to**: SC samples only. `pos_weight` auto-computed from class imbalance (~100:1 non-HP to HP), capped at 50x.
+- **Why**: Hydrogen superconductors (H3S at 203K, LaH10 at 250K) have the highest Tc values but only under extreme pressure (>100 GPa). Without this head, the model might learn to generate hydrides for high-Tc targets without encoding the pressure requirement.
+
+### 12. SC/Non-SC Classification
+
+Binary superconductor vs non-superconductor classification.
+
+- **Type**: Binary Cross-Entropy with Logits
+- **Config**: `sc_loss_weight: 1.0`
+- **Where**: `train_epoch()` (line ~4674)
+- **Inputs**: `encoder_out['sc_pred'] [batch]` vs `is_sc.float() [batch]`
 - **Applied to**: All samples
-- **Weight mechanism**: Local variable `effective_physics_z_weight` with warmup ramp
-- **Skip schedule**: Yes — (threshold=0.5, delta=0.2)
+- **Why**: The contrastive dataset has 23K SC + 23K non-SC materials. This head forces the z-space to have a clear SC/non-SC boundary, which is essential for targeted generation (want to generate SCs, not random materials).
 
-### 12. High-Pressure (HP) Prediction
-- **Version**: V12.19, boosted V12.26
-- **Config**: `hp_loss_weight: 0.5`
-- **Computed in**: `train_epoch()` (line ~3957)
-- **What it does**: Binary cross-entropy predicting whether a superconductor requires high pressure. Critical for hydrogen-based superconductors (H3S, LaH10) where Tc is meaningless without pressure context.
-- **Applied to**: SC samples only
-- **Weight mechanism**: Local variable `epoch_hp_loss_weight`, passed as parameter
-- **Skip schedule**: Yes — (threshold=0.3, delta=0.1)
+### 13. Hierarchical Family Classifier
 
-### 13. SC/non-SC Classification
-- **Version**: V12.21
-- **Config**: `sc_loss_weight: 0.5`
-- **Computed in**: `train_epoch()` (line ~3968)
-- **What it does**: Binary cross-entropy classifying whether a material is a superconductor. Helps the latent space separate SC from non-SC materials.
-- **Applied to**: All samples
-- **Weight mechanism**: Local variable `epoch_sc_loss_weight`, passed as parameter
-- **Skip schedule**: Yes — (threshold=0.3, delta=0.1)
+Three-level classification of superconductor families.
+
+- **Type**: Composite of 3 Cross-Entropy losses
+- **Config**: `family_classifier_weight: 0.5`
+- **Where**: `train_epoch()` (line ~4684)
+- **Internal weights**: coarse 0.6, cuprate-sub 0.3, iron-sub 0.1
+- **Levels**:
+  - Level 1 (coarse): 7 classes — cuprate, iron, conventional, MgB2, heavy-fermion, organic, other
+  - Level 2a (cuprate sub): 6 classes — YBCO, LSCO, Bi-cuprate, Tl-cuprate, Hg-cuprate, other-cuprate
+  - Level 2b (iron sub): 2 classes — 1111-type, 122-type
+- **Applied to**: SC samples only with valid family labels
+- **Why**: Family membership strongly constrains valid formulas. A YBCO must contain Y, Ba, Cu, O. An iron-pnictide must contain Fe and an As/P. This signal structures the z-space by chemistry, not just statistical pattern.
 
 ### 14. Stop Prediction
-- **Version**: V12.30
+
+Dedicated binary head for end-of-sequence decision.
+
+- **Type**: Binary Cross-Entropy with Logits (position-weighted)
 - **Config**: `stop_loss_weight: 5.0`, `stop_end_position_weight: 10.0`
-- **Computed in**: `train_epoch()` (line ~3930)
-- **What it does**: BCE on stop head predicting END token position. High weight (5.0) due to severe class imbalance (~1 END per 14 non-END tokens). Position-aware weighting (10x at END positions, V12.37) addresses this further.
-- **Applied to**: All samples
-- **Weight mechanism**: Local variable `epoch_stop_loss_weight`, passed as parameter (V12.40)
-- **Skip schedule**: Yes — (threshold=0.1, delta=0.1)
+- **Where**: `train_epoch()` (line ~4636)
+- **Inputs**: `stop_logits [batch, seq]` vs `stop_targets = (targets == END_IDX).float()`
+- **Applied to**: All samples (valid non-PAD positions only)
+- **Details**: END positions get 10x extra weight to address 1:14 class imbalance (only 1 END token per ~14 non-END tokens)
+- **Why**: Knowing when to stop is critical for autoregressive generation. Collapsing the stop decision into the 4600+ token softmax dilutes the signal. A dedicated head with high weight ensures the model learns clean sequence termination.
 
-### 15. Hierarchical Family Classifier
-- **Version**: V12.33
-- **Config**: `family_classifier_weight: 2.0`, `use_family_classifier: True`
-- **Computed in**: `train_epoch()` (line ~3974)
-- **What it does**: Hierarchical classification of superconductor family: coarse (cuprate/iron/conventional/other), cuprate sub-family (YBCO/LSCO/Bi/Tl/Hg), iron sub-family (1111/122/11). Forces latent space to encode family membership.
-- **Applied to**: SC samples only (requires family labels)
-- **Weight mechanism**: Local variable `epoch_family_loss_weight`, passed as parameter
-- **Skip schedule**: Yes — (threshold=0.5, delta=0.2)
+### 15. Token Type Classification (V14.3)
 
-### 16. Contrastive Loss (DISABLED)
-- **Version**: V12.12 (disabled V12.26)
-- **Config**: `contrastive_weight: 0.0`
-- **Reason disabled**: Plateaued at 5.06, consuming 16% of gradient budget with no improvement.
-- **What it does**: Pushes SC and non-SC z-vectors apart in latent space using contrastive learning.
+Predicts the TYPE of the next token (element/integer/fraction/special/EOS).
 
-### 17. Theory Consistency (DISABLED)
-- **Version**: V12.22 (disabled V12.26)
+- **Type**: Cross-Entropy (5 classes)
+- **Config**: `token_type_loss_weight: 0.1`
+- **Where**: `train_epoch()` (line ~4622)
+- **Inputs**: `type_logits [batch, seq, 5]` vs `type_targets` (computed from tokenizer LUT)
+- **Applied to**: All samples (valid non-PAD positions only)
+- **Details**: See `docs/TOKEN_TYPE_CLASSIFIER_V14_3.md` for full design
+- **Why**: 50% of autoregressive errors are type confusion (element where fraction should go, etc.). The formula grammar is deterministic: `[Element, Stoich, Element, Stoich, ..., EOS]`. This head learns the pattern during training; at inference, it applies a **hard mask** over vocab logits to block invalid token types.
+
+### 16. Physics Z Supervision (DORMANT)
+
+Enforces physical meaning on named z-coordinate blocks.
+
+- **Type**: Composite of 10 sub-losses (MSE, SmoothL1, hinge)
+- **Config**: `use_physics_z: False` (disabled; auto-reactivated by smart scheduler)
+- **Where**: `train_epoch()` (line ~4742); implementation in `src/superconductor/losses/z_supervision_loss.py`
+- **Sub-components**: Compositional encoding, Magpie projection, GL consistency, BCS consistency, cobordism, dimensionless ratios, thermodynamic, structural, electronic, direct supervision
+- **Why**: The 2048-dim z-space has named blocks (1-11) for specific physics quantities (Ginzburg-Landau params, BCS params, crystal structure, etc.). This loss enforces inter-block consistency (e.g., GL kappa = lambda/xi) and alignment with external physics targets. Currently dormant because formula reconstruction takes priority; the scheduler auto-reactivates it when formula CE plateaus.
+
+### 17. Theory Consistency (REMOVED — weight=0, infrastructure retained)
+
+Family-specific physics losses (BCS Allen-Dynes, cuprate Presland dome, etc.).
+
 - **Config**: `theory_weight: 0.0`
-- **Reason disabled**: Plateaued at 1.43, consuming 22% of gradient budget with no improvement.
-- **What it does**: Ensures z-vectors are consistent with theoretical predictions (BCS-like relationships).
+- **File**: `src/superconductor/losses/theory_losses.py`
+- **Reason disabled**: Plateaued at 1.43, consuming 22% of gradient budget with no formula reconstruction improvement.
 
 ---
 
-## Loss Composition
+## Non-Differentiable: REINFORCE Reward Signals
 
-### Inside `CombinedLossWithREINFORCE.forward()` (the `total` tensor)
-```
-total = ce_weight * formula_CE + rl_weight * reinforce_loss
-      + tc_weight * tc_loss
-      + magpie_weight * magpie_loss
-      + kl_weight * kl_loss
-      + stoich_weight * stoich_loss
-      + numden_weight * numden_loss
-      + 0.5 * element_count_loss
-      + tc_class_weight * tc_class_loss
-      + z_norm_penalty_weight * z_norm_penalty  (if enabled)
-```
+These are NOT losses — they are reward modifiers that shape the REINFORCE policy gradient (#2) by changing the advantage computation. They affect training indirectly through the SCST/RLOO sampling loop.
 
-### External (added in `train_epoch()` batch loop)
-```
-loss = sc_frac * sc_loss_dict['total']
-     + non_sc_frac * non_sc_formula_weight * non_sc_loss_dict['total']
-     + contrastive_weight * contrastive_loss     (DISABLED, weight=0)
-     + hp_loss_weight * hp_loss
-     + sc_loss_weight * sc_loss
-     + theory_weight * theory_loss               (DISABLED, weight=0)
-     + stop_loss_weight * stop_loss
-     + physics_z_weight * physics_z_loss
-     + family_loss_weight * family_loss
-```
+### Task Reward
+
+- **Formula**: `reward = max_reward * (n_correct / n_total)^sharpness`
+- **Config**: `v14_max_reward: 100.0`, `v14_sharpness: 4.0`
+- **File**: `src/superconductor/losses/reward_gpu_native.py`
+- **Token-type penalties**: element -3.0, integer -1.0, fraction -0.5, special -0.5
+
+### Constraint Reward Penalties (A1, A4, A7, B1-B8)
+
+Non-differentiable physics-grounded penalties applied to REINFORCE-sampled formulas.
+
+- **File**: `src/superconductor/losses/constraint_rewards.py`
+
+| Constraint | Penalty | Description |
+|-----------|---------|-------------|
+| A1 | -50.0 | Duplicate element in formula |
+| A4 | -10.0 | Non-normalized stoichiometry |
+| A7 | -30.0 | Impossible element combination |
+| B1 | -40.0 | YBCO: wrong oxygen content |
+| B2 | -40.0 | LSCO: Sr doping out of range |
+| B3 | -40.0 | BSCCO: wrong Ca/Cu content |
+| B4 | -30.0 | Hg-cuprate: volatile elements present |
+| B5 | -30.0 | Tl-cuprate: poison elements present |
+| B6 | -30.0 | Iron-based: wrong oxygen content |
+| B7 | -30.0 | MgB2: poison elements present |
+| B8 | -30.0 | A15: ratio constraints violated |
+
+B-constraints only apply when family classifier confidence > 0.8.
+
+### Entropy Bonus
+
+- **Formula**: `combined_reward = task_reward + entropy_weight * seq_entropy`
+- **Config**: `entropy_weight: 0.2`
+- **Managed by**: `EntropyManager` (dynamically adjusts between 0.05 and 1.0)
+- **File**: `src/superconductor/training/entropy_maintenance.py`
+- **Why**: Prevents entropy collapse (policy becoming too deterministic) during RL training.
 
 ---
 
-## V12.40 Smart Skip Schedule
+## Smart Loss Skip Schedule (V12.40)
 
-Each loss is independently tracked. When converged (below threshold), it's computed every 4th epoch only. If it spikes above baseline + delta, it resumes every-epoch.
+Each loss is independently tracked. When converged (below threshold), it's computed every `loss_skip_frequency` (default 4) epochs only. If it spikes above baseline + delta, it resumes every-epoch.
 
 ```python
 'loss_skip_schedule': {
     # metric_key:      (converge_threshold, spike_delta)
-    # reinforce_loss: REMOVED in V13.2 — RL fluctuates by design, skipping kills signal
     'tc_loss':         (0.5,   0.1),
     'magpie_loss':     (0.1,   0.1),
     'stoich_loss':     (0.01,  0.05),
-    'numden_loss':     (3.0,   0.5),
     'tc_class_loss':   (0.5,   0.2),
     'physics_z_loss':  (0.5,   0.2),
     'hp_loss':         (0.3,   0.1),
@@ -244,56 +383,36 @@ Each loss is independently tracked. When converged (below threshold), it's compu
 
 Losses NOT in skip schedule (always active):
 - Formula CE — core training signal
+- REINFORCE — policy gradient fluctuates by design (V13.2: removed from skip)
 - KL/L2 regularization — stability
-- Element count MSE — tiny, always useful
-- Z-norm penalty — tiny, stability
+- Element count MSE — tiny cost
+- Z-norm penalty — tiny cost
+- Constraint zoo — tiny cost
+- Token type classification — new, always learning
 
 ---
 
-## V14.0 RL Curriculum Redesign
+## Historical: Removed Losses
 
-### Problem
-After 24 epochs of SCST RL (rl_weight=1.0), AR exact match was stuck at ~1.2% despite TF exact being 99.4%. Error analysis revealed:
-- 26.7% of AR samples have 1-3 errors (RL-tractable) — RL was moving the distribution but couldn't push across the 0-error threshold
-- 72.1% have 4+ errors — reward cliff at 3→4 errors (10.0→5.0) killed gradient for these samples
-- 87% of compute was in RL sampling, for near-zero gradient signal on most samples
+| Loss | Version Added | Version Removed | Reason |
+|------|--------------|-----------------|--------|
+| Contrastive | V12.12 | V12.26 | Plateaued at 5.06, 16% gradient budget, no improvement |
+| NumDen MSE | V12.38 | V13.0 | Replaced by semantic fraction tokens (FRAC:p/q) |
+| Theory Consistency | V12.22 | V12.26 (weight→0) | Plateaued at 1.43, 22% gradient budget |
 
-### Continuous Reward (eliminates the cliff)
+---
 
-Formula: `reward = max_reward * (n_correct / n_total) ^ sharpness`
+## Key Files
 
-| Errors (15-token seq) | Old Reward | New Reward (sharpness=4) |
-|----------------------|-----------|-------------------------|
-| 0 (exact)            | 100.0     | 100.0                   |
-| 1                    | 50.0      | 75.8                    |
-| 2                    | 25.0      | 56.4                    |
-| 3                    | 10.0      | 41.0                    |
-| **4 (THE CLIFF)**    | **max 5.0** | **28.9**              |
-| 5                    | max 5.0   | 19.8                    |
-| 7                    | max 5.0   | 7.7                     |
-
-Config: `GPURewardConfigV14` in `src/superconductor/losses/reward_gpu_native.py`, gated by `use_v14_reward` in TRAIN_CONFIG.
-
-### Token-Type Penalties
-
-| Token Type | Penalty | Rationale |
-|-----------|---------|-----------|
-| Element   | -3.0    | Wrong element = wrong compound entirely |
-| Integer   | -1.0    | Wrong stoichiometry |
-| Fraction  | -0.5    | Wrong fraction (value-scaled penalty already exists) |
-| Special   | -0.5    | Wrong BOS/EOS/PAD |
-
-### Training Controls
-
-| Control | Config Key | Default | Description |
-|---------|-----------|---------|-------------|
-| RL Warmup | `rl_warmup_epochs`, `rl_warmup_start` | 20, 0.1 | Linear ramp from 10% to 100% |
-| RL Safety Guard | `rl_safety_exact_drop`, `rl_safety_check_interval` | 0.02, 5 | Halve weight on >2% TF regression |
-| PhysZ Stagger | `rl_requires_physz_stable` | True | Block RL until PhysZ warmup done |
-| Temp Schedule | `rl_temperature_start/end/decay_epochs` | 0.5, 0.2, 50 | Exploration → exploitation |
-| Phased Curriculum | `rl_use_phased_curriculum` | False | Staged reward complexity |
-
-### Key Files
-- `src/superconductor/losses/reward_gpu_native.py` — `GPURewardConfigV14`, continuous reward, token-type penalties
-- `src/superconductor/training/entropy_maintenance.py` — `set_base_temperature()` for temp schedule
-- `scripts/train_v12_clean.py` — TRAIN_CONFIG keys, warmup/safety/stagger/schedule logic
+| File | Contains |
+|------|----------|
+| `scripts/train_v12_clean.py` | `CombinedLossWithREINFORCE`, `train_epoch()`, all config, loss assembly |
+| `src/superconductor/losses/reward_gpu_native.py` | V14.0 continuous reward, token-type penalties |
+| `src/superconductor/losses/constraint_rewards.py` | A1, A4, A7, B1-B8 reward penalties |
+| `src/superconductor/losses/constraint_zoo.py` | A3 site occupancy, A6 charge balance |
+| `src/superconductor/losses/round_trip_loss.py` | A5 round-trip consistency |
+| `src/superconductor/losses/z_supervision_loss.py` | Physics Z (10-component) |
+| `src/superconductor/losses/theory_losses.py` | Theory losses (BCS, cuprate, iron, etc.) |
+| `src/superconductor/losses/consistency_losses.py` | Legacy consistency (unused) |
+| `src/superconductor/training/entropy_maintenance.py` | Entropy manager for RL |
+| `src/superconductor/models/attention_vae.py` | Encoder KL/L2 loss |
