@@ -1537,16 +1537,41 @@ class EnhancedTransformerDecoder(nn.Module):
 
         # V14.3: Add encoder heads memory (4 tokens)
         # Gives decoder context about what kind of material this is
-        if heads_pred is not None:
+        if heads_pred is not None and hasattr(self, 'heads_to_memory'):
+            # Ensure all heads_pred values have matching batch dimension
+            hp_tc = heads_pred['tc_pred']
+            hp_sc = heads_pred['sc_pred']
+            hp_hp = heads_pred['hp_pred']
+            hp_tc_class = heads_pred['tc_class_logits']
+            hp_comp = heads_pred['competence']
+            hp_ecount = heads_pred['element_count_pred']
+
+            # Validate batch dims match z before cat (catches stale tensors)
+            for name, tensor in [('tc_pred', hp_tc), ('sc_pred', hp_sc),
+                                 ('hp_pred', hp_hp), ('tc_class_logits', hp_tc_class),
+                                 ('competence', hp_comp), ('element_count_pred', hp_ecount)]:
+                if tensor.size(0) != batch_size:
+                    raise RuntimeError(
+                        f"heads_pred['{name}'] batch {tensor.size(0)} != z batch {batch_size}. "
+                        f"Shapes: {name}={tensor.shape}, z=[{batch_size}, ...]"
+                    )
+
             heads_input = torch.cat([
-                heads_pred['tc_pred'].unsqueeze(-1),              # 1
-                heads_pred['sc_pred'].unsqueeze(-1),              # 1
-                heads_pred['hp_pred'].unsqueeze(-1),              # 1
-                heads_pred['tc_class_logits'],                    # 5
-                heads_pred['competence'].unsqueeze(-1),           # 1
-                heads_pred['element_count_pred'].unsqueeze(-1),   # 1
+                hp_tc.unsqueeze(-1),        # 1
+                hp_sc.unsqueeze(-1),        # 1
+                hp_hp.unsqueeze(-1),        # 1
+                hp_tc_class,                # 5
+                hp_comp.unsqueeze(-1),      # 1
+                hp_ecount.unsqueeze(-1),    # 1
             ], dim=-1)  # [batch, 10]
             heads_memory = self.heads_to_memory(heads_input)
+            expected_size = batch_size * self.heads_n_tokens * self.d_model
+            if heads_memory.numel() != expected_size:
+                raise RuntimeError(
+                    f"heads_to_memory output {heads_memory.shape} ({heads_memory.numel()} elems) "
+                    f"!= expected [{batch_size}, {self.heads_n_tokens}, {self.d_model}] "
+                    f"({expected_size} elems). heads_input={heads_input.shape}"
+                )
             heads_memory = heads_memory.view(batch_size, self.heads_n_tokens, self.d_model)
             memory_parts.append(heads_memory)
 
