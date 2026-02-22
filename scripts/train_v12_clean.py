@@ -77,7 +77,7 @@ from superconductor.models.autoregressive_decoder import (
     VOCAB_SIZE, PAD_IDX, START_IDX, END_IDX, IDX_TO_TOKEN, indices_to_formula
 )
 # V13.0: Semantic fraction tokenizer
-from superconductor.tokenizer.fraction_tokenizer import FractionAwareTokenizer
+from superconductor.tokenizer.fraction_tokenizer import FractionAwareTokenizer, N_TOKEN_TYPES
 from superconductor.encoders.element_properties import get_atomic_number
 
 # V12.8: REINFORCE support with GPU-native rewards
@@ -400,7 +400,7 @@ def build_family_lookup_tensors(device):
     return fine_to_coarse, fine_to_cuprate_sub, fine_to_iron_sub
 
 
-ALGO_VERSION = 'V14.0'  # Bump this when making algorithm changes
+ALGO_VERSION = 'V14.3'  # Bump this when making algorithm changes
 
 TRAIN_CONFIG = {
     'num_epochs': 5000,
@@ -743,6 +743,18 @@ TRAIN_CONFIG = {
     'stop_boost': 10.0,       # V12.37: Increased from 4.0 — stop head needs stronger boost to compete with 150+ element tokens
     'hard_stop_threshold': 0.8,  # V12.37: Force END when sigmoid(stop_logit) > threshold (0 = disabled)
     'stop_end_position_weight': 10.0,  # V12.37: Extra weight on END positions in stop loss (addresses 1:14 imbalance)
+
+    # =========================================================================
+    # V14.3: Token Type Classifier Head
+    # =========================================================================
+    # Predicts what TYPE of token comes next (element/integer/fraction/special/EOS).
+    # Auxiliary CE loss during training; hard vocab masking at inference.
+    # 50% of AR errors are type confusion — this eliminates that error class.
+    # =========================================================================
+    'token_type_loss_weight': 0.1,  # V14.3: Weight for token type CE loss (auxiliary)
+    'use_type_masking_ar': False,   # V14.3: Enable hard type masking during AR generation
+                                    # Set True after type head is accurate (>90%)
+    'use_heads_memory': True,       # V14.3: Feed encoder head predictions into decoder memory
 
     # =========================================================================
     # V12.31: Physics-Supervised Z Coordinates
@@ -2115,6 +2127,8 @@ class CombinedLossWithREINFORCE(nn.Module):
         self._max_len = 60
         self._stop_boost = 0.0  # V12.30: Set via set_decoder()
         self._hard_stop_threshold = 0.0  # V12.37: Set via set_decoder()
+        self._heads_pred = None  # V14.3: Set per-batch for RLOO enriched memory
+        self._type_masks = None  # V14.3: Set per-batch for RLOO type masking
 
         # GPU-native reward config
         # V14.0: Use continuous reward config when enabled
@@ -2285,6 +2299,8 @@ class CombinedLossWithREINFORCE(nn.Module):
         targets: torch.Tensor,
         encoder_skip: torch.Tensor = None,
         stoich_pred: torch.Tensor = None,
+        heads_pred: dict = None,  # V14.3: Encoder head predictions for enriched memory
+        type_masks: torch.Tensor = None,  # V14.3: Token type masks for constrained sampling
     ):
         """
         V12.8: Compute RLOO advantages using autoregressive sampling with KV cache.
@@ -2299,6 +2315,12 @@ class CombinedLossWithREINFORCE(nn.Module):
         if self._decoder is None:
             raise RuntimeError("Decoder not set. Call set_decoder() first.")
 
+        # V14.3: Fall back to per-batch stored values if not explicitly passed
+        if heads_pred is None:
+            heads_pred = self._heads_pred
+        if type_masks is None:
+            type_masks = self._type_masks
+
         batch_size = z.shape[0]
         n_samples = self.n_samples_rloo
 
@@ -2311,6 +2333,13 @@ class CombinedLossWithREINFORCE(nn.Module):
         encoder_skip_expanded = encoder_skip.repeat(n_samples, 1) if encoder_skip is not None else None
         stoich_pred_expanded = stoich_pred.repeat(n_samples, 1) if stoich_pred is not None else None
         targets_expanded = targets.repeat(n_samples, 1)  # [batch * n_samples, seq_len]
+        # V14.3: Expand heads_pred dict values for RLOO batch
+        heads_pred_expanded = None
+        if heads_pred is not None:
+            heads_pred_expanded = {
+                k: v.repeat(n_samples, *([1] * (v.dim() - 1)))
+                for k, v in heads_pred.items()
+            }
 
         # V12.15: Track REINFORCE sampling time separately (this is the expensive part)
         timing = get_timing_stats()
@@ -2342,6 +2371,8 @@ class CombinedLossWithREINFORCE(nn.Module):
                 max_len=self._max_len,
                 stop_boost=self._stop_boost,  # V12.30
                 hard_stop_threshold=self._hard_stop_threshold,  # V12.37
+                heads_pred=heads_pred_expanded,  # V14.3: enriched memory
+                type_masks=type_masks,  # V14.3: type-constrained sampling
             )
             self._last_spec_stats = None
 
@@ -2494,6 +2525,8 @@ class CombinedLossWithREINFORCE(nn.Module):
         targets: torch.Tensor,
         encoder_skip: torch.Tensor = None,
         stoich_pred: torch.Tensor = None,
+        heads_pred: dict = None,  # V14.3: Encoder head predictions for enriched memory
+        type_masks: torch.Tensor = None,  # V14.3: Token type masks for constrained sampling
     ):
         """
         Self-Critical Sequence Training (Rennie et al. 2017).
@@ -2516,8 +2549,14 @@ class CombinedLossWithREINFORCE(nn.Module):
         if self._decoder is None:
             raise RuntimeError("Decoder not set. Call set_decoder() first.")
 
+        # V14.3: Fall back to per-batch stored values if not explicitly passed
+        if heads_pred is None:
+            heads_pred = self._heads_pred
+        if type_masks is None:
+            type_masks = self._type_masks
+
         # Precompute memory once — shared by both greedy and sample passes
-        cached_memory = self._decoder.precompute_memory(z, encoder_skip, stoich_pred)
+        cached_memory = self._decoder.precompute_memory(z, encoder_skip, stoich_pred, heads_pred=heads_pred)
 
         # 1. Greedy decode (deterministic baseline) — no gradients needed
         with torch.no_grad():
@@ -2531,6 +2570,7 @@ class CombinedLossWithREINFORCE(nn.Module):
                 cached_memory=cached_memory,
                 stop_boost=self._stop_boost,  # V12.30
                 hard_stop_threshold=self._hard_stop_threshold,  # V12.37
+                type_masks=type_masks,  # V14.3
             )
 
             # Pad/truncate greedy tokens to match target length for reward computation
@@ -2581,6 +2621,7 @@ class CombinedLossWithREINFORCE(nn.Module):
             cached_memory=cached_memory,
             stop_boost=self._stop_boost,  # V12.30
             hard_stop_threshold=self._hard_stop_threshold,  # V12.37
+            type_masks=type_masks,  # V14.3
         )
 
         # Pad/truncate sampled tokens to match target length
@@ -3130,6 +3171,24 @@ def cache_z_vectors(encoder, loader, device, epoch, cache_path, dataset_info=Non
                 else:
                     _stoich = None
 
+                # V14.3: Build heads_pred for enriched decoder memory
+                _zc_heads_pred = None
+                if TRAIN_CONFIG.get('use_heads_memory', False) and hasattr(decoder, 'heads_to_memory'):
+                    _tc_pred = encoder_out.get('tc_pred')
+                    _sc_pred = encoder_out.get('sc_pred', torch.zeros(z.size(0), device=z.device))
+                    _hp_pred = encoder_out.get('hp_pred', torch.zeros(z.size(0), device=z.device))
+                    _tc_class = encoder_out.get('tc_class_logits', torch.zeros(z.size(0), 5, device=z.device))
+                    _comp = encoder_out.get('competence', torch.ones(z.size(0), device=z.device))
+                    if _tc_pred is not None and _ecount is not None:
+                        _zc_heads_pred = {
+                            'tc_pred': _tc_pred.detach(),
+                            'sc_pred': _sc_pred.detach(),
+                            'hp_pred': _hp_pred.detach(),
+                            'tc_class_logits': _tc_class.detach(),
+                            'competence': _comp.detach(),
+                            'element_count_pred': _ecount.detach(),
+                        }
+
                 # Generate predictions using decoder
                 if include_log_probs:
                     gen_tokens, log_probs, _, _ = decoder.sample_for_reinforce(
@@ -3138,6 +3197,7 @@ def cache_z_vectors(encoder, loader, device, epoch, cache_path, dataset_info=Non
                         max_len=tokens.size(1),
                         stop_boost=stop_boost,  # V12.37: Was missing — caused 1.6% exact match
                         hard_stop_threshold=hard_stop_threshold,
+                        heads_pred=_zc_heads_pred,  # V14.3
                     )
                     all_log_probs.append(log_probs.cpu())
                 else:
@@ -3147,6 +3207,7 @@ def cache_z_vectors(encoder, loader, device, epoch, cache_path, dataset_info=Non
                         max_len=tokens.size(1), return_log_probs=False, return_entropy=False,
                         stop_boost=stop_boost,  # V12.37: Was missing — caused 1.6% exact match
                         hard_stop_threshold=hard_stop_threshold,
+                        heads_pred=_zc_heads_pred,  # V14.3
                     )[0]
 
                 all_generated_tokens.append(gen_tokens.cpu())
@@ -3914,6 +3975,28 @@ def evaluate_true_autoregressive(encoder, decoder, loader, device, max_samples=1
             else:
                 all_family_coarse_pred.extend([-1] * batch_size)
 
+        # V14.3: Build heads_pred for AR generation if enabled
+        _ar_heads_pred = None
+        _ar_type_masks = None
+        if TRAIN_CONFIG.get('use_heads_memory', False) or TRAIN_CONFIG.get('use_type_masking_ar', False):
+            _sc_pred = encoder_out.get('sc_pred')
+            _hp_pred = encoder_out.get('hp_pred')
+            _tc_class = encoder_out.get('tc_class_logits')
+            _competence = encoder_out.get('competence')
+            _elem_count = encoder_out.get('element_count_pred')
+            if all(v is not None for v in [_sc_pred, _hp_pred, _tc_class, _competence, _elem_count]):
+                _ar_heads_pred = {
+                    'tc_pred': encoder_out['tc_pred'],
+                    'sc_pred': _sc_pred,
+                    'hp_pred': _hp_pred,
+                    'tc_class_logits': _tc_class,
+                    'competence': _competence,
+                    'element_count_pred': _elem_count,
+                }
+            # V14.3: Type masks for hard vocab masking during AR generation
+            if TRAIN_CONFIG.get('use_type_masking_ar', False) and v13_tokenizer is not None:
+                _ar_type_masks = v13_tokenizer.get_type_masks(device=str(device))
+
         # Generate autoregressively (TRUE inference - no teacher forcing)
         generated_tokens, _, _ = decoder.generate_with_kv_cache(
             z=z,
@@ -3922,6 +4005,8 @@ def evaluate_true_autoregressive(encoder, decoder, loader, device, max_samples=1
             max_len=decoder.max_len,
             stop_boost=stop_boost,  # V12.30
             hard_stop_threshold=hard_stop_threshold,  # V12.37
+            heads_pred=_ar_heads_pred,  # V14.3
+            type_masks=_ar_type_masks,  # V14.3
         )
 
         # Compare with targets (excluding START token from targets)
@@ -4356,7 +4441,8 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
                 physics_z_loss_fn=None, physics_z_weight=1.0,
                 family_loss_weight=0.0, family_lookup_tables=None,
                 stop_loss_weight=None,  # V12.40: Pass as param for skip scheduling
-                stoich_cond_tf=1.0):  # V12.41: Stoich conditioning teacher forcing ratio
+                stoich_cond_tf=1.0,  # V12.41: Stoich conditioning teacher forcing ratio
+                v13_tokenizer=None):  # V14.3: Token type classification requires tokenizer
     """Train for one epoch with curriculum weights and teacher forcing.
 
     V12.8: Added amp_dtype for configurable mixed precision (bfloat16/float16)
@@ -4406,6 +4492,7 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
     total_constraint_zoo_loss = 0  # V12.43
     total_a5_z_mse = 0  # V12.43
     total_a5_tc_mse = 0  # V12.43
+    total_type_loss = 0  # V14.3
     total_sc_exact = 0
     total_non_sc_exact = 0
     total_spec_accept = 0  # V12.9: Speculative decoding acceptance rate
@@ -4496,19 +4583,55 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
             else:
                 stoich_pred = None
 
+            # V14.3: Build heads_pred dict for enriched decoder memory
+            heads_pred_dict = None
+            if TRAIN_CONFIG.get('use_heads_memory', False):
+                tc_pred_val = encoder_out['tc_pred']
+                sc_pred_val = encoder_out.get('sc_pred')
+                hp_pred_val = encoder_out.get('hp_pred')
+                tc_class_val = encoder_out.get('tc_class_logits')
+                competence_val = encoder_out.get('competence')
+                elem_count_val = encoder_out.get('element_count_pred')
+                # Only build dict if all required heads are available
+                if all(v is not None for v in [sc_pred_val, hp_pred_val, tc_class_val,
+                                               competence_val, elem_count_val]):
+                    heads_pred_dict = {
+                        'tc_pred': tc_pred_val.detach(),
+                        'sc_pred': sc_pred_val.detach(),
+                        'hp_pred': hp_pred_val.detach(),
+                        'tc_class_logits': tc_class_val.detach(),
+                        'competence': competence_val.detach(),
+                        'element_count_pred': elem_count_val.detach(),
+                    }
+
             # V12.15: Time decoder forward
             if timing:
                 timing.start('decoder_fwd')
 
             # Decoder forward with teacher forcing ratio (all samples)
-            formula_logits, _, stop_logits = decoder(
+            formula_logits, _, stop_logits, type_logits = decoder(
                 z, tokens,
-                stoich_pred=stoich_pred, teacher_forcing_ratio=tf_ratio
+                stoich_pred=stoich_pred, teacher_forcing_ratio=tf_ratio,
+                heads_pred=heads_pred_dict,
             )
             formula_targets = tokens[:, 1:]
 
             if timing:
                 timing.stop('decoder_fwd')
+
+            # V14.3: Token type classification loss (auxiliary CE on type labels)
+            token_type_loss_weight = TRAIN_CONFIG.get('token_type_loss_weight', 0.0)
+            type_loss_val = torch.tensor(0.0, device=device)
+            if token_type_loss_weight > 0 and type_logits is not None:
+                # Compute type targets from formula_targets using tokenizer LUT
+                type_targets = v13_tokenizer.compute_token_type_targets(formula_targets)
+                # Mask: only compute on valid (non-PAD) positions
+                type_mask = (formula_targets != PAD_IDX)
+                # Flatten for CE: [batch*seq_len, N_TOKEN_TYPES] vs [batch*seq_len]
+                type_logits_flat = type_logits[type_mask]
+                type_targets_flat = type_targets[type_mask]
+                if type_logits_flat.numel() > 0:
+                    type_loss_val = F.cross_entropy(type_logits_flat, type_targets_flat)
 
             # V12.30: Stop-prediction loss (BCE on stop head)
             stop_loss_val = torch.tensor(0.0, device=device)
@@ -4630,6 +4753,10 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
             if timing:
                 timing.start('loss_compute')
 
+            # V14.3: Set per-batch heads_pred for RLOO enriched memory
+            loss_fn._heads_pred = heads_pred_dict
+            loss_fn._type_masks = None  # Type masking in RLOO disabled for V14.3
+
             # V12.12: Compute main loss differently for SC vs non-SC
             if sc_mask.all():
                 # Pure SC batch — standard loss (no masking needed)
@@ -4660,6 +4787,7 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
                         + sc_loss_weight * sc_loss_val
                         + theory_weight * theory_loss_val
                         + stop_loss_weight * stop_loss_val
+                        + token_type_loss_weight * type_loss_val  # V14.3
                         + physics_z_loss_val  # V12.31
                         + family_loss_weight * family_loss_val)  # V12.32
 
@@ -4692,6 +4820,7 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
                         + sc_loss_weight * sc_loss_val
                         + theory_weight * theory_loss_val
                         + stop_loss_weight * stop_loss_val
+                        + token_type_loss_weight * type_loss_val  # V14.3
                         + physics_z_loss_val  # V12.31
                         + family_loss_weight * family_loss_val)  # V12.32
 
@@ -4760,6 +4889,7 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
                         sc_loss_weight * sc_loss_val +
                         theory_weight * theory_loss_val +
                         stop_loss_weight * stop_loss_val +
+                        token_type_loss_weight * type_loss_val +  # V14.3
                         physics_z_loss_val +  # V12.31
                         family_loss_weight * family_loss_val)  # V12.32
 
@@ -4870,6 +5000,7 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
         total_constraint_zoo_loss += loss_dict.get('constraint_zoo_loss', torch.tensor(0.0)).item()  # V12.43
         total_a5_z_mse += loss_dict.get('a5_z_mse', torch.tensor(0.0)).item()  # V12.43
         total_a5_tc_mse += loss_dict.get('a5_tc_mse', torch.tensor(0.0)).item()  # V12.43
+        total_type_loss += type_loss_val.item() if torch.is_tensor(type_loss_val) else type_loss_val  # V14.3
         z_norm_val = z.detach().float().norm(dim=1).mean().item()
         if not math.isnan(z_norm_val):
             total_z_norm += z_norm_val
@@ -4915,6 +5046,7 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
             'reinforce_loss': 0, 'mean_reward': 0, 'entropy': 0,
             'hp_loss': 0, 'sc_loss': 0, 'theory_loss': 0,
             'stop_loss': 0,  # V12.30
+            'type_loss': 0,  # V14.3
             'physics_z_loss': 0,  # V12.31
             'family_loss': 0,  # V12.32
             'z_norm': 0, 'n_skipped': n_skipped, 'n_total_batches': 0,
@@ -4935,6 +5067,7 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
         'theory_loss': total_theory_loss / n_batches,  # V12.22
         'tc_class_loss': total_tc_class_loss / n_batches,  # V12.28
         'stop_loss': total_stop_loss / n_batches,  # V12.30
+        'type_loss': total_type_loss / n_batches,  # V14.3
         'physics_z_loss': total_physics_z_loss / n_batches,  # V12.31
         'family_loss': total_family_loss / n_batches,  # V12.32
         'constraint_zoo_loss': total_constraint_zoo_loss / n_batches,  # V12.43
@@ -6196,6 +6329,7 @@ def train():
             physics_z_weight=effective_physics_z_weight,
             stop_loss_weight=epoch_stop_loss_weight,  # V12.40: For skip scheduling
             stoich_cond_tf=TRAIN_CONFIG.get('stoich_cond_tf', 1.0),  # V12.41: Stoich conditioning TF
+            v13_tokenizer=v13_tokenizer,  # V14.3: Token type classification
         )
 
         # V14.1: RL auto-scaling — after first epoch with RL active, measure raw RL loss
@@ -6404,6 +6538,10 @@ def train():
         # V12.30: Show stop loss if enabled
         if TRAIN_CONFIG.get('stop_loss_weight', 0) > 0 and metrics.get('stop_loss', 0) > 0:
             base_msg += f" | Stop: {metrics['stop_loss']:.4f}"
+
+        # V14.3: Show token type loss if enabled
+        if TRAIN_CONFIG.get('token_type_loss_weight', 0) > 0 and metrics.get('type_loss', 0) > 0:
+            base_msg += f" | Type: {metrics['type_loss']:.4f}"
 
         # V12.31: Show physics Z loss if enabled
         if physics_z_loss_fn is not None and metrics.get('physics_z_loss', 0) > 0:

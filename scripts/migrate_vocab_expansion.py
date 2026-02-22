@@ -235,6 +235,8 @@ def migrate_checkpoint(
             continue
 
         # Everything else: copy as-is
+        # This includes V14.3 token_type_head.* and heads_to_memory.* parameters
+        # which are vocab-independent and transfer directly.
         new_dec_state[key] = value
 
     # =========================================================================

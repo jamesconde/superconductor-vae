@@ -283,12 +283,13 @@ class SoftTokenDecoder(nn.Module):
         temp = temperature or self.temperature
 
         if soft_ratio <= 0:
-            # Pure teacher forcing
-            return self.decoder(z, target_tokens)
+            # Pure teacher forcing — return only (logits, predictions) for API compat
+            result = self.decoder(z, target_tokens)
+            return result[0], result[1]
 
         # First pass: get predictions with teacher forcing
         with torch.no_grad():
-            first_logits, _ = self.decoder(z, target_tokens)
+            first_logits, *_extra = self.decoder(z, target_tokens)
 
         # Create soft embeddings for input (all but last token)
         input_tokens = target_tokens[:, :-1]

@@ -205,7 +205,7 @@ def main():
         stoich_pred = torch.randn(batch_size, 37)  # max_elements*3 + 1
 
         try:
-            logits, generated, stop_logits = new_decoder(
+            logits, generated, stop_logits, *_extra = new_decoder(
                 z, target, encoder_skip=encoder_skip,
                 teacher_forcing_ratio=1.0, stoich_pred=stoich_pred
             )

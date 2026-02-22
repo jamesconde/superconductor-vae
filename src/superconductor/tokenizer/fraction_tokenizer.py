@@ -62,6 +62,15 @@ N_SPECIAL = 5
 N_ELEMENTS = 118
 MAX_INTEGER = 20
 
+# V14.3: Token type classification constants
+# Used by token_type_head to predict what TYPE of token comes next
+TOKEN_TYPE_ELEMENT = 0   # Chemical elements (H, He, ..., Og): IDs 5-122
+TOKEN_TYPE_INTEGER = 1   # Integer subscripts (1-20): IDs 123-142
+TOKEN_TYPE_FRACTION = 2  # FRAC:p/q tokens: IDs 143-4354
+TOKEN_TYPE_SPECIAL = 3   # PAD, BOS, UNK, FRAC_UNK, ISO_UNK, isotopes: IDs 0-4 + 4355+
+TOKEN_TYPE_EOS = 4       # EOS only (ID 2) — carved out from SPECIAL for importance
+N_TOKEN_TYPES = 5
+
 # Regex to tokenize formulas: matches elements, fractions in parens, or bare integers
 # Order: fraction (greedy), then element (2-char before 1-char), then integer
 _FORMULA_PATTERN = re.compile(
@@ -289,6 +298,70 @@ class FractionAwareTokenizer:
         """Get the element token index corresponding to an isotope (for embedding init)."""
         elem = self.isotope_token_to_element(token_id)
         return self._token_to_id[elem]
+
+    # =========================================================================
+    # V14.3: Token Type Classification
+    # =========================================================================
+
+    def get_token_type(self, token_id: int) -> int:
+        """Get the token type class for a single token ID.
+
+        Returns one of: TOKEN_TYPE_ELEMENT, TOKEN_TYPE_INTEGER, TOKEN_TYPE_FRACTION,
+                        TOKEN_TYPE_SPECIAL, TOKEN_TYPE_EOS
+        """
+        if token_id == EOS_IDX:
+            return TOKEN_TYPE_EOS
+        if self.is_element_token(token_id):
+            return TOKEN_TYPE_ELEMENT
+        if self.is_integer_token(token_id):
+            return TOKEN_TYPE_INTEGER
+        if self.is_fraction_token(token_id):
+            return TOKEN_TYPE_FRACTION
+        # Everything else: PAD, BOS, UNK, FRAC_UNK, ISO_UNK, isotope tokens
+        return TOKEN_TYPE_SPECIAL
+
+    def get_type_masks(self, device: str = 'cpu') -> 'torch.Tensor':
+        """Precompute [N_TOKEN_TYPES, vocab_size] boolean masks for each type class.
+
+        Returns:
+            Tensor of shape [5, vocab_size] where mask[type_class, token_id] = True
+            if token_id belongs to that type class.
+        """
+        import torch
+        v = self.vocab_size
+        masks = torch.zeros(N_TOKEN_TYPES, v, dtype=torch.bool, device=device)
+
+        for tid in range(v):
+            tc = self.get_token_type(tid)
+            masks[tc, tid] = True
+
+        return masks
+
+    def compute_token_type_targets(self, token_ids: 'torch.Tensor') -> 'torch.Tensor':
+        """Vectorized: convert token ID tensor to token type class tensor.
+
+        Uses a precomputed lookup table for O(1) per token.
+
+        Args:
+            token_ids: Integer tensor of any shape (e.g., [batch, seq_len])
+
+        Returns:
+            Tensor of same shape with token type class IDs (0-4)
+        """
+        import torch
+        # Build lookup table on first call (cached on instance)
+        if not hasattr(self, '_token_type_lut'):
+            v = self.vocab_size
+            lut = torch.zeros(v, dtype=torch.long)
+            for tid in range(v):
+                lut[tid] = self.get_token_type(tid)
+            self._token_type_lut = lut
+
+        # Move LUT to same device as input
+        lut = self._token_type_lut.to(token_ids.device)
+        # Clamp to valid range (PAD=0 mapped to SPECIAL is fine)
+        clamped = token_ids.clamp(0, lut.shape[0] - 1)
+        return lut[clamped]
 
     def fraction_token_to_value(self, token_id: int) -> float:
         """Convert a fraction token ID to its float value."""

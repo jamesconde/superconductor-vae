@@ -1444,6 +1444,47 @@ class EnhancedTransformerDecoder(nn.Module):
             nn.Linear(d_model // 4, 1),         # 128 → 1 (logit)
         )
 
+        # V14.3: Token type classifier head
+        # Predicts what TYPE of token comes next (element/integer/fraction/special/EOS)
+        # Uses same transformer hidden state as output_proj.
+        # Training: auxiliary CE loss on type labels.
+        # Inference: hard mask over vocab logits to eliminate type confusion errors.
+        #
+        # CRITICAL: This head applies HARD masking at inference — a wrong prediction
+        # completely blocks the correct token. Must be at least as capable as output_proj.
+        # Architecture mirrors output_proj: LayerNorm → Linear → GELU → Dropout → Linear
+        # with an additional hidden layer for richer type-discriminative features.
+        from superconductor.tokenizer.fraction_tokenizer import N_TOKEN_TYPES
+        self.token_type_head = nn.Sequential(
+            nn.LayerNorm(d_model),                  # Normalize transformer output
+            nn.Linear(d_model, d_model),            # 512 → 512 (full-width, no info loss)
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model, d_model // 4),       # 512 → 128
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model // 4, N_TOKEN_TYPES),  # 128 → 5
+        )
+
+        # V14.3: Enriched decoder memory from encoder head predictions
+        # Projects concatenated head outputs to additional memory tokens for cross-attention.
+        # Input: tc_pred(1) + sc_pred(1) + hp_pred(1) + tc_class_logits(5) +
+        #        competence(1) + element_count_pred(1) = 10 dims
+        # Output: 4 memory tokens of d_model each
+        #
+        # 10 → 2048 is a 200x expansion — needs intermediate stages to learn
+        # meaningful interactions between head predictions (e.g., "high Tc + SC + cuprate
+        # family → expect Cu, Ba, Y elements and specific stoichiometries").
+        self.heads_n_tokens = 4
+        self.heads_to_memory = nn.Sequential(
+            nn.Linear(10, d_model // 2),            # 10 → 256 (initial expansion)
+            nn.LayerNorm(d_model // 2),
+            nn.GELU(),
+            nn.Linear(d_model // 2, d_model),       # 256 → 512
+            nn.GELU(),
+            nn.Linear(d_model, d_model * self.heads_n_tokens),  # 512 → 2048
+        )
+
         self._init_weights()
 
     def _init_weights(self):
@@ -1461,15 +1502,17 @@ class EnhancedTransformerDecoder(nn.Module):
         z: torch.Tensor,
         encoder_skip: Optional[torch.Tensor] = None,
         stoich_pred: Optional[torch.Tensor] = None,  # V12.x: [batch, 37]; V13.0: [batch, 13]
+        heads_pred: Optional[Dict[str, torch.Tensor]] = None,  # V14.3: encoder head predictions
     ) -> torch.Tensor:
-        """Create combined memory from latent z, skip connection, and stoichiometry.
+        """Create combined memory from latent z, skip connection, stoichiometry, and heads.
 
         V12.4: Now includes stoichiometry conditioning tokens that give the decoder
         direct visibility into predicted element fractions.
         V13.0: stoich_pred is [batch, 13] = fractions(12) + count(1). numden removed.
+        V14.3: heads_pred adds 4 tokens from encoder head predictions (tc, sc, hp, etc.)
 
-        Memory layout: [latent_tokens (16) | skip_tokens (8) | stoich_tokens (4)]
-        Total: 28 memory tokens for cross-attention
+        Memory layout: [latent_tokens (16) | skip_tokens (8) | stoich_tokens (4) | heads_tokens (4)]
+        Total: up to 32 memory tokens for cross-attention
         """
         batch_size = z.size(0)
 
@@ -1492,6 +1535,21 @@ class EnhancedTransformerDecoder(nn.Module):
             stoich_memory = stoich_memory.view(batch_size, self.stoich_n_tokens, self.d_model)
             memory_parts.append(stoich_memory)
 
+        # V14.3: Add encoder heads memory (4 tokens)
+        # Gives decoder context about what kind of material this is
+        if heads_pred is not None:
+            heads_input = torch.cat([
+                heads_pred['tc_pred'].unsqueeze(-1),              # 1
+                heads_pred['sc_pred'].unsqueeze(-1),              # 1
+                heads_pred['hp_pred'].unsqueeze(-1),              # 1
+                heads_pred['tc_class_logits'],                    # 5
+                heads_pred['competence'].unsqueeze(-1),           # 1
+                heads_pred['element_count_pred'].unsqueeze(-1),   # 1
+            ], dim=-1)  # [batch, 10]
+            heads_memory = self.heads_to_memory(heads_input)
+            heads_memory = heads_memory.view(batch_size, self.heads_n_tokens, self.d_model)
+            memory_parts.append(heads_memory)
+
         # Concatenate all memory parts
         memory = torch.cat(memory_parts, dim=1)
 
@@ -1502,6 +1560,7 @@ class EnhancedTransformerDecoder(nn.Module):
         z: torch.Tensor,
         encoder_skip: Optional[torch.Tensor] = None,
         stoich_pred: Optional[torch.Tensor] = None,
+        heads_pred: Optional[Dict[str, torch.Tensor]] = None,  # V14.3
     ) -> torch.Tensor:
         """
         V12.8: Pre-compute memory projections for reuse across multiple operations.
@@ -1515,11 +1574,12 @@ class EnhancedTransformerDecoder(nn.Module):
             z: Latent vectors (batch, latent_dim)
             encoder_skip: Skip connection from encoder (batch, encoder_skip_dim)
             stoich_pred: Stoichiometry conditioning [batch, max_elements*3 + 1]
+            heads_pred: V14.3 Dict of encoder head predictions for enriched memory
 
         Returns:
             memory: Pre-computed memory tensor (batch, n_memory_tokens + extras, d_model)
         """
-        return self._create_memory(z, encoder_skip, stoich_pred)
+        return self._create_memory(z, encoder_skip, stoich_pred, heads_pred)
 
     def forward(
         self,
@@ -1529,7 +1589,8 @@ class EnhancedTransformerDecoder(nn.Module):
         teacher_forcing_ratio: float = 1.0,
         stoich_pred: Optional[torch.Tensor] = None,  # V12.4: [batch, max_elements*3 + 1]
         cached_memory: Optional[torch.Tensor] = None,  # V12.8: Pre-computed memory
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        heads_pred: Optional[Dict[str, torch.Tensor]] = None,  # V14.3: encoder head predictions
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
         """
         Forward pass with scheduled sampling (teacher forcing).
 
@@ -1548,11 +1609,15 @@ class EnhancedTransformerDecoder(nn.Module):
                         Contains predicted element fractions + element count
             cached_memory: V12.8 Pre-computed memory from precompute_memory().
                           If provided, skips memory creation (saves computation).
+            heads_pred: V14.3 Dict of encoder head predictions for enriched memory.
+                       Keys: tc_pred, sc_pred, hp_pred, tc_class_logits,
+                             competence, element_count_pred
 
         Returns:
             logits: Token logits (batch, seq_len-1, vocab_size)
             generated: Predicted token indices (batch, seq_len-1)
             stop_logits: V12.30 Stop-prediction logits (batch, seq_len-1)
+            type_logits: V14.3 Token type logits (batch, seq_len-1, N_TOKEN_TYPES) or None
         """
         batch_size = z.size(0)
         device = z.device
@@ -1562,8 +1627,8 @@ class EnhancedTransformerDecoder(nn.Module):
         if cached_memory is not None:
             memory = cached_memory
         else:
-            # Create combined memory (V12.4: includes stoichiometry tokens)
-            memory = self._create_memory(z, encoder_skip, stoich_pred)
+            # Create combined memory (V12.4: stoich, V14.3: heads)
+            memory = self._create_memory(z, encoder_skip, stoich_pred, heads_pred)
 
         # Fast path: Full teacher forcing (TF = 1.0) - parallel forward
         if teacher_forcing_ratio >= 1.0:
@@ -1596,8 +1661,9 @@ class EnhancedTransformerDecoder(nn.Module):
 
             logits = self.output_proj(output)
             stop_logits = self.stop_head(output).squeeze(-1)  # V12.30: [batch, seq_len]
+            type_logits = self.token_type_head(output)  # V14.3: [batch, seq_len, N_TOKEN_TYPES]
             generated = logits.argmax(dim=-1)
-            return logits, generated, stop_logits
+            return logits, generated, stop_logits, type_logits
 
         # OPTIMIZED path: Scheduled sampling (TF < 1.0) - 2 passes instead of 60
         # V12.6: This is 30x faster than the original sequential approach
@@ -1691,9 +1757,10 @@ class EnhancedTransformerDecoder(nn.Module):
 
         logits = self.output_proj(output)  # [batch, seq_len, vocab]
         stop_logits = self.stop_head(output).squeeze(-1)  # V12.30: [batch, seq_len]
+        type_logits = self.token_type_head(output)  # V14.3: [batch, seq_len, N_TOKEN_TYPES]
         generated = logits.argmax(dim=-1)  # [batch, seq_len]
 
-        return logits, generated, stop_logits
+        return logits, generated, stop_logits, type_logits
 
     def generate(
         self,
@@ -1702,6 +1769,8 @@ class EnhancedTransformerDecoder(nn.Module):
         temperature: float = 1.0,
         max_len: Optional[int] = None,
         stop_boost: float = 0.0,  # V12.30: Additive END logit boost from stop head
+        stoich_pred: Optional[torch.Tensor] = None,  # V14.3: For memory consistency
+        heads_pred: Optional[Dict[str, torch.Tensor]] = None,  # V14.3: Enriched memory
     ) -> List[str]:
         """Generate formulas autoregressively (legacy, no KV cache)."""
         self.eval()
@@ -1710,7 +1779,7 @@ class EnhancedTransformerDecoder(nn.Module):
         max_len = max_len or self.max_len
 
         with torch.no_grad():
-            memory = self._create_memory(z, encoder_skip)
+            memory = self._create_memory(z, encoder_skip, stoich_pred, heads_pred=heads_pred)
 
             generated_tokens = torch.full(
                 (batch_size, 1), START_IDX, dtype=torch.long, device=device
@@ -1934,6 +2003,8 @@ class EnhancedTransformerDecoder(nn.Module):
         cached_memory: Optional[torch.Tensor] = None,  # V12.8: Pre-computed memory
         stop_boost: float = 0.0,  # V12.30: Additive END logit boost from stop head
         hard_stop_threshold: float = 0.0,  # V12.37: Force END when sigmoid(stop_logit) > threshold
+        heads_pred: Optional[Dict[str, torch.Tensor]] = None,  # V14.3: encoder head predictions
+        type_masks: Optional[torch.Tensor] = None,  # V14.3: [N_TOKEN_TYPES, vocab_size] bool masks
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
         """
         Generate token sequences with KV caching for O(n) complexity.
@@ -1951,6 +2022,10 @@ class EnhancedTransformerDecoder(nn.Module):
             return_log_probs: If True, also return log probabilities of sampled tokens
             return_entropy: If True, also return proper entropy H(p) = -sum(p * log(p))
             cached_memory: V12.8 Pre-computed memory from precompute_memory()
+            heads_pred: V14.3 Dict of encoder head predictions for enriched memory
+            type_masks: V14.3 Precomputed [N_TOKEN_TYPES, vocab_size] boolean masks
+                       from tokenizer.get_type_masks(). When provided, applies hard type
+                       masking: predicted type → only allow tokens of that type.
 
         Returns:
             generated_tokens: Token indices [batch, seq_len] (excluding START)
@@ -1967,7 +2042,11 @@ class EnhancedTransformerDecoder(nn.Module):
             if cached_memory is not None:
                 memory = cached_memory
             else:
-                memory = self._create_memory(z, encoder_skip, stoich_pred)
+                memory = self._create_memory(z, encoder_skip, stoich_pred, heads_pred)
+
+            # V14.3: Move type masks to device if provided
+            if type_masks is not None:
+                type_masks = type_masks.to(device)
 
             # Initialize KV cache
             kv_cache = self._init_kv_cache(batch_size, device)
@@ -1991,6 +2070,15 @@ class EnhancedTransformerDecoder(nn.Module):
 
                 # Get logits for this position
                 logits = self.output_proj(output).squeeze(1)  # [batch, vocab_size]
+
+                # V14.3: Token type masking — predict type, then mask vocab to that type
+                if type_masks is not None:
+                    type_logit = self.token_type_head(output).squeeze(1)  # [batch, N_TOKEN_TYPES]
+                    predicted_type = type_logit.argmax(dim=-1)  # [batch]
+                    # For each sample in batch, get the valid token mask for its predicted type
+                    valid_mask = type_masks[predicted_type]  # [batch, vocab_size]
+                    # Set invalid tokens to -inf
+                    logits = logits.masked_fill(~valid_mask, float('-inf'))
 
                 # V12.30: Boost END logit based on stop head prediction
                 if stop_boost > 0:
@@ -2090,6 +2178,8 @@ class EnhancedTransformerDecoder(nn.Module):
         cached_memory: Optional[torch.Tensor] = None,  # V12.8: Pre-computed memory
         stop_boost: float = 0.0,  # V12.30: Additive END logit boost from stop head
         hard_stop_threshold: float = 0.0,  # V12.37: Force END when sigmoid(stop_logit) > threshold
+        heads_pred: Optional[Dict[str, torch.Tensor]] = None,  # V14.3
+        type_masks: Optional[torch.Tensor] = None,  # V14.3
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Sample sequences for REINFORCE training with KV caching.
@@ -2105,6 +2195,8 @@ class EnhancedTransformerDecoder(nn.Module):
             max_len: Maximum sequence length
             cached_memory: V12.8 Pre-computed memory from precompute_memory()
             stop_boost: V12.30 Additive END logit boost from stop head
+            heads_pred: V14.3 Dict of encoder head predictions for enriched memory
+            type_masks: V14.3 Precomputed type masks for hard type masking
 
         Returns:
             sampled_tokens: [batch, seq_len] - sampled token indices
@@ -2126,6 +2218,8 @@ class EnhancedTransformerDecoder(nn.Module):
             cached_memory=cached_memory,  # V12.8: Pass through cached memory
             stop_boost=stop_boost,  # V12.30: Pass through stop boost
             hard_stop_threshold=hard_stop_threshold,  # V12.37: Pass through hard stop threshold
+            heads_pred=heads_pred,  # V14.3: Pass through heads_pred
+            type_masks=type_masks,  # V14.3: Pass through type masks
         )
 
         # Create mask: 1 for valid tokens, 0 after END
@@ -2161,6 +2255,8 @@ class EnhancedTransformerDecoder(nn.Module):
         max_len: Optional[int] = None,
         k: int = 5,  # Number of tokens to draft at once
         cached_memory: Optional[torch.Tensor] = None,
+        heads_pred: Optional[Dict[str, torch.Tensor]] = None,  # V14.3
+        type_masks: Optional[torch.Tensor] = None,  # V14.3
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Dict]:
         """
         V12.16: REINFORCE sampling with TRUE per-sequence speculative decoding.
@@ -2208,7 +2304,11 @@ class EnhancedTransformerDecoder(nn.Module):
             if cached_memory is not None:
                 memory = cached_memory
             else:
-                memory = self._create_memory(z, encoder_skip, stoich_pred)
+                memory = self._create_memory(z, encoder_skip, stoich_pred, heads_pred=heads_pred)
+
+            # V14.3: Move type masks to device if provided
+            if type_masks is not None:
+                type_masks = type_masks.to(device)
 
             # Per-sequence state tracking
             # Each sequence has its own position and KV cache length

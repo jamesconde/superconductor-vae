@@ -443,7 +443,7 @@ def scan_for_digit_errors(
             attended_input = encoder_out['attended_input']
 
             # Decode (greedy generation, no teacher forcing)
-            formula_logits, _ = decoder(
+            formula_logits, _, *_extra = decoder(
                 z, tokens, encoder_skip=attended_input, teacher_forcing_ratio=0.0
             )
             predictions = formula_logits.argmax(dim=-1)
@@ -1858,7 +1858,7 @@ def train_epoch(encoder, formula_decoder, train_loader, loss_fn,
 
             # Formula decoding with skip connection and stoichiometry conditioning
             # V12.5: Use batch_tf_ratio for scheduled sampling
-            formula_logits, generated = formula_decoder(
+            formula_logits, generated, *_extra = formula_decoder(
                 z, tokens, encoder_skip=attended_input, teacher_forcing_ratio=batch_tf_ratio,
                 stoich_pred=stoich_pred  # V12.4: Pass stoichiometry to decoder
             )

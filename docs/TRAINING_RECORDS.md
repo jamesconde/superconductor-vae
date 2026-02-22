@@ -4,6 +4,64 @@ Chronological record of training runs, architecture changes, and optimization de
 
 ---
 
+## V14.3: Token Type Classifier Head + Enriched Decoder Memory (2026-02-21)
+
+### Problem
+
+50% of all autoregressive (AR) errors are **type confusion** — the model predicts an element where a fraction should go, a fraction where an integer should go, etc. The formula grammar is deterministic: `[Element, Stoich, Element, Stoich, ..., EOS]` where Stoich is an integer (1-20) or a FRAC:p/q token. TF exact match is 95.6% but TRUE AR exact match is only 7.5%.
+
+### Solution: Two-Part Architecture
+
+**Part 1: Token Type Head** (330K params) — Deep classifier on transformer decoder hidden state that predicts token type (5 classes: ELEMENT, INTEGER, FRACTION, SPECIAL, EOS).
+
+- Architecture: `LayerNorm(512) → Linear(512,512) → GELU → Dropout → Linear(512,128) → GELU → Dropout → Linear(128,5)`
+- 8 layers, mirrors output_proj structure — critical because hard masking means wrong type prediction blocks the correct token entirely
+- Training: CE loss on type labels (weight 0.1), derived from target tokens via tokenizer LUT
+- Inference: Hard mask over vocab logits — only allow tokens of the predicted type
+- Precedent: POS-Guided Softmax (Yang et al., COLING 2022)
+
+**Part 2: Enriched Decoder Memory** (1.2M params) — Feed encoder head predictions into decoder as 4 additional cross-attention memory tokens.
+
+- Input: tc_pred(1) + sc_pred(1) + hp_pred(1) + tc_class_logits(5) + competence(1) + element_count_pred(1) = 10 dims
+- Architecture: `Linear(10,256) → LayerNorm(256) → GELU → Linear(256,512) → GELU → Linear(512,2048)` → reshape to 4 x 512 tokens
+- 6 layers with 3 linear stages for gradual 200x expansion (10→256→512→2048)
+- Memory layout: `[16 latent | 4 stoich | 4 heads] = 24 tokens` (was 20)
+- All head values are `.detach()`ed — no gradient flows back through heads
+
+### Files Modified
+
+- `src/superconductor/tokenizer/fraction_tokenizer.py` — Added `TOKEN_TYPE_*` constants, `get_token_type()`, `get_type_masks()`, `compute_token_type_targets()`
+- `src/superconductor/models/autoregressive_decoder.py` — Added `token_type_head`, `heads_to_memory` to `EnhancedTransformerDecoder.__init__()`. Updated `_create_memory()`, `forward()` (now returns 4-tuple), `generate_with_kv_cache()`, `sample_for_reinforce()`, `speculative_sample_for_reinforce()`, legacy `generate()`.
+- `scripts/train_v12_clean.py` — Added `token_type_loss_weight`, `use_type_masking_ar`, `use_heads_memory` to TRAIN_CONFIG. Pass `heads_pred` to decoder, compute type loss, integrate into total loss. SCST + RLOO + Z-cache paths all pass `heads_pred` for memory consistency.
+- `scripts/migrate_vocab_expansion.py` — Note about new layers (handled by existing copy-as-is logic)
+- `scripts/migrate_checkpoint_v1242_wider.py` — Fixed 3-tuple to 4-tuple destructuring
+- `scripts/train.py` — Fixed 2-tuple → `*_extra` for 4-tuple decoder return (lines 446, 1861)
+- `src/superconductor/training/soft_token_sampling.py` — Fixed 2-tuple → slice/`*_extra` for decoder return
+- `scratch/debug_cuda_test.py` — Fixed 5 × 2-tuple → `*_extra` for decoder return
+- `scratch/test_real_data.py`, `test_amp_transition.py`, `test_epoch_boundary.py`, `test_full_volume.py` — Same fix
+- RLOO/SCST plumbing: `CombinedLossWithREINFORCE` stores `_heads_pred`/`_type_masks` per-batch, passed through to `compute_rloo_autoregressive`, `compute_scst`, and `sample_for_reinforce`. Z-cache (`cache_z_vectors`) also builds `heads_pred` from encoder outputs.
+
+### Config
+
+```python
+'token_type_loss_weight': 0.1,  # Auxiliary CE loss weight
+'use_type_masking_ar': False,   # Enable AFTER type head is >90% accurate
+'use_heads_memory': True,       # Feed encoder heads into decoder memory
+```
+
+### Checkpoint Compatibility
+
+New layers (`token_type_head`, `heads_to_memory`) are missing from pre-V14.3 checkpoints. `load_checkpoint()` uses `strict=False` — new layers initialize randomly, existing layers load from checkpoint. No migration needed.
+
+### Rollout Strategy
+
+1. **V14.3**: Train with type loss + heads memory (training signal only, no AR masking)
+2. **After 1 epoch**: Check type head accuracy (should be >90% on TF mode)
+3. **Enable masking**: Set `use_type_masking_ar=True` once type head is accurate
+4. **Monitor**: Type head accuracy should correlate with AR exact match improvement
+
+---
+
 ## V14.2: Migration LR Boost + dtype Fixes (2026-02-21)
 
 ### Migration LR Boost
