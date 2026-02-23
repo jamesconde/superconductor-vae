@@ -68,14 +68,14 @@ You can also use the web interface at https://datahub.ucsd.edu/
 
 ## Resuming Training
 
-If training is interrupted, it will save an `checkpoint_interrupt.pt`. To resume:
+Training auto-resumes from the best checkpoint by default (`resume_checkpoint='auto'`). This prefers `checkpoint_best.pt`, then falls back to the highest-numbered `checkpoint_epoch_*.pt`.
 
-1. Edit `scripts/train_v12_clean.py`
-2. Change `resume_checkpoint` to point to your checkpoint:
-   ```python
-   'resume_checkpoint': 'outputs/checkpoint_interrupt.pt',
-   ```
-3. Restart training
+If you need to resume from a specific checkpoint (e.g., an interrupt save):
+```python
+'resume_checkpoint': 'outputs/checkpoint_interrupt.pt',
+```
+
+Set to `None` to train from scratch.
 
 ## Monitoring
 

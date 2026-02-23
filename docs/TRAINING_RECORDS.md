@@ -57,6 +57,7 @@ New layers (`token_type_head`, `heads_to_memory`) are missing from pre-V14.3 che
 
 - **Mixed SC/non-SC batch crash**: `loss_fn._heads_pred` was set to full batch (e.g. 252 samples) but RLOO/SCST received `z=z[sc_mask]` (e.g. 176 SC samples). The stale full-batch `_heads_pred` reference caused `_create_memory` to attempt reshape `[176, 4, 1024]` from 252×4×1024 elements → `RuntimeError`. Fixed by slicing `heads_pred_dict` by `sc_mask` before the SC loss call in the mixed-batch path, and clearing it to `None` before the non-SC call.
 - **Batch validation assertions**: Added explicit batch-size checks in `_create_memory()` for all `heads_pred` tensors vs z batch size, with clear error messages identifying the mismatched tensor.
+- **Auto-detect checkpoint on resume**: `resume_checkpoint` was hardcoded to a specific epoch file (`checkpoint_epoch_3999.pt`). When training continued past that epoch and saved `checkpoint_best.pt`, the next restart still loaded the stale epoch 3999 — discarding ~200 epochs of progress. Now defaults to `'auto'`, which prefers `checkpoint_best.pt` then falls back to the highest-numbered `checkpoint_epoch_*.pt`. Explicit paths still supported for one-off overrides.
 
 ### Rollout Strategy
 
