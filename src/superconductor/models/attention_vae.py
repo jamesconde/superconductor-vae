@@ -1,45 +1,27 @@
 """
-Attention-augmented BidirectionalVAE for superconductor discovery.
+Full Materials VAE for superconductor discovery (V12+).
 
-Integrates element-level attention INTO the VAE encoding path so that:
-1. The model learns which elements are important for Tc prediction
-2. The latent space captures element-weighted relationships
-3. Attention weights are interpretable and grounded in Tc prediction
+Contains the active encoder/decoder architecture:
+- ElementEncoder: element-level attention weighted by stoichiometric fractions
+- AttentionVAEEncoder: MLP encoder from fused representation to latent z
+- HierarchicalFamilyHead: 3-level SC family classification (coarse → cuprate/iron sub)
+- FullMaterialsVAE: three-branch encoder (elements + Magpie + Tc) → z (2048)
+  with multi-head decoder (Tc, Magpie, SC class, family, fractions, etc.)
 
-Architecture:
-    Formula → Element embeddings → Attention → VAE encoder → Latent z → Tc predictor
-                                      ↓
-                              Attention weights (interpretable)
-
-This differs from adding attention as a separate module - here attention
-directly influences what the VAE's latent space learns about Tc.
+Architecture (V12+):
+    Element attention + Magpie features (145) + Tc → Fusion → z (2048)
+    z → Multi-head decoder (Tc, Magpie, formula memory, SC class, family, HP, fractions)
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Dict, List, Optional, Tuple
-from dataclasses import dataclass
 
 from ..encoders.element_attention import (
     ElementEmbedding,
     ElementAttention,
-    AttentionOutput,
 )
-from ..encoders.isotope_encoder import IsotopeEncoder
-
-
-@dataclass
-class AttentionVAEOutput:
-    """Output from AttentionVAE forward pass."""
-    tc_pred: torch.Tensor              # [batch] predicted Tc
-    z: torch.Tensor                    # [batch, latent_dim] latent representation
-    z_mean: torch.Tensor               # [batch, latent_dim] latent mean
-    z_logvar: torch.Tensor             # [batch, latent_dim] latent log variance
-    reconstruction: torch.Tensor       # [batch, input_dim] reconstructed input
-    competence: torch.Tensor           # [batch] model confidence
-    attention_weights: torch.Tensor    # [batch, n_elements] element importance
-    element_contributions: torch.Tensor  # [batch, n_elements] per-element Tc contribution
 
 
 class ElementEncoder(nn.Module):
