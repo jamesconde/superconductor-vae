@@ -674,21 +674,20 @@ class EnhancedTransformerDecoder(nn.Module):
 
         # V14.3: Enriched decoder memory from encoder head predictions
         # Projects concatenated head outputs to additional memory tokens for cross-attention.
+        # V15.0: Added family_composed_14 (14 family class probabilities) — tells decoder
+        # exactly what kind of material to generate (cuprate→Cu,Ba,Y; iron→Fe,As; etc.)
         # Input: tc_pred(1) + sc_pred(1) + hp_pred(1) + tc_class_logits(5) +
-        #        competence(1) + element_count_pred(1) = 10 dims
+        #        competence(1) + element_count_pred(1) + family_composed_14(14) = 24 dims
         # Output: 4 memory tokens of d_model each
-        #
-        # 10 → 2048 is a 200x expansion — needs intermediate stages to learn
-        # meaningful interactions between head predictions (e.g., "high Tc + SC + cuprate
-        # family → expect Cu, Ba, Y elements and specific stoichiometries").
+        self.heads_input_dim = 24  # 10 original + 14 family
         self.heads_n_tokens = 4
         self.heads_to_memory = nn.Sequential(
-            nn.Linear(10, d_model // 2),            # 10 → 256 (initial expansion)
+            nn.Linear(self.heads_input_dim, d_model // 2),  # 24 → 512 (initial expansion)
             nn.LayerNorm(d_model // 2),
             nn.GELU(),
-            nn.Linear(d_model // 2, d_model),       # 256 → 512
+            nn.Linear(d_model // 2, d_model),       # 512 → 1024
             nn.GELU(),
-            nn.Linear(d_model, d_model * self.heads_n_tokens),  # 512 → 2048
+            nn.Linear(d_model, d_model * self.heads_n_tokens),  # 1024 → 4096
         )
 
         self._init_weights()
@@ -744,6 +743,7 @@ class EnhancedTransformerDecoder(nn.Module):
 
         # V14.3: Add encoder heads memory (4 tokens)
         # Gives decoder context about what kind of material this is
+        # V15.0: Added family_composed_14 (14-class family probabilities)
         if heads_pred is not None and hasattr(self, 'heads_to_memory'):
             # Ensure all heads_pred values have matching batch dimension
             hp_tc = heads_pred['tc_pred']
@@ -752,25 +752,36 @@ class EnhancedTransformerDecoder(nn.Module):
             hp_tc_class = heads_pred['tc_class_logits']
             hp_comp = heads_pred['competence']
             hp_ecount = heads_pred['element_count_pred']
+            # V15.0: family logits (14 classes) — tells decoder the material family
+            hp_family = heads_pred.get('family_composed_14')
 
             # Validate batch dims match z before cat (catches stale tensors)
-            for name, tensor in [('tc_pred', hp_tc), ('sc_pred', hp_sc),
-                                 ('hp_pred', hp_hp), ('tc_class_logits', hp_tc_class),
-                                 ('competence', hp_comp), ('element_count_pred', hp_ecount)]:
+            validate_tensors = [('tc_pred', hp_tc), ('sc_pred', hp_sc),
+                                ('hp_pred', hp_hp), ('tc_class_logits', hp_tc_class),
+                                ('competence', hp_comp), ('element_count_pred', hp_ecount)]
+            if hp_family is not None:
+                validate_tensors.append(('family_composed_14', hp_family))
+            for name, tensor in validate_tensors:
                 if tensor.size(0) != batch_size:
                     raise RuntimeError(
                         f"heads_pred['{name}'] batch {tensor.size(0)} != z batch {batch_size}. "
                         f"Shapes: {name}={tensor.shape}, z=[{batch_size}, ...]"
                     )
 
-            heads_input = torch.cat([
+            parts = [
                 hp_tc.unsqueeze(-1),        # 1
                 hp_sc.unsqueeze(-1),        # 1
                 hp_hp.unsqueeze(-1),        # 1
                 hp_tc_class,                # 5
                 hp_comp.unsqueeze(-1),      # 1
                 hp_ecount.unsqueeze(-1),    # 1
-            ], dim=-1)  # [batch, 10]
+            ]
+            # V15.0: Append family logits if available, else zeros for backward compat
+            if hp_family is not None:
+                parts.append(hp_family)     # 14
+            else:
+                parts.append(torch.zeros(batch_size, 14, device=z.device))
+            heads_input = torch.cat(parts, dim=-1)  # [batch, 24]
             heads_memory = self.heads_to_memory(heads_input)
             expected_size = batch_size * self.heads_n_tokens * self.d_model
             if heads_memory.numel() != expected_size:

@@ -2385,7 +2385,7 @@ class CombinedLossWithREINFORCE(nn.Module):
         heads_pred_expanded = None
         if heads_pred is not None:
             heads_pred_expanded = {
-                k: v.repeat(n_samples, *([1] * (v.dim() - 1)))
+                k: v.repeat(n_samples, *([1] * (v.dim() - 1))) if v is not None else None
                 for k, v in heads_pred.items()
             }
 
@@ -3220,6 +3220,7 @@ def cache_z_vectors(encoder, loader, device, epoch, cache_path, dataset_info=Non
                     _stoich = None
 
                 # V14.3: Build heads_pred for enriched decoder memory
+                # V15.0: Added family_composed_14
                 _zc_heads_pred = None
                 if TRAIN_CONFIG.get('use_heads_memory', False) and hasattr(decoder, 'heads_to_memory'):
                     _tc_pred = encoder_out.get('tc_pred')
@@ -3227,6 +3228,7 @@ def cache_z_vectors(encoder, loader, device, epoch, cache_path, dataset_info=Non
                     _hp_pred = encoder_out.get('hp_pred', torch.zeros(z.size(0), device=z.device))
                     _tc_class = encoder_out.get('tc_class_logits', torch.zeros(z.size(0), 5, device=z.device))
                     _comp = encoder_out.get('competence', torch.ones(z.size(0), device=z.device))
+                    _family = encoder_out.get('family_composed_14')
                     if _tc_pred is not None and _ecount is not None:
                         _zc_heads_pred = {
                             'tc_pred': _tc_pred.detach(),
@@ -3235,6 +3237,7 @@ def cache_z_vectors(encoder, loader, device, epoch, cache_path, dataset_info=Non
                             'tc_class_logits': _tc_class.detach(),
                             'competence': _comp.detach(),
                             'element_count_pred': _ecount.detach(),
+                            'family_composed_14': _family.detach() if _family is not None else None,
                         }
 
                 # Generate predictions using decoder
@@ -4024,6 +4027,7 @@ def evaluate_true_autoregressive(encoder, decoder, loader, device, max_samples=1
                 all_family_coarse_pred.extend([-1] * batch_size)
 
         # V14.3: Build heads_pred for AR generation if enabled
+        # V15.0: Added family_composed_14
         _ar_heads_pred = None
         _ar_type_masks = None
         if TRAIN_CONFIG.get('use_heads_memory', False) or TRAIN_CONFIG.get('use_type_masking_ar', False):
@@ -4032,6 +4036,7 @@ def evaluate_true_autoregressive(encoder, decoder, loader, device, max_samples=1
             _tc_class = encoder_out.get('tc_class_logits')
             _competence = encoder_out.get('competence')
             _elem_count = encoder_out.get('element_count_pred')
+            _family = encoder_out.get('family_composed_14')
             if all(v is not None for v in [_sc_pred, _hp_pred, _tc_class, _competence, _elem_count]):
                 _ar_heads_pred = {
                     'tc_pred': encoder_out['tc_pred'],
@@ -4040,6 +4045,7 @@ def evaluate_true_autoregressive(encoder, decoder, loader, device, max_samples=1
                     'tc_class_logits': _tc_class,
                     'competence': _competence,
                     'element_count_pred': _elem_count,
+                    'family_composed_14': _family.detach() if _family is not None else None,
                 }
             # V14.3: Type masks for hard vocab masking during AR generation
             if TRAIN_CONFIG.get('use_type_masking_ar', False) and v13_tokenizer is not None:
@@ -4639,6 +4645,7 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
                 stoich_pred = None
 
             # V14.3: Build heads_pred dict for enriched decoder memory
+            # V15.0: Added family_composed_14 (14-class family logits)
             heads_pred_dict = None
             if TRAIN_CONFIG.get('use_heads_memory', False):
                 tc_pred_val = encoder_out['tc_pred']
@@ -4647,6 +4654,7 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
                 tc_class_val = encoder_out.get('tc_class_logits')
                 competence_val = encoder_out.get('competence')
                 elem_count_val = encoder_out.get('element_count_pred')
+                family_val = encoder_out.get('family_composed_14')
                 # Only build dict if all required heads are available
                 if all(v is not None for v in [sc_pred_val, hp_pred_val, tc_class_val,
                                                competence_val, elem_count_val]):
@@ -4657,6 +4665,7 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
                         'tc_class_logits': tc_class_val.detach(),
                         'competence': competence_val.detach(),
                         'element_count_pred': elem_count_val.detach(),
+                        'family_composed_14': family_val.detach() if family_val is not None else None,
                     }
 
             # V12.15: Time decoder forward
@@ -4895,7 +4904,8 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
                 # matching batch dims (z[sc_mask] has n_sc samples, not full batch)
                 if heads_pred_dict is not None:
                     loss_fn._heads_pred = {
-                        k: v[sc_mask] for k, v in heads_pred_dict.items()
+                        k: v[sc_mask] if v is not None else None
+                        for k, v in heads_pred_dict.items()
                     }
                 else:
                     loss_fn._heads_pred = None

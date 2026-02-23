@@ -39,6 +39,7 @@ self.latent_to_memory = nn.Sequential(
 - Memory layout: [16 latent + 4 stoich + 4 heads] = 24 tokens (unchanged from V14.3)
 - ~413 params/sample (was ~3,300 at d_model=1024) — significant capacity reduction without losing token count
 - LayerNorm after bottleneck matches `stoich_to_memory` pattern
+- Heads tokens now include `family_composed_14` (14-class family probabilities) — tells decoder which material family to generate (cuprate→Cu,Ba,Y; iron→Fe,As; etc.). Input dim: 10→24, still 4 tokens.
 
 ### SVD Migration Strategy
 
