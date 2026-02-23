@@ -70,7 +70,7 @@ def analyze_svd_spectrum(W1: torch.Tensor) -> torch.Tensor:
 
 def apply_migration(
     checkpoint: dict,
-    bottleneck_dim: int = 512,
+    bottleneck_dim: int = 1024,
     n_new_tokens: int = 16,
     d_model_override: int = None,
 ) -> dict:
@@ -269,8 +269,8 @@ def main():
                         help='Path to checkpoint file (e.g., checkpoint_best.pt)')
     parser.add_argument('--analyze-only', action='store_true',
                         help='Only run SVD spectrum analysis, do not modify checkpoint')
-    parser.add_argument('--bottleneck-dim', type=int, default=512,
-                        help='Bottleneck dimension (default: 512)')
+    parser.add_argument('--bottleneck-dim', type=int, default=1024,
+                        help='Bottleneck dimension (default: 1024)')
     parser.add_argument('--n-tokens', type=int, default=16,
                         help='Number of latent memory tokens (default: 16, same as original)')
     parser.add_argument('--d-model', type=int, default=None,

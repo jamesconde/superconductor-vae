@@ -357,7 +357,7 @@ MODEL_CONFIG = {
     'num_layers': 12,
     'dim_feedforward': 4096,   # V12.42: 4x d_model (was 2048)
     'n_memory_tokens': 16,     # V15.0: Kept at 16 — V12 checkpoint had good AR behavior with 16 tokens
-    'memory_bottleneck_dim': 512,  # V15.0: Bottleneck for latent_to_memory (was unbottlenecked 42M params)
+    'memory_bottleneck_dim': 1024, # V15.0: Bottleneck for latent_to_memory (~98.5% SVD variance, headroom for self-supervised expansion)
     'element_embed_dim': 128,
 }
 
@@ -2065,8 +2065,8 @@ def create_models(magpie_dim: int, device: torch.device):
         # V13.0: Configurable vocab and stoich dims for semantic fraction tokens
         vocab_size=decoder_vocab_size,
         stoich_input_dim=decoder_stoich_input_dim,
-        # V15.0: Bottleneck latent_to_memory (42M → 1.6M params)
-        memory_bottleneck_dim=MODEL_CONFIG.get('memory_bottleneck_dim', 512),
+        # V15.0: Bottleneck latent_to_memory (~151M → ~19M params)
+        memory_bottleneck_dim=MODEL_CONFIG.get('memory_bottleneck_dim', 1024),
     ).to(device)
 
     enc_params = sum(p.numel() for p in encoder.parameters())

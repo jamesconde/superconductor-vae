@@ -530,9 +530,9 @@ class EnhancedTransformerDecoder(nn.Module):
         # V13.0: 13 = fractions(12) + count(1) — numden removed (implicit in fraction tokens)
         stoich_input_dim: int = None,
         # V15.0: Bottleneck latent_to_memory to prevent decoder memorization
-        # Old: 2-layer MLP with 42M params. New: bottleneck with ~1.6M params.
+        # Old: 2-layer MLP with ~151M params (at d_model=1024). New: bottleneck with ~19M params.
         # If 0, uses old-style direct MLP (for backward compat with pre-V15 checkpoints).
-        memory_bottleneck_dim: int = 512,
+        memory_bottleneck_dim: int = 1024,
     ):
         super().__init__()
 
@@ -564,14 +564,14 @@ class EnhancedTransformerDecoder(nn.Module):
         # V15.0: Project latent z to memory tokens for cross-attention.
         # Bottleneck architecture forces information compression, preventing
         # the decoder from memorizing individual training samples through
-        # this subnetwork (42M→5.3M param reduction at bottleneck=512, 16 tokens).
+        # this subnetwork (~151M→~19M param reduction at bottleneck=1024, d_model=1024, 16 tokens).
         # Memory layout: [n_memory_tokens latent | 4 stoich | 4 heads] = 24 total
         if memory_bottleneck_dim > 0:
             self.latent_to_memory = nn.Sequential(
-                nn.Linear(latent_dim, memory_bottleneck_dim),           # 2048 → 512
+                nn.Linear(latent_dim, memory_bottleneck_dim),           # 2048 → 1024
                 nn.LayerNorm(memory_bottleneck_dim),                    # Stabilize bottleneck
                 nn.GELU(),
-                nn.Linear(memory_bottleneck_dim, d_model * n_memory_tokens),  # 512 → d_model*n_tokens
+                nn.Linear(memory_bottleneck_dim, d_model * n_memory_tokens),  # 1024 → d_model*n_tokens
             )
         else:
             # Pre-V15 fallback: direct MLP (for loading old checkpoints without migration)

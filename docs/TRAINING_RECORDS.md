@@ -23,21 +23,21 @@ self.latent_to_memory = nn.Sequential(
 )  # Output: [batch, 16, 1024]
 ```
 
-**New (~9.3M params, 16x reduction at d_model=1024):**
+**New (~19M params, 8x reduction at d_model=1024):**
 ```python
 self.latent_to_memory = nn.Sequential(
-    nn.Linear(2048, 512),                  # 1.05M params
-    nn.LayerNorm(512),                     # Stabilize bottleneck
+    nn.Linear(2048, 1024),                 # 2.1M params
+    nn.LayerNorm(1024),                    # Stabilize bottleneck
     nn.GELU(),
-    nn.Linear(512, d_model * 16),          # 8.4M params (512 * 1024 * 16)
+    nn.Linear(1024, d_model * 16),         # 16.8M params (1024 * 1024 * 16)
 )  # Output: [batch, 16, 1024]
 ```
 
 **Why this works:**
-- 512-dim bottleneck for 2048-dim input = 4x compression, forces learning which z dimensions matter
+- 1024-dim bottleneck for 2048-dim input = 2x compression (~98.5% SVD variance), forces learning which z dimensions matter while preserving headroom for self-supervised dataset expansion
 - 16 latent tokens kept (V12 checkpoint had good AR behavior with 16)
 - Memory layout: [16 latent + 4 stoich + 4 heads] = 24 tokens (unchanged from V14.3)
-- ~200 params/sample (was ~3,300 at d_model=1024) — significant capacity reduction without losing token count
+- ~413 params/sample (was ~3,300 at d_model=1024) — significant capacity reduction without losing token count
 - LayerNorm after bottleneck matches `stoich_to_memory` pattern
 
 ### SVD Migration Strategy
@@ -47,8 +47,8 @@ Weights migrated via SVD decomposition of old Layer 1:
 ```
 W1 [8192, 2048] = U @ diag(S) @ Vt    (at d_model=1024: hidden=8192)
 
-New Layer 0: W1_new = diag(S[:512]) @ Vt[:512, :]      — top-512 directions scaled by singular values
-New Layer 3: W2_new = W2 @ U[:, :512]                   — project old Layer 2 through top-512 left SVs
+New Layer 0: W1_new = diag(S[:1024]) @ Vt[:1024, :]     — top-1024 directions scaled by singular values
+New Layer 3: W2_new = W2 @ U[:, :1024]                  — project old Layer 2 through top-1024 left SVs
 ```
 
 Script: `scripts/migrate_latent_to_memory_reduction.py` (standalone, runs on Colab or locally).
@@ -61,7 +61,7 @@ The Colab checkpoint (epoch 4245) has **d_model=1024** — V12.42 Net2Net wideni
 ### Files Modified
 
 - `src/superconductor/models/autoregressive_decoder.py` — `EnhancedTransformerDecoder.__init__()`: added `memory_bottleneck_dim` param, replaced `latent_to_memory` with bottleneck version, updated `_create_memory()` docstring
-- `scripts/train_v12_clean.py` — `MODEL_CONFIG`: `d_model=1024`, `dim_feedforward=4096`, `n_memory_tokens=16`, `memory_bottleneck_dim=512`. Decoder construction passes `memory_bottleneck_dim`.
+- `scripts/train_v12_clean.py` — `MODEL_CONFIG`: `d_model=1024`, `dim_feedforward=4096`, `n_memory_tokens=16`, `memory_bottleneck_dim=1024`. Decoder construction passes `memory_bottleneck_dim`.
 - `scripts/migrate_latent_to_memory_reduction.py` — NEW: standalone SVD migration script (auto-detects d_model from checkpoint)
 - `notebooks/migrate_v15_latent_bottleneck.ipynb` — NEW: Colab migration notebook (auto-detects d_model from checkpoint)
 
@@ -72,14 +72,14 @@ MODEL_CONFIG = {
     'd_model': 1024,             # V12.42 Net2Net widening (confirmed on Colab epoch 4245)
     'dim_feedforward': 4096,     # 4x d_model
     'n_memory_tokens': 16,       # Kept at 16 (V12 had good AR behavior)
-    'memory_bottleneck_dim': 512, # NEW: bottleneck dimension
+    'memory_bottleneck_dim': 1024, # NEW: bottleneck (~98.5% SVD variance)
     ...
 }
 ```
 
 ### Expected Impact
 
-- Decoder latent_to_memory: ~151M → ~9.3M (~142M reduction from bottleneck)
+- Decoder latent_to_memory: ~151M → ~19M (~132M reduction from bottleneck)
 - Memory layout: 24 tokens unchanged [16 latent + 4 stoich + 4 heads]
 - Hypothesis: Train exact will drop initially but val exact should climb as the model can no longer memorize through the bottleneck
 
