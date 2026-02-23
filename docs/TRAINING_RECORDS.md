@@ -4,6 +4,47 @@ Chronological record of training runs, architecture changes, and optimization de
 
 ---
 
+## V15.1: Per-Bin Tc Head Early Stopping — Snapshot/Restore (2026-02-23)
+
+### Problem
+
+The Tc head's R² for high-Kelvin bins (120-200K and >200K) oscillates between 68-91% across epochs. Root cause: gradient interference from ~20K majority low-Tc samples overpowers ~1K minority high-Tc samples in the shared encoder backbone. The optimizer rationally trades minority performance for majority improvement, causing R² regressions in the high-Tc bins.
+
+### Solution: TcBinTracker
+
+Self-contained class that monitors per-bin R² and snapshots/restores Tc head weights:
+
+1. **Combined metric**: Sample-weighted average R² of target bins (120-200K, >200K)
+2. **Snapshot scope**: Only `tc_proj`, `tc_res_block`, `tc_out` (~297K params, ~1.2MB) — NOT the shared `decoder_backbone`
+3. **On new best**: Deep-copy Tc head weights to CPU
+4. **On regression**: If combined R² drops >0.10 below best, restore snapshot weights to GPU
+5. **No freezing**: After restore, training continues — model may find even better weights
+6. **Checkpoint persistence**: Snapshot state saved/restored in checkpoint for resume
+
+### Config Parameters
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `tc_bin_tracker_enabled` | `True` | Enable per-bin Tc head snapshot/restore |
+| `tc_bin_regression_threshold` | `0.10` | Restore if combined R² drops > this below best |
+| `tc_bin_target_bins` | `('120-200K', '>200K')` | Bins to monitor |
+| `tc_bin_min_samples` | `5` | Min samples per bin to include in combined R² |
+
+### Console Output
+
+Every 4 epochs (eval cadence), prints one of:
+- `[V15.1 Tc-BIN] NEW BEST combined R²=0.8521 | 120-200K: R²=0.8234 (n=87), >200K: R²=0.9105 (n=24) | snapshot saved`
+- `[V15.1 Tc-BIN] REGRESSION combined R²=0.7102 (best=0.8521, drop=0.1419 > threshold=0.10) | ... | RESTORED weights from epoch 4212`
+- `[V15.1 Tc-BIN] combined R²=0.8301 (best=0.8521) | ...` (within tolerance, no action)
+
+### Safety Interactions
+
+- **Catastrophic rollback**: When the main model rolls back to `checkpoint_best.pt`, the Tc bin tracker snapshot is invalidated (best R² reset to -inf) since the underlying model weights changed
+- **Signal handler**: Tc bin tracker state included in interrupt checkpoints
+- **Emergency save**: Tc bin tracker state included in emergency checkpoints
+
+---
+
 ## V15.0: Latent-to-Memory Bottleneck — SVD Weight Contraction (2026-02-23)
 
 ### Problem

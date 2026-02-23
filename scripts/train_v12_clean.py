@@ -401,7 +401,7 @@ def build_family_lookup_tensors(device):
     return fine_to_coarse, fine_to_cuprate_sub, fine_to_iron_sub
 
 
-ALGO_VERSION = 'V15.0'  # Bump this when making algorithm changes
+ALGO_VERSION = 'V15.1'  # Bump this when making algorithm changes
 
 TRAIN_CONFIG = {
     'num_epochs': 5000,
@@ -762,6 +762,19 @@ TRAIN_CONFIG = {
     'use_type_masking_ar': True,    # V14.3: Enable hard type masking during AR generation
                                     # Enabled: type head trained for 1000+ epochs, eliminates 57% of type confusion errors
     'use_heads_memory': True,       # V14.3: Feed encoder head predictions into decoder memory
+
+    # =========================================================================
+    # V15.1: Per-Bin Tc Head Early Stopping (Snapshot/Restore)
+    # =========================================================================
+    # Monitors R² for high-Tc bins (120-200K, >200K) which oscillate due to
+    # gradient interference from majority low-Tc samples. Snapshots Tc head
+    # weights when combined R² peaks; restores if R² regresses past threshold.
+    # Only affects tc_proj, tc_res_block, tc_out (~297K params) — NOT backbone.
+    # =========================================================================
+    'tc_bin_tracker_enabled': True,          # Enable per-bin Tc head snapshot/restore
+    'tc_bin_regression_threshold': 0.10,     # Restore if combined R² drops > this below best
+    'tc_bin_target_bins': ('120-200K', '>200K'),  # Bins to monitor (these oscillate)
+    'tc_bin_min_samples': 5,                 # Min samples per bin to include in combined R²
 
     # =========================================================================
     # V12.31: Physics-Supervised Z Coordinates
@@ -1167,6 +1180,7 @@ _shutdown_state = {
     'prev_exact': 0, 'best_exact': 0,
     'theory_loss_fn': None,  # V12.22
     'manifest_builder': None,  # V12.29
+    'tc_bin_tracker': None,  # V15.1
 }
 
 def signal_handler(signum, frame):
@@ -1193,6 +1207,7 @@ def signal_handler(signum, frame):
             theory_loss_fn=_shutdown_state.get('theory_loss_fn'),  # V12.22
             physics_z_loss_fn=_shutdown_state.get('physics_z_loss_fn'),  # V12.31
             manifest=_interrupt_manifest,  # V12.29
+            tc_bin_tracker=_shutdown_state.get('tc_bin_tracker'),  # V15.1
         )
     sys.exit(0)
 
@@ -3055,13 +3070,155 @@ CombinedLoss = CombinedLossWithREINFORCE
 
 
 # ============================================================================
+# V15.1: PER-BIN Tc HEAD EARLY STOPPING (SNAPSHOT/RESTORE)
+# ============================================================================
+# Monitors R² for high-Tc bins that oscillate due to gradient interference
+# from majority low-Tc samples. Snapshots Tc head weights on new best
+# combined R², restores if R² regresses past tolerance.
+# ============================================================================
+
+class TcBinTracker:
+    """Snapshot/restore Tc head weights based on per-bin R² monitoring.
+
+    Only tracks tc_proj, tc_res_block, tc_out (~297K params, ~1.2MB).
+    Does NOT touch the shared decoder_backbone.
+    """
+
+    # Tc head module names within the encoder
+    TC_HEAD_MODULES = ('tc_proj', 'tc_res_block', 'tc_out')
+
+    def __init__(self, target_bins=('120-200K', '>200K'),
+                 regression_threshold=0.10, min_samples=5):
+        self.target_bins = target_bins
+        self.regression_threshold = regression_threshold
+        self.min_samples = min_samples
+
+        # State
+        self.best_combined_r2 = -float('inf')
+        self.best_epoch = -1
+        self.snapshot = None  # Dict of {module_name: state_dict} on CPU
+        self.restore_count = 0
+
+    def _get_encoder_module(self, encoder):
+        """Unwrap torch.compile wrapper if present."""
+        if hasattr(encoder, '_orig_mod'):
+            return encoder._orig_mod
+        return encoder
+
+    def _compute_combined_r2(self, z_diagnostics):
+        """Compute sample-weighted average R² of target bins.
+
+        Returns (combined_r2, per_bin_info) or (None, info) if insufficient data.
+        """
+        tc_ranges = z_diagnostics.get('errors_by_tc_range', {})
+        total_samples = 0
+        weighted_r2_sum = 0.0
+        per_bin = {}
+
+        for bin_name in self.target_bins:
+            bin_data = tc_ranges.get(bin_name, {})
+            n = bin_data.get('n_samples', 0)
+            r2 = bin_data.get('tc_r2', None)
+
+            if n < self.min_samples or r2 is None:
+                per_bin[bin_name] = {'n_samples': n, 'r2': None, 'status': 'insufficient'}
+                continue
+
+            per_bin[bin_name] = {'n_samples': n, 'r2': r2, 'status': 'ok'}
+            total_samples += n
+            weighted_r2_sum += r2 * n
+
+        if total_samples == 0:
+            return None, per_bin
+
+        combined = weighted_r2_sum / total_samples
+        return combined, per_bin
+
+    def _snapshot_weights(self, encoder):
+        """Deep-copy Tc head state_dicts to CPU."""
+        raw = self._get_encoder_module(encoder)
+        snapshot = {}
+        for name in self.TC_HEAD_MODULES:
+            module = getattr(raw, name, None)
+            if module is not None:
+                # Deep copy to CPU to avoid GPU memory pressure
+                snapshot[name] = {
+                    k: v.detach().cpu().clone()
+                    for k, v in module.state_dict().items()
+                }
+        return snapshot
+
+    def _restore_weights(self, encoder):
+        """Load snapshot back onto the encoder (GPU)."""
+        if self.snapshot is None:
+            return
+        raw = self._get_encoder_module(encoder)
+        device = next(raw.parameters()).device
+        for name, state in self.snapshot.items():
+            module = getattr(raw, name, None)
+            if module is not None:
+                gpu_state = {k: v.to(device) for k, v in state.items()}
+                module.load_state_dict(gpu_state)
+
+    def update(self, encoder, z_diagnostics, epoch):
+        """Main entry point: call after eval. Returns action string for logging.
+
+        Actions: 'new_best', 'restore', 'within_tolerance', 'no_data'
+        """
+        combined_r2, per_bin = self._compute_combined_r2(z_diagnostics)
+
+        if combined_r2 is None:
+            return 'no_data', per_bin, None
+
+        # New best?
+        if combined_r2 > self.best_combined_r2:
+            old_best = self.best_combined_r2
+            self.best_combined_r2 = combined_r2
+            self.best_epoch = epoch
+            self.snapshot = self._snapshot_weights(encoder)
+            return 'new_best', per_bin, combined_r2
+
+        # Regression past threshold?
+        drop = self.best_combined_r2 - combined_r2
+        if drop > self.regression_threshold and self.snapshot is not None:
+            self._restore_weights(encoder)
+            self.restore_count += 1
+            return 'restore', per_bin, combined_r2
+
+        return 'within_tolerance', per_bin, combined_r2
+
+    def get_state(self):
+        """Serialize for checkpoint persistence."""
+        return {
+            'best_combined_r2': self.best_combined_r2,
+            'best_epoch': self.best_epoch,
+            'snapshot': self.snapshot,  # Already on CPU
+            'restore_count': self.restore_count,
+            'target_bins': self.target_bins,
+            'regression_threshold': self.regression_threshold,
+            'min_samples': self.min_samples,
+        }
+
+    def load_state(self, state):
+        """Restore from checkpoint."""
+        if state is None:
+            return
+        self.best_combined_r2 = state.get('best_combined_r2', -float('inf'))
+        self.best_epoch = state.get('best_epoch', -1)
+        self.snapshot = state.get('snapshot', None)
+        self.restore_count = state.get('restore_count', 0)
+        # Config overrides: use current config, not checkpoint config
+        # (allows tuning threshold between runs)
+
+
+# ============================================================================
 # CHECKPOINTING
 # ============================================================================
 
 def save_checkpoint(encoder, decoder, epoch, suffix='', entropy_manager=None,
                     enc_opt=None, dec_opt=None, enc_scheduler=None, dec_scheduler=None,
                     prev_exact=None, best_exact=None, theory_loss_fn=None,
-                    manifest=None, physics_z_loss_fn=None):
+                    manifest=None, physics_z_loss_fn=None, tc_bin_tracker=None):
     """Save model checkpoint with full training state for proper resumption."""
     OUTPUT_DIR.mkdir(exist_ok=True)
 
@@ -3108,6 +3265,10 @@ def save_checkpoint(encoder, decoder, epoch, suffix='', entropy_manager=None,
     # V12.29: Embed training manifest for version/config tracking
     if manifest is not None:
         checkpoint_data['manifest'] = manifest
+
+    # V15.1: Save Tc bin tracker state for resume
+    if tc_bin_tracker is not None:
+        checkpoint_data['tc_bin_tracker_state'] = tc_bin_tracker.get_state()
 
     # V13.0: Store decoder architecture params for auto-detection by holdout/analysis scripts
     checkpoint_data['d_model'] = MODEL_CONFIG.get('d_model', 512)
@@ -3854,6 +4015,7 @@ def load_checkpoint(encoder, decoder, checkpoint_path, entropy_manager=None,
         'fresh_optimizers': fresh_optimizers,        # V12.31: Grace period needed
         'physics_z_is_new': physics_z_is_new,        # V12.31: Warmup from introduction
         'vocab_expanded': _vocab_expanded,            # V14.2: Migration LR boost needed
+        'tc_bin_tracker_state': checkpoint.get('tc_bin_tracker_state', None),  # V15.1
     }
 
     if 'prev_exact' in checkpoint:
@@ -5695,6 +5857,7 @@ def train():
     prev_entropy = 0.5  # Track previous epoch's entropy for entropy manager (V12.9)
     migration_lr_boost_end = 0  # V14.2: No boost unless vocab expansion detected
     migration_lr_boost_factor = 1.0
+    _tc_bin_tracker_state = None  # V15.1: Deferred resume state for Tc bin tracker
 
     _resume_val = TRAIN_CONFIG.get('resume_checkpoint')
     if _resume_val:
@@ -5811,6 +5974,8 @@ def train():
             start_epoch = resume_state['start_epoch']
             prev_exact = resume_state['prev_exact']
             best_exact = resume_state['best_exact']
+            # V15.1: Deferred — store state, apply after tracker is created (~line after family_lookup_tables)
+            _tc_bin_tracker_state = resume_state.get('tc_bin_tracker_state')
             print(f"  Starting from epoch {start_epoch}")
 
             # V12.31: Grace period when optimizers were freshly initialized
@@ -5917,6 +6082,25 @@ def train():
     family_lookup_tables = None
     if TRAIN_CONFIG.get('use_family_classifier', False):
         family_lookup_tables = build_family_lookup_tensors(device)
+
+    # V15.1: Per-bin Tc head early stopping tracker
+    tc_bin_tracker = None
+    if TRAIN_CONFIG.get('tc_bin_tracker_enabled', False):
+        tc_bin_tracker = TcBinTracker(
+            target_bins=TRAIN_CONFIG.get('tc_bin_target_bins', ('120-200K', '>200K')),
+            regression_threshold=TRAIN_CONFIG.get('tc_bin_regression_threshold', 0.10),
+            min_samples=TRAIN_CONFIG.get('tc_bin_min_samples', 5),
+        )
+        # Restore from checkpoint if resuming
+        if _tc_bin_tracker_state is not None:
+            tc_bin_tracker.load_state(_tc_bin_tracker_state)
+            print(f"  [V15.1 Tc-BIN] Tracker restored: best R²={tc_bin_tracker.best_combined_r2:.4f} "
+                  f"(epoch {tc_bin_tracker.best_epoch}), restores={tc_bin_tracker.restore_count}",
+                  flush=True)
+        else:
+            print(f"  [V15.1 Tc-BIN] Tracker initialized (bins={tc_bin_tracker.target_bins}, "
+                  f"threshold={tc_bin_tracker.regression_threshold})", flush=True)
+    _shutdown_state['tc_bin_tracker'] = tc_bin_tracker
 
     # V12.11: Rollback loop detection
     rollback_count = 0
@@ -6480,7 +6664,8 @@ def train():
                                prev_exact=prev_exact, best_exact=best_exact,
                                theory_loss_fn=theory_loss_fn,
                                physics_z_loss_fn=physics_z_loss_fn,
-                               manifest=_build_current_manifest())
+                               manifest=_build_current_manifest(),
+                               tc_bin_tracker=tc_bin_tracker)  # V15.1
                 raise RuntimeError(f"Training stopped: {max_rollbacks} consecutive rollbacks detected. "
                                    f"Check data, model architecture, or hyperparameters.")
 
@@ -6504,6 +6689,11 @@ def train():
                 _shutdown_state['prev_exact'] = prev_exact
                 _shutdown_state['best_exact'] = best_exact
                 rolled_back = True
+                # V15.1: Invalidate Tc bin tracker snapshot — model weights changed
+                if tc_bin_tracker is not None:
+                    tc_bin_tracker.best_combined_r2 = -float('inf')
+                    tc_bin_tracker.snapshot = None
+                    print(f"  [V15.1 Tc-BIN] Snapshot invalidated due to model rollback", flush=True)
                 print(f"  [SAFETY] Rolled back to epoch {rollback_state['start_epoch']-1} "
                       f"(exact={prev_exact*100:.1f}%)", flush=True)
             else:
@@ -6713,6 +6903,36 @@ def train():
                   f"({true_eval['exact_count']}/{true_eval['total_samples']}) | "
                   f"Errors: 0={err_dist[0]}, 1={err_dist[1]}, 2={err_dist[2]}, 3={err_dist[3]}, >3={err_dist['more']}", flush=True)
 
+        # V15.1: Per-bin Tc head snapshot/restore — MUST come BEFORE checkpoint saving
+        # so restored weights get captured in the checkpoint
+        if tc_bin_tracker is not None and true_eval is not None:
+            zd = true_eval.get('z_diagnostics', {})
+            action, per_bin, combined_r2 = tc_bin_tracker.update(encoder, zd, epoch)
+            # Format per-bin info
+            bin_parts = []
+            for bname in tc_bin_tracker.target_bins:
+                bi = per_bin.get(bname, {})
+                if bi.get('r2') is not None:
+                    bin_parts.append(f"{bname}: R²={bi['r2']:.4f} (n={bi['n_samples']})")
+                else:
+                    bin_parts.append(f"{bname}: insufficient (n={bi.get('n_samples', 0)})")
+            bin_str = ', '.join(bin_parts)
+
+            if action == 'new_best':
+                print(f"  [V15.1 Tc-BIN] NEW BEST combined R²={combined_r2:.4f} | {bin_str} | "
+                      f"snapshot saved (epoch {epoch})", flush=True)
+            elif action == 'restore':
+                print(f"  [V15.1 Tc-BIN] REGRESSION combined R²={combined_r2:.4f} "
+                      f"(best={tc_bin_tracker.best_combined_r2:.4f}, "
+                      f"drop={tc_bin_tracker.best_combined_r2 - combined_r2:.4f} > "
+                      f"threshold={tc_bin_tracker.regression_threshold}) | {bin_str} | "
+                      f"RESTORED weights from epoch {tc_bin_tracker.best_epoch} "
+                      f"(restore #{tc_bin_tracker.restore_count})", flush=True)
+            elif action == 'within_tolerance':
+                print(f"  [V15.1 Tc-BIN] combined R²={combined_r2:.4f} "
+                      f"(best={tc_bin_tracker.best_combined_r2:.4f}) | {bin_str}", flush=True)
+            # 'no_data' — silently skip (insufficient samples in target bins)
+
         # V12.21: Add entropy_weight and tf_ratio to metrics for CSV logging
         if entropy_manager is not None:
             metrics['entropy_weight'] = loss_fn.entropy_weight
@@ -6732,6 +6952,7 @@ def train():
             theory_loss_fn=theory_loss_fn,  # V12.22
             physics_z_loss_fn=physics_z_loss_fn,  # V12.31
             manifest=_manifest,  # V12.29
+            tc_bin_tracker=tc_bin_tracker,  # V15.1
         )
 
         if metrics['exact_match'] > best_exact:

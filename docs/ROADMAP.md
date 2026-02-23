@@ -53,15 +53,19 @@ def check_family_consistency(generated_tokens, predicted_family) -> bool:
 
 ---
 
-## Active: V15.0 Bottleneck Recovery Monitoring (2/23/2026)
+## Active: V15.0/V15.1 Bottleneck Recovery Monitoring (2/23/2026)
 
 **What to watch**:
 - Type accuracy should climb above 90% first (decoder relearning cross-attention)
 - Exact match should follow within 50-200 epochs
 - Encoder metrics (Tc, Magpie, stoich, family) should remain stable (they were untouched)
 - If exact match stalls below 50% after 200 epochs, consider restoring from `checkpoint_best_pre_v15_contraction.pt` backup
+- **V15.1**: `[V15.1 Tc-BIN]` console output every 4 epochs shows high-Tc bin R² tracking. Verify snapshot/restore actions fire based on R² changes in 120-200K and >200K bins
 
 **Changes applied in V15.0**:
 - latent_to_memory bottleneck: 151M → 19M params (1024-dim, ~98.5% SVD variance)
 - family_composed_14 added to decoder heads tokens (10 → 24 input dims)
 - Fresh decoder optimizer (Adam state reset due to param shape changes)
+
+**Changes applied in V15.1**:
+- Per-bin Tc head early stopping (TcBinTracker): snapshot/restore tc_proj, tc_res_block, tc_out weights when high-Tc bin R² regresses >0.10 below best
