@@ -316,10 +316,11 @@ def indices_to_formula(indices: torch.Tensor) -> str:
 
 class AutoregressiveFormulaDecoder(nn.Module):
     """
-    GRU-based autoregressive decoder for generating chemical formulas.
+    LEGACY (V1-V6) — GRU-based autoregressive decoder.
 
-    Takes a latent vector z and generates a formula token by token.
-    Uses teacher forcing during training and greedy/sampling during inference.
+    Superseded by EnhancedTransformerDecoder (V7+) which uses transformer
+    architecture with cross-attention memory, skip connections, stoich
+    conditioning, and KV-cache generation. Kept for reference only.
     """
 
     def __init__(
@@ -569,10 +570,10 @@ class AutoregressiveFormulaDecoder(nn.Module):
 
 class FormulaVAEWithDecoder(nn.Module):
     """
-    VAE with autoregressive formula decoder.
+    LEGACY (V1-V6) — Wrapper combining AttentionBidirectionalVAE + GRU decoder.
 
-    Combines the attention-based encoder with the autoregressive decoder
-    for end-to-end training and generation.
+    Superseded by separate FullMaterialsVAE + EnhancedTransformerDecoder in V12+.
+    Kept for reference only.
     """
 
     def __init__(
@@ -661,7 +662,8 @@ def create_formula_tokenizer():
 
 
 # =============================================================================
-# Transformer-based Decoder (Higher capacity for 100% reconstruction)
+# LEGACY: Early Transformer Decoder (V7-V10) — see EnhancedTransformerDecoder
+# for the active decoder used in V11+
 # =============================================================================
 
 class PositionalEncoding(nn.Module):
@@ -690,29 +692,11 @@ class PositionalEncoding(nn.Module):
 
 class TransformerFormulaDecoder(nn.Module):
     """
-    Transformer-based autoregressive decoder for chemical formulas.
+    LEGACY (V7-V10) — Early transformer decoder, precursor to EnhancedTransformerDecoder.
 
-    Uses self-attention over generated tokens and cross-attention to the
-    latent vector z for conditioning. Much higher capacity than GRU for
-    achieving near-perfect reconstruction.
-
-    Architecture:
-        - Token embedding + positional encoding
-        - Latent projection to memory sequence
-        - N transformer decoder layers with:
-            - Masked self-attention (causal)
-            - Cross-attention to latent memory
-            - Feed-forward network
-        - Output projection to vocabulary
-
-    Args:
-        latent_dim: Dimension of input latent vectors
-        d_model: Transformer hidden dimension (default: 512)
-        nhead: Number of attention heads (default: 8)
-        num_layers: Number of transformer layers (default: 6)
-        dim_feedforward: FFN hidden dimension (default: 2048)
-        dropout: Dropout rate (default: 0.1)
-        max_len: Maximum sequence length (default: 50)
+    Lacked skip connections, stoich conditioning, stop head, KV-cache generation,
+    REINFORCE sampling, and token type masking that the active
+    EnhancedTransformerDecoder provides. Kept for reference only.
     """
 
     def __init__(
@@ -1099,9 +1083,10 @@ class TransformerFormulaDecoder(nn.Module):
 
 class FormulaVAEWithTransformer(nn.Module):
     """
-    VAE with Transformer formula decoder.
+    LEGACY (V7-V10) — Wrapper combining encoder + TransformerFormulaDecoder.
 
-    Higher capacity version for near-perfect reconstruction.
+    Superseded by separate FullMaterialsVAE + EnhancedTransformerDecoder in V12+.
+    Kept for reference only.
     """
 
     def __init__(

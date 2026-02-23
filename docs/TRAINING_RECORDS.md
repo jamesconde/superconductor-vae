@@ -66,6 +66,26 @@ New layers (`token_type_head`, `heads_to_memory`) are missing from pre-V14.3 che
 3. **Enable masking**: Set `use_type_masking_ar=True` once type head is accurate
 4. **Monitor**: Type head accuracy should correlate with AR exact match improvement
 
+### Legacy Code Audit (2026-02-22)
+
+Marked all unused/legacy classes with `LEGACY` docstrings. No code deleted — kept for reference.
+
+**attention_vae.py:**
+- `AttentionBidirectionalVAE` — V1-V10 element-only encoder, superseded by FullMaterialsVAE in V12
+- `AttentionVAELoss` — Loss for above, superseded by CombinedLossWithREINFORCE
+- `create_attention_vae()` — Factory for above
+- `FullMaterialsLoss` — Simple V12.0 loss, superseded by CombinedLossWithREINFORCE in train_v12_clean.py (still imported by old scripts/train.py)
+- `StructuredLatentEncoder` — V13 proposal (z=384, semantic partitions). **Never trained.** Abandoned because the bottleneck was tokenization granularity, not latent space organization. V13.0 shipped with semantic fraction tokens instead. **REMOVED** (preserved in git history).
+- `FullMaterialsV13` — Full model wrapper for above. **Never trained.** **REMOVED** (preserved in git history).
+
+**autoregressive_decoder.py:**
+- `AutoregressiveFormulaDecoder` — V1-V6 GRU decoder, superseded by EnhancedTransformerDecoder
+- `FormulaVAEWithDecoder` — Wrapper for GRU decoder
+- `TransformerFormulaDecoder` — V7-V10 basic transformer, lacked skip connections, stoich conditioning, KV-cache, REINFORCE
+- `FormulaVAEWithTransformer` — Wrapper for basic transformer
+
+**Active components** (NOT legacy): `ElementEncoder`, `FullMaterialsVAE`, `EnhancedTransformerDecoder`, `PositionalEncoding`, all helper functions/constants.
+
 ---
 
 ## V14.2: Migration LR Boost + dtype Fixes (2026-02-21)
