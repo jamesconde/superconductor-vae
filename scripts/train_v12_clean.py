@@ -680,11 +680,15 @@ TRAIN_CONFIG = {
     'entropy_plateau_threshold': 0.01,   # Improvement threshold (1% relative by default)
     'entropy_plateau_relative': True,    # If True, threshold scales with performance
 
-    # Resume from checkpoint (set to None to train from scratch)
-    # V14.2: Auto-migration — point directly at ANY checkpoint (even pre-V14).
+    # Resume from checkpoint:
+    #   'auto'  — (DEFAULT) auto-detect best checkpoint in outputs/ directory.
+    #             Prefers checkpoint_best.pt, then highest checkpoint_epoch_*.pt.
+    #   'outputs/checkpoint_epoch_XXXX.pt' — load a specific checkpoint file.
+    #   None    — train from scratch.
+    # V14.2: Auto-migration — works with ANY checkpoint (even pre-V14).
     # The training script detects if the checkpoint vocab is smaller than the model
     # vocab and automatically runs the V13→V14→V15 migration chain before loading.
-    'resume_checkpoint': 'outputs/checkpoint_epoch_3999.pt',
+    'resume_checkpoint': 'auto',
 
     # V12.12: Retrain on new/combined data - resets catastrophic drop detector
     # Set to True when training data has changed (new normalization stats)
@@ -944,6 +948,45 @@ CONTRASTIVE_DATA_PATH = PROJECT_ROOT / 'data/processed/supercon_fractions_contra
 DATA_PATH = PROJECT_ROOT / 'data/processed/supercon_fractions_combined.csv'
 HOLDOUT_PATH = PROJECT_ROOT / 'data/GENERATIVE_HOLDOUT_DO_NOT_TRAIN.json'
 OUTPUT_DIR = PROJECT_ROOT / 'outputs'
+
+
+def _find_best_checkpoint(output_dir: Path) -> Path | None:
+    """V14.3: Auto-detect the best checkpoint in the output directory.
+
+    Priority:
+      1. checkpoint_best.pt (saved whenever TF exact match improves)
+      2. Highest-numbered checkpoint_epoch_XXXX.pt (most recent periodic save)
+
+    Returns None if no checkpoint is found.
+    """
+    best = output_dir / 'checkpoint_best.pt'
+    if best.exists():
+        # Peek at epoch to report which epoch this is from
+        try:
+            meta = torch.load(best, map_location='cpu', weights_only=False)
+            epoch = meta.get('epoch', '?')
+            best_exact = meta.get('best_exact', None)
+            del meta
+            info = f"epoch {epoch}"
+            if best_exact is not None:
+                info += f", best_exact={best_exact:.4f}"
+            print(f"  [AUTO] Found checkpoint_best.pt ({info})")
+        except Exception:
+            print(f"  [AUTO] Found checkpoint_best.pt (could not peek at metadata)")
+        return best
+
+    # Fall back to highest-numbered epoch checkpoint
+    epoch_files = sorted(
+        output_dir.glob('checkpoint_epoch_*.pt'),
+        key=lambda p: int(p.stem.split('_')[-1]) if p.stem.split('_')[-1].isdigit() else 0,
+    )
+    if epoch_files:
+        latest = epoch_files[-1]
+        print(f"  [AUTO] No checkpoint_best.pt found, using latest: {latest.name}")
+        return latest
+
+    return None
+
 
 # ============================================================================
 # FOCAL LOSS WITH LABEL SMOOTHING
@@ -5626,9 +5669,20 @@ def train():
     migration_lr_boost_end = 0  # V14.2: No boost unless vocab expansion detected
     migration_lr_boost_factor = 1.0
 
-    if TRAIN_CONFIG.get('resume_checkpoint'):
-        checkpoint_path = PROJECT_ROOT / TRAIN_CONFIG['resume_checkpoint']
-        if checkpoint_path.exists():
+    _resume_val = TRAIN_CONFIG.get('resume_checkpoint')
+    if _resume_val:
+        # V14.3: Auto-detect best checkpoint
+        if _resume_val == 'auto':
+            print(f"\n  [AUTO] Scanning {OUTPUT_DIR} for best checkpoint...")
+            checkpoint_path = _find_best_checkpoint(OUTPUT_DIR)
+            if checkpoint_path is None:
+                print(f"  [AUTO] No checkpoints found in {OUTPUT_DIR} — training from scratch")
+        else:
+            checkpoint_path = PROJECT_ROOT / _resume_val
+            if not checkpoint_path.exists():
+                checkpoint_path = None  # Will fall through to warning below
+
+        if checkpoint_path is not None and checkpoint_path.exists():
             print(f"\nResuming from checkpoint: {checkpoint_path}")
 
             # V14.2: Auto-migration — detect if checkpoint needs vocab migration
@@ -5776,12 +5830,13 @@ def train():
             # Sync shutdown state so interrupt checkpoint preserves the correct values
             _shutdown_state['best_exact'] = best_exact
             _shutdown_state['prev_exact'] = prev_exact
-        else:
+        elif _resume_val != 'auto':
+            # Explicit path was given but doesn't exist
             print(f"\n{'='*70}")
-            print(f"WARNING: Checkpoint not found: {checkpoint_path}")
+            print(f"WARNING: Checkpoint not found: {PROJECT_ROOT / _resume_val}")
             print(f"  If resuming on Colab, copy your checkpoint from Google Drive:")
-            print(f"    !cp '/content/drive/My Drive/outputs/{checkpoint_path.name}' '{checkpoint_path}'")
-            print(f"  Or change TRAIN_CONFIG['resume_checkpoint'] to match your file.")
+            print(f"    !cp '/content/drive/My Drive/outputs/{Path(_resume_val).name}' '{PROJECT_ROOT / _resume_val}'")
+            print(f"  Or set resume_checkpoint='auto' to auto-detect.")
             print(f"  Starting from scratch...")
             print(f"{'='*70}")
 
