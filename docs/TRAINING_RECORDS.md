@@ -16,7 +16,7 @@ Chronological record of training runs, architecture changes, and optimization de
 
 - Architecture: `LayerNorm(512) → Linear(512,512) → GELU → Dropout → Linear(512,128) → GELU → Dropout → Linear(128,5)`
 - 8 layers, mirrors output_proj structure — critical because hard masking means wrong type prediction blocks the correct token entirely
-- Training: CE loss on type labels (weight 0.1), derived from target tokens via tokenizer LUT
+- Training: CE loss on type labels (weight 1.0, raised from 0.1 in V14.3b), derived from target tokens via tokenizer LUT
 - Inference: Hard mask over vocab logits — only allow tokens of the predicted type
 - Precedent: POS-Guided Softmax (Yang et al., COLING 2022)
 
@@ -44,8 +44,8 @@ Chronological record of training runs, architecture changes, and optimization de
 ### Config
 
 ```python
-'token_type_loss_weight': 0.1,  # Auxiliary CE loss weight
-'use_type_masking_ar': False,   # Enable AFTER type head is >90% accurate
+'token_type_loss_weight': 1.0,  # CE loss weight (raised 0.1→1.0 in V14.3b)
+'use_type_masking_ar': True,    # Hard vocab masking during AR generation (enabled in V14.3b)
 'use_heads_memory': True,       # Feed encoder heads into decoder memory
 ```
 
@@ -65,6 +65,25 @@ New layers (`token_type_head`, `heads_to_memory`) are missing from pre-V14.3 che
 2. **After 1 epoch**: Check type head accuracy (should be >90% on TF mode)
 3. **Enable masking**: Set `use_type_masking_ar=True` once type head is accurate
 4. **Monitor**: Type head accuracy should correlate with AR exact match improvement
+
+### V14.3b: Enable Type Masking + Raise Type Loss Weight (2026-02-23)
+
+**Problem**: Error analysis of epochs 4208–4228 revealed:
+- 98.7% train exact match but only ~2% validation exact match (decoder memorization)
+- `use_type_masking_ar=False` — type head trained for 1000+ epochs but masking never enabled
+- 56.9% of all validation errors (5,260 of 9,237) are **type confusions** that masking eliminates
+- `token_type_loss_weight=0.1` — 10x weaker than other critical heads (SC=1.0, HP=1.0, Stop=5.0)
+
+**Changes**:
+1. `use_type_masking_ar`: `False` → `True` — enable hard vocab masking during both eval and RLOO
+2. `token_type_loss_weight`: `0.1` → `1.0` — raise to match other critical heads (wrong type prediction blocks correct token entirely)
+3. Decoder `dropout`: `0.1` → `0.4` — combat memorization (109M params / 46K samples = 2,337 params/sample). Encoder stays at 0.1 (already converged, not overfitting)
+4. Added type head accuracy tracking — logs `Type: 0.0234 (95.2%)` showing both loss and accuracy per epoch
+5. RLOO type masking — type masks now passed to RLOO/SCST sampling (was `None`), preventing RL exploration of impossible type combinations
+
+**Expected impact**: Eliminate 57% of validation type confusion errors. Higher dropout forces decoder to learn generalizable composition rules instead of memorizing. Combined with the 10x stronger type loss signal, the type head should become highly accurate, making the hard masking reliable.
+
+See `docs/ERROR_ANALYSIS_EPOCHS_4208_4228.md` for full analysis.
 
 ### Legacy Code Audit (2026-02-22)
 

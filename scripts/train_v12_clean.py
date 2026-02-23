@@ -755,9 +755,11 @@ TRAIN_CONFIG = {
     # Auxiliary CE loss during training; hard vocab masking at inference.
     # 50% of AR errors are type confusion — this eliminates that error class.
     # =========================================================================
-    'token_type_loss_weight': 0.1,  # V14.3: Weight for token type CE loss (auxiliary)
-    'use_type_masking_ar': False,   # V14.3: Enable hard type masking during AR generation
-                                    # Set True after type head is accurate (>90%)
+    'token_type_loss_weight': 1.0,  # V14.3: Weight for token type CE loss
+                                    # Raised 0.1→1.0: type head controls hard vocab masking,
+                                    # wrong prediction blocks correct token entirely
+    'use_type_masking_ar': True,    # V14.3: Enable hard type masking during AR generation
+                                    # Enabled: type head trained for 1000+ epochs, eliminates 57% of type confusion errors
     'use_heads_memory': True,       # V14.3: Feed encoder head predictions into decoder memory
 
     # =========================================================================
@@ -2053,7 +2055,7 @@ def create_models(magpie_dim: int, device: torch.device):
         use_stoich_conditioning=True,
         max_elements=12,
         n_stoich_tokens=4,
-        dropout=0.1,
+        dropout=0.4,  # V14.3b: Raised 0.1→0.4 to combat decoder memorization (109M params / 46K samples)
         # V12.8: Gradient checkpointing for memory optimization
         use_gradient_checkpointing=TRAIN_CONFIG.get('use_gradient_checkpointing', False),
         # V12.34: Position-dependent teacher forcing (no effect at TF=1.0)
@@ -4536,6 +4538,8 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
     total_a5_z_mse = 0  # V12.43
     total_a5_tc_mse = 0  # V12.43
     total_type_loss = 0  # V14.3
+    total_type_correct = 0  # V14.3: Type head accuracy tracking
+    total_type_total = 0    # V14.3: Total non-PAD type positions
     total_sc_exact = 0
     total_non_sc_exact = 0
     total_spec_accept = 0  # V12.9: Speculative decoding acceptance rate
@@ -4549,6 +4553,11 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
     # V12.12: Running average loss for selective backpropagation
     running_avg_loss = None
     sb_momentum = 0.95  # EMA momentum for running average
+
+    # V14.3: Precompute type masks once for RLOO type-constrained sampling
+    _rloo_type_masks = None
+    if TRAIN_CONFIG.get('use_type_masking_ar', False) and v13_tokenizer is not None:
+        _rloo_type_masks = v13_tokenizer.get_type_masks(device=str(device))
 
     # Zero gradients at start of accumulation
     enc_opt.zero_grad()
@@ -4675,6 +4684,10 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
                 type_targets_flat = type_targets[type_mask]
                 if type_logits_flat.numel() > 0:
                     type_loss_val = F.cross_entropy(type_logits_flat, type_targets_flat)
+                    # V14.3: Track type head accuracy
+                    type_preds_flat = type_logits_flat.argmax(dim=-1)
+                    total_type_correct += (type_preds_flat == type_targets_flat).sum().item()
+                    total_type_total += type_targets_flat.numel()
 
             # V12.30: Stop-prediction loss (BCE on stop head)
             stop_loss_val = torch.tensor(0.0, device=device)
@@ -4801,7 +4814,7 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
             # to match the SC subset passed to loss_fn. Otherwise RLOO/SCST would
             # use stale full-batch heads_pred while z is only the SC subset.
             loss_fn._heads_pred = heads_pred_dict
-            loss_fn._type_masks = None  # Type masking in RLOO disabled for V14.3
+            loss_fn._type_masks = _rloo_type_masks  # V14.3: type-constrained RLOO sampling
 
             # V12.12: Compute main loss differently for SC vs non-SC
             if sc_mask.all():
@@ -5126,6 +5139,7 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
         'tc_class_loss': total_tc_class_loss / n_batches,  # V12.28
         'stop_loss': total_stop_loss / n_batches,  # V12.30
         'type_loss': total_type_loss / n_batches,  # V14.3
+        'type_accuracy': total_type_correct / max(total_type_total, 1),  # V14.3: Type head accuracy
         'physics_z_loss': total_physics_z_loss / n_batches,  # V12.31
         'family_loss': total_family_loss / n_batches,  # V12.32
         'constraint_zoo_loss': total_constraint_zoo_loss / n_batches,  # V12.43
@@ -6609,9 +6623,9 @@ def train():
         if TRAIN_CONFIG.get('stop_loss_weight', 0) > 0 and metrics.get('stop_loss', 0) > 0:
             base_msg += f" | Stop: {metrics['stop_loss']:.4f}"
 
-        # V14.3: Show token type loss if enabled
+        # V14.3: Show token type loss and accuracy if enabled
         if TRAIN_CONFIG.get('token_type_loss_weight', 0) > 0 and metrics.get('type_loss', 0) > 0:
-            base_msg += f" | Type: {metrics['type_loss']:.4f}"
+            base_msg += f" | Type: {metrics['type_loss']:.4f} ({metrics.get('type_accuracy', 0)*100:.1f}%)"
 
         # V12.31: Show physics Z loss if enabled
         if physics_z_loss_fn is not None and metrics.get('physics_z_loss', 0) > 0:
