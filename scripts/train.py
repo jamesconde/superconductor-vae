@@ -130,7 +130,7 @@ PROJECT_ROOT = Path(__file__).parent.parent  # scripts/ -> superconductor-vae/
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 from superconductor.data.dataset import SuperconductorDataset
-from superconductor.models.attention_vae import FullMaterialsVAE, FullMaterialsLoss
+from superconductor.models.attention_vae import FullMaterialsVAE
 from superconductor.models.autoregressive_decoder import (
     EnhancedTransformerDecoder,
     tokenize_formula, tokens_to_indices, indices_to_formula,

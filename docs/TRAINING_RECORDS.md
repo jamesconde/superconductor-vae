@@ -68,23 +68,29 @@ New layers (`token_type_head`, `heads_to_memory`) are missing from pre-V14.3 che
 
 ### Legacy Code Audit (2026-02-22)
 
-Marked all unused/legacy classes with `LEGACY` docstrings. No code deleted — kept for reference.
+Marked all unused/legacy classes with `LEGACY` docstrings, then **REMOVED** them (preserved in git history).
 
-**attention_vae.py:**
+**Removed from `attention_vae.py`** (~415 lines):
+- `AttentionVAEDecoder` — Internal to AttentionBidirectionalVAE
+- `TcPredictorWithContributions` — Internal to AttentionBidirectionalVAE
 - `AttentionBidirectionalVAE` — V1-V10 element-only encoder, superseded by FullMaterialsVAE in V12
 - `AttentionVAELoss` — Loss for above, superseded by CombinedLossWithREINFORCE
 - `create_attention_vae()` — Factory for above
-- `FullMaterialsLoss` — Simple V12.0 loss, superseded by CombinedLossWithREINFORCE in train_v12_clean.py (still imported by old scripts/train.py)
-- `StructuredLatentEncoder` — V13 proposal (z=384, semantic partitions). **Never trained.** Abandoned because the bottleneck was tokenization granularity, not latent space organization. V13.0 shipped with semantic fraction tokens instead. **REMOVED** (preserved in git history).
-- `FullMaterialsV13` — Full model wrapper for above. **Never trained.** **REMOVED** (preserved in git history).
+- `FullMaterialsLoss` — Simple V12.0 loss, superseded by CombinedLossWithREINFORCE in train_v12_clean.py
+- `StructuredLatentEncoder` — V13 proposal, never trained
+- `FullMaterialsV13` — V13 wrapper, never trained
 
-**autoregressive_decoder.py:**
+**Removed from `autoregressive_decoder.py`** (~795 lines):
 - `AutoregressiveFormulaDecoder` — V1-V6 GRU decoder, superseded by EnhancedTransformerDecoder
 - `FormulaVAEWithDecoder` — Wrapper for GRU decoder
 - `TransformerFormulaDecoder` — V7-V10 basic transformer, lacked skip connections, stoich conditioning, KV-cache, REINFORCE
 - `FormulaVAEWithTransformer` — Wrapper for basic transformer
 
-**Active components** (NOT legacy): `ElementEncoder`, `FullMaterialsVAE`, `EnhancedTransformerDecoder`, `PositionalEncoding`, all helper functions/constants.
+**Removed file**: `src/superconductor/generation/attention_generator.py` — Legacy generator depending on AttentionBidirectionalVAE
+
+**Import cleanup**: Removed dead imports from `models/__init__.py`, `superconductor/__init__.py`, `generation/__init__.py`, and `scripts/train.py`.
+
+**Active components** (NOT legacy): `ElementEncoder`, `AttentionVAEEncoder`, `HierarchicalFamilyHead`, `FullMaterialsVAE`, `PositionalEncoding`, `EnhancedTransformerDecoder`, all helper functions/constants.
 
 ---
 

@@ -5,7 +5,7 @@ Provides dataset classes for:
 - SuperCon database loading
 - Contrastive learning with negative samples
 - Materials API integration
-- Attention-compatible datasets (for AttentionBidirectionalVAE)
+- Attention-compatible datasets (for FullMaterialsVAE)
 - Canonical ordering for formula standardization
 """
 

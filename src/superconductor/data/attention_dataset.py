@@ -1,7 +1,7 @@
 """
 Attention-compatible dataset for superconductor data.
 
-Returns element-level features suitable for AttentionBidirectionalVAE:
+Returns element-level features suitable for FullMaterialsVAE:
 - element_indices: Atomic numbers for each element in composition
 - element_fractions: Molar fractions
 - element_mask: Valid element mask

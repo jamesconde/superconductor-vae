@@ -154,10 +154,7 @@ from .models.bidirectional_vae import (
     create_bidirectional_vae,
 )
 from .models.attention_vae import (
-    AttentionBidirectionalVAE,
-    AttentionVAELoss,
     ElementEncoder,
-    create_attention_vae,
 )
 
 # Validation
@@ -255,11 +252,8 @@ __all__ = [
     'BidirectionalVAELoss',
     'create_bidirectional_vae',
 
-    # Models - Attention VAE (element-level, recommended)
-    'AttentionBidirectionalVAE',
-    'AttentionVAELoss',
+    # Models - Attention VAE (element-level)
     'ElementEncoder',
-    'create_attention_vae',
 
     # Validation
     'CandidateValidator',
