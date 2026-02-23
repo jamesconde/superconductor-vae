@@ -71,21 +71,23 @@ def analyze_svd_spectrum(W1: torch.Tensor) -> torch.Tensor:
 def apply_migration(
     checkpoint: dict,
     bottleneck_dim: int = 512,
-    n_new_tokens: int = 8,
-    d_model: int = 512,
+    n_new_tokens: int = 16,
+    d_model_override: int = None,
 ) -> dict:
     """Apply SVD-based migration to latent_to_memory weights.
 
-    Old architecture (42M params):
-        Layer 0: Linear(2048 → 4096)   [latent_to_memory.0.weight, .0.bias]
-        Layer 1: GELU                   (no params)
-        Layer 2: Linear(4096 → 8192)   [latent_to_memory.2.weight, .2.bias]
+    Old architecture:
+        Layer 0: Linear(latent_dim → hidden)      [latent_to_memory.0.weight, .0.bias]
+        Layer 1: GELU                              (no params)
+        Layer 2: Linear(hidden → d_model*n_tokens) [latent_to_memory.2.weight, .2.bias]
 
-    New architecture (~1.6M params):
-        Layer 0: Linear(2048 → bottleneck_dim)     [latent_to_memory.0.weight, .0.bias]
-        Layer 1: LayerNorm(bottleneck_dim)          [latent_to_memory.1.weight, .1.bias]
-        Layer 2: GELU                               (no params)
-        Layer 3: Linear(bottleneck_dim → d_model * n_new_tokens)  [latent_to_memory.3.weight, .3.bias]
+    New architecture (bottleneck):
+        Layer 0: Linear(latent_dim → bottleneck_dim)              [latent_to_memory.0.weight, .0.bias]
+        Layer 1: LayerNorm(bottleneck_dim)                         [latent_to_memory.1.weight, .1.bias]
+        Layer 2: GELU                                              (no params)
+        Layer 3: Linear(bottleneck_dim → d_model * n_new_tokens)   [latent_to_memory.3.weight, .3.bias]
+
+    d_model is auto-detected from token_embedding.weight in the checkpoint.
 
     Returns:
         Modified checkpoint dict (in-place mutation of decoder_state_dict).
@@ -96,6 +98,23 @@ def apply_migration(
     prefix = ''
     if any(k.startswith('_orig_mod.') for k in dec_state.keys()):
         prefix = '_orig_mod.'
+
+    # Auto-detect d_model from token_embedding (shape: [vocab_size, d_model])
+    embed_key = f'{prefix}token_embedding.weight'
+    if embed_key in dec_state:
+        d_model = dec_state[embed_key].shape[1]
+        print(f"Auto-detected d_model={d_model} from token_embedding.weight {list(dec_state[embed_key].shape)}")
+    elif d_model_override is not None:
+        d_model = d_model_override
+        print(f"Using d_model={d_model} from --d-model flag")
+    else:
+        print("ERROR: Cannot auto-detect d_model (no token_embedding.weight found) "
+              "and no --d-model flag provided.")
+        sys.exit(1)
+
+    if d_model_override is not None and d_model_override != d_model:
+        print(f"WARNING: --d-model {d_model_override} overrides auto-detected {d_model}")
+        d_model = d_model_override
 
     key_w1 = f'{prefix}latent_to_memory.0.weight'
     key_b1 = f'{prefix}latent_to_memory.0.bias'
@@ -112,13 +131,17 @@ def apply_migration(
                     print(f"    {dk}: {dec_state[dk].shape}")
             sys.exit(1)
 
-    W1 = dec_state[key_w1].float()  # [4096, 2048]
-    b1 = dec_state[key_b1].float()  # [4096]
-    W2 = dec_state[key_w2].float()  # [8192, 4096]
-    b2 = dec_state[key_b2].float()  # [8192]
+    W1 = dec_state[key_w1].float()
+    b1 = dec_state[key_b1].float()
+    W2 = dec_state[key_w2].float()
+    b2 = dec_state[key_b2].float()
 
-    old_n_tokens = W2.shape[0] // d_model  # Should be 16
-    new_output_dim = d_model * n_new_tokens  # 512 * 8 = 4096
+    old_n_tokens = W2.shape[0] // d_model
+    new_output_dim = d_model * n_new_tokens
+
+    # Sanity check: old token count should match n_new_tokens (unless intentionally reducing)
+    if old_n_tokens != n_new_tokens:
+        print(f"NOTE: Token count changing from {old_n_tokens} to {n_new_tokens}")
 
     print(f"\n{'='*60}")
     print("Phase 2: Applying SVD Migration")
@@ -250,8 +273,8 @@ def main():
                         help='Bottleneck dimension (default: 512)')
     parser.add_argument('--n-tokens', type=int, default=16,
                         help='Number of latent memory tokens (default: 16, same as original)')
-    parser.add_argument('--d-model', type=int, default=512,
-                        help='Transformer d_model (default: 512)')
+    parser.add_argument('--d-model', type=int, default=None,
+                        help='Transformer d_model (default: auto-detect from checkpoint)')
     parser.add_argument('-o', '--output', type=str, default=None,
                         help='Output path for migrated checkpoint (default: <dir>/checkpoint_v15_migrated.pt)')
     args = parser.parse_args()
@@ -301,7 +324,7 @@ def main():
         checkpoint,
         bottleneck_dim=args.bottleneck_dim,
         n_new_tokens=args.n_tokens,
-        d_model=args.d_model,
+        d_model_override=args.d_model,
     )
 
     # Save migrated checkpoint

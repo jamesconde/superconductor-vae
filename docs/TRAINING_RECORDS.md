@@ -8,36 +8,36 @@ Chronological record of training runs, architecture changes, and optimization de
 
 ### Problem
 
-Error analysis of epochs 4208–4228 revealed 98.7% train exact but ~2% validation exact — the decoder memorizes 46K formulas without generalizing. The `latent_to_memory` subnetwork is the prime suspect: **42M params** in a 2-layer MLP that projects z(2048) to 16 memory tokens. Layer 2 alone is 33.6M params — a single weight matrix larger than the entire encoder (7.2M). At 901 params per training sample, this subnetwork has enough capacity to store each formula individually.
+Error analysis of epochs 4208–4228 revealed 98.7% train exact but ~2% validation exact — the decoder memorizes 46K formulas without generalizing. The `latent_to_memory` subnetwork is the prime suspect: **~151M params** (at d_model=1024) in a 2-layer MLP that projects z(2048) to 16 memory tokens. Layer 2 alone is 134M params. At ~3,300 params per training sample, this subnetwork has enough capacity to store each formula individually.
 
 ### Solution: Bottleneck Architecture
 
 Replace the 2-layer MLP with a compressed bottleneck that forces information compression.
 
-**Old (42M params):**
+**Old (~151M params at d_model=1024):**
 ```python
 self.latent_to_memory = nn.Sequential(
-    nn.Linear(2048, 4096),    # 8.4M params
+    nn.Linear(2048, 8192),     # 16.8M params  (d_model*16//2 = 1024*16//2)
     nn.GELU(),
-    nn.Linear(4096, 8192),    # 33.6M params
-)  # Output: [batch, 16, 512]
+    nn.Linear(8192, 16384),    # 134.2M params (d_model*16 = 1024*16)
+)  # Output: [batch, 16, 1024]
 ```
 
-**New (~5.3M params, 8x reduction):**
+**New (~9.3M params, 16x reduction at d_model=1024):**
 ```python
 self.latent_to_memory = nn.Sequential(
     nn.Linear(2048, 512),                  # 1.05M params
     nn.LayerNorm(512),                     # Stabilize bottleneck
     nn.GELU(),
-    nn.Linear(512, d_model * 16),          # 4.2M params (at d_model=512, 16 tokens)
-)  # Output: [batch, 16, 512]
+    nn.Linear(512, d_model * 16),          # 8.4M params (512 * 1024 * 16)
+)  # Output: [batch, 16, 1024]
 ```
 
 **Why this works:**
 - 512-dim bottleneck for 2048-dim input = 4x compression, forces learning which z dimensions matter
 - 16 latent tokens kept (V12 checkpoint had good AR behavior with 16)
 - Memory layout: [16 latent + 4 stoich + 4 heads] = 24 tokens (unchanged from V14.3)
-- 114 params/sample (was 901) — significant capacity reduction without losing token count
+- ~200 params/sample (was ~3,300 at d_model=1024) — significant capacity reduction without losing token count
 - LayerNorm after bottleneck matches `stoich_to_memory` pattern
 
 ### SVD Migration Strategy
@@ -45,7 +45,7 @@ self.latent_to_memory = nn.Sequential(
 Weights migrated via SVD decomposition of old Layer 1:
 
 ```
-W1 [4096, 2048] = U @ diag(S) @ Vt
+W1 [8192, 2048] = U @ diag(S) @ Vt    (at d_model=1024: hidden=8192)
 
 New Layer 0: W1_new = diag(S[:512]) @ Vt[:512, :]      — top-512 directions scaled by singular values
 New Layer 3: W2_new = W2 @ U[:, :512]                   — project old Layer 2 through top-512 left SVs
@@ -54,22 +54,23 @@ New Layer 3: W2_new = W2 @ U[:, :512]                   — project old Layer 2 
 Script: `scripts/migrate_latent_to_memory_reduction.py` (standalone, runs on Colab or locally).
 Saves pre-contraction backup as `checkpoint_*_pre_v15_contraction.pt`.
 
-### d_model Discrepancy Fix
+### d_model Confirmation
 
-MODEL_CONFIG previously said `d_model=1024` (V12.42 Net2Net widening) but the actual checkpoint has always been d_model=512 — the V12.42 migration script was never applied. Reverted config to match reality: `d_model=512`, `dim_feedforward=2048`.
+The Colab checkpoint (epoch 4245) has **d_model=1024** — V12.42 Net2Net widening WAS applied on Colab (token_embedding shape [4752, 1024], all transformer layers at 1024). MODEL_CONFIG correctly reflects `d_model=1024`, `dim_feedforward=4096`. The migration script auto-detects d_model from the checkpoint's `token_embedding.weight`.
 
 ### Files Modified
 
 - `src/superconductor/models/autoregressive_decoder.py` — `EnhancedTransformerDecoder.__init__()`: added `memory_bottleneck_dim` param, replaced `latent_to_memory` with bottleneck version, updated `_create_memory()` docstring
-- `scripts/train_v12_clean.py` — `MODEL_CONFIG`: `d_model=512`, `dim_feedforward=2048`, `n_memory_tokens=8`, `memory_bottleneck_dim=512`. Decoder construction passes `memory_bottleneck_dim`.
-- `scripts/migrate_latent_to_memory_reduction.py` — NEW: standalone SVD migration script
+- `scripts/train_v12_clean.py` — `MODEL_CONFIG`: `d_model=1024`, `dim_feedforward=4096`, `n_memory_tokens=16`, `memory_bottleneck_dim=512`. Decoder construction passes `memory_bottleneck_dim`.
+- `scripts/migrate_latent_to_memory_reduction.py` — NEW: standalone SVD migration script (auto-detects d_model from checkpoint)
+- `notebooks/migrate_v15_latent_bottleneck.ipynb` — NEW: Colab migration notebook (auto-detects d_model from checkpoint)
 
 ### Config
 
 ```python
 MODEL_CONFIG = {
-    'd_model': 512,              # Reverted from 1024 (V12.42 never applied)
-    'dim_feedforward': 2048,     # Reverted from 4096
+    'd_model': 1024,             # V12.42 Net2Net widening (confirmed on Colab epoch 4245)
+    'dim_feedforward': 4096,     # 4x d_model
     'n_memory_tokens': 16,       # Kept at 16 (V12 had good AR behavior)
     'memory_bottleneck_dim': 512, # NEW: bottleneck dimension
     ...
@@ -78,7 +79,7 @@ MODEL_CONFIG = {
 
 ### Expected Impact
 
-- Decoder params: ~109M → ~73M (~36M reduction from latent_to_memory bottleneck)
+- Decoder latent_to_memory: ~151M → ~9.3M (~142M reduction from bottleneck)
 - Memory layout: 24 tokens unchanged [16 latent + 4 stoich + 4 heads]
 - Hypothesis: Train exact will drop initially but val exact should climb as the model can no longer memorize through the bottleneck
 
@@ -210,7 +211,7 @@ At epoch 4001/5000, the cosine annealing schedule gives only ~10% of the initial
 
 All migration scripts (`migrate_v13_to_v14.py`, `migrate_vocab_expansion.py`) and the inline loader in `train_v12_clean.py` had a dtype bug: `torch.zeros()` and `torch.randn()` default to float32, but checkpoint tensors may be bfloat16 (training uses AMP). This caused silent dtype mixing in all 397 expanded vocab rows. Fixed by passing `dtype=value.dtype` to all allocation/noise tensors.
 
-**Action required**: Re-run migration on Colab from the best checkpoint to get a clean V15 checkpoint.
+**Action required**: Re-run isotope migration on Colab from the best checkpoint to get a clean V14 checkpoint with correct dtypes.
 
 ---
 

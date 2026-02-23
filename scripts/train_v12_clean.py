@@ -352,10 +352,10 @@ MODEL_CONFIG = {
     'magpie_dim': 145,  # V12.28: Will be 151 after physics features added (dynamically detected from CSV)
     'encoder_hidden': [512, 256],
     'decoder_hidden': [256, 512],
-    'd_model': 512,             # V15.0: Reverted to 512 — V12.42 Net2Net widening was never applied to checkpoint
+    'd_model': 1024,            # V12.42: Net2Net 2x wider (confirmed applied on Colab checkpoint epoch 4245)
     'nhead': 8,
     'num_layers': 12,
-    'dim_feedforward': 2048,   # V15.0: Reverted to 2048 (4x d_model=512) — matches actual checkpoint
+    'dim_feedforward': 4096,   # V12.42: 4x d_model (was 2048)
     'n_memory_tokens': 16,     # V15.0: Kept at 16 — V12 checkpoint had good AR behavior with 16 tokens
     'memory_bottleneck_dim': 512,  # V15.0: Bottleneck for latent_to_memory (was unbottlenecked 42M params)
     'element_embed_dim': 128,
