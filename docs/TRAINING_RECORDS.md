@@ -4,6 +4,86 @@ Chronological record of training runs, architecture changes, and optimization de
 
 ---
 
+## V15.0: Latent-to-Memory Bottleneck — SVD Weight Contraction (2026-02-23)
+
+### Problem
+
+Error analysis of epochs 4208–4228 revealed 98.7% train exact but ~2% validation exact — the decoder memorizes 46K formulas without generalizing. The `latent_to_memory` subnetwork is the prime suspect: **42M params** in a 2-layer MLP that projects z(2048) to 16 memory tokens. Layer 2 alone is 33.6M params — a single weight matrix larger than the entire encoder (7.2M). At 901 params per training sample, this subnetwork has enough capacity to store each formula individually.
+
+### Solution: Bottleneck Architecture
+
+Replace the 2-layer MLP with a compressed bottleneck that forces information compression.
+
+**Old (42M params):**
+```python
+self.latent_to_memory = nn.Sequential(
+    nn.Linear(2048, 4096),    # 8.4M params
+    nn.GELU(),
+    nn.Linear(4096, 8192),    # 33.6M params
+)  # Output: [batch, 16, 512]
+```
+
+**New (~5.3M params, 8x reduction):**
+```python
+self.latent_to_memory = nn.Sequential(
+    nn.Linear(2048, 512),                  # 1.05M params
+    nn.LayerNorm(512),                     # Stabilize bottleneck
+    nn.GELU(),
+    nn.Linear(512, d_model * 16),          # 4.2M params (at d_model=512, 16 tokens)
+)  # Output: [batch, 16, 512]
+```
+
+**Why this works:**
+- 512-dim bottleneck for 2048-dim input = 4x compression, forces learning which z dimensions matter
+- 16 latent tokens kept (V12 checkpoint had good AR behavior with 16)
+- Memory layout: [16 latent + 4 stoich + 4 heads] = 24 tokens (unchanged from V14.3)
+- 114 params/sample (was 901) — significant capacity reduction without losing token count
+- LayerNorm after bottleneck matches `stoich_to_memory` pattern
+
+### SVD Migration Strategy
+
+Weights migrated via SVD decomposition of old Layer 1:
+
+```
+W1 [4096, 2048] = U @ diag(S) @ Vt
+
+New Layer 0: W1_new = diag(S[:512]) @ Vt[:512, :]      — top-512 directions scaled by singular values
+New Layer 3: W2_new = W2 @ U[:, :512]                   — project old Layer 2 through top-512 left SVs
+```
+
+Script: `scripts/migrate_latent_to_memory_reduction.py` (standalone, runs on Colab or locally).
+Saves pre-contraction backup as `checkpoint_*_pre_v15_contraction.pt`.
+
+### d_model Discrepancy Fix
+
+MODEL_CONFIG previously said `d_model=1024` (V12.42 Net2Net widening) but the actual checkpoint has always been d_model=512 — the V12.42 migration script was never applied. Reverted config to match reality: `d_model=512`, `dim_feedforward=2048`.
+
+### Files Modified
+
+- `src/superconductor/models/autoregressive_decoder.py` — `EnhancedTransformerDecoder.__init__()`: added `memory_bottleneck_dim` param, replaced `latent_to_memory` with bottleneck version, updated `_create_memory()` docstring
+- `scripts/train_v12_clean.py` — `MODEL_CONFIG`: `d_model=512`, `dim_feedforward=2048`, `n_memory_tokens=8`, `memory_bottleneck_dim=512`. Decoder construction passes `memory_bottleneck_dim`.
+- `scripts/migrate_latent_to_memory_reduction.py` — NEW: standalone SVD migration script
+
+### Config
+
+```python
+MODEL_CONFIG = {
+    'd_model': 512,              # Reverted from 1024 (V12.42 never applied)
+    'dim_feedforward': 2048,     # Reverted from 4096
+    'n_memory_tokens': 16,       # Kept at 16 (V12 had good AR behavior)
+    'memory_bottleneck_dim': 512, # NEW: bottleneck dimension
+    ...
+}
+```
+
+### Expected Impact
+
+- Decoder params: ~109M → ~73M (~36M reduction from latent_to_memory bottleneck)
+- Memory layout: 24 tokens unchanged [16 latent + 4 stoich + 4 heads]
+- Hypothesis: Train exact will drop initially but val exact should climb as the model can no longer memorize through the bottleneck
+
+---
+
 ## V14.3: Token Type Classifier Head + Enriched Decoder Memory (2026-02-21)
 
 ### Problem

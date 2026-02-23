@@ -352,11 +352,12 @@ MODEL_CONFIG = {
     'magpie_dim': 145,  # V12.28: Will be 151 after physics features added (dynamically detected from CSV)
     'encoder_hidden': [512, 256],
     'decoder_hidden': [256, 512],
-    'd_model': 1024,            # V12.42: Net2Net 2x wider (was 512), 128 dims/head
+    'd_model': 512,             # V15.0: Reverted to 512 — V12.42 Net2Net widening was never applied to checkpoint
     'nhead': 8,
     'num_layers': 12,
-    'dim_feedforward': 4096,   # V12.42: 4x d_model (was 2048)
-    'n_memory_tokens': 16,
+    'dim_feedforward': 2048,   # V15.0: Reverted to 2048 (4x d_model=512) — matches actual checkpoint
+    'n_memory_tokens': 16,     # V15.0: Kept at 16 — V12 checkpoint had good AR behavior with 16 tokens
+    'memory_bottleneck_dim': 512,  # V15.0: Bottleneck for latent_to_memory (was unbottlenecked 42M params)
     'element_embed_dim': 128,
 }
 
@@ -400,7 +401,7 @@ def build_family_lookup_tensors(device):
     return fine_to_coarse, fine_to_cuprate_sub, fine_to_iron_sub
 
 
-ALGO_VERSION = 'V14.3'  # Bump this when making algorithm changes
+ALGO_VERSION = 'V15.0'  # Bump this when making algorithm changes
 
 TRAIN_CONFIG = {
     'num_epochs': 5000,
@@ -2064,6 +2065,8 @@ def create_models(magpie_dim: int, device: torch.device):
         # V13.0: Configurable vocab and stoich dims for semantic fraction tokens
         vocab_size=decoder_vocab_size,
         stoich_input_dim=decoder_stoich_input_dim,
+        # V15.0: Bottleneck latent_to_memory (42M → 1.6M params)
+        memory_bottleneck_dim=MODEL_CONFIG.get('memory_bottleneck_dim', 512),
     ).to(device)
 
     enc_params = sum(p.numel() for p in encoder.parameters())

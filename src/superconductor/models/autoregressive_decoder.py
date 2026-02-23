@@ -529,6 +529,10 @@ class EnhancedTransformerDecoder(nn.Module):
         # V12.x: 37 = fractions(12) + numden(24) + count(1)
         # V13.0: 13 = fractions(12) + count(1) — numden removed (implicit in fraction tokens)
         stoich_input_dim: int = None,
+        # V15.0: Bottleneck latent_to_memory to prevent decoder memorization
+        # Old: 2-layer MLP with 42M params. New: bottleneck with ~1.6M params.
+        # If 0, uses old-style direct MLP (for backward compat with pre-V15 checkpoints).
+        memory_bottleneck_dim: int = 512,
     ):
         super().__init__()
 
@@ -557,12 +561,25 @@ class EnhancedTransformerDecoder(nn.Module):
         # Positional encoding
         self.pos_encoding = PositionalEncoding(d_model, max_len, dropout)
 
-        # Project latent to memory for cross-attention (MORE tokens)
-        self.latent_to_memory = nn.Sequential(
-            nn.Linear(latent_dim, d_model * n_memory_tokens // 2),
-            nn.GELU(),
-            nn.Linear(d_model * n_memory_tokens // 2, d_model * n_memory_tokens),
-        )
+        # V15.0: Project latent z to memory tokens for cross-attention.
+        # Bottleneck architecture forces information compression, preventing
+        # the decoder from memorizing individual training samples through
+        # this subnetwork (42M→5.3M param reduction at bottleneck=512, 16 tokens).
+        # Memory layout: [n_memory_tokens latent | 4 stoich | 4 heads] = 24 total
+        if memory_bottleneck_dim > 0:
+            self.latent_to_memory = nn.Sequential(
+                nn.Linear(latent_dim, memory_bottleneck_dim),           # 2048 → 512
+                nn.LayerNorm(memory_bottleneck_dim),                    # Stabilize bottleneck
+                nn.GELU(),
+                nn.Linear(memory_bottleneck_dim, d_model * n_memory_tokens),  # 512 → d_model*n_tokens
+            )
+        else:
+            # Pre-V15 fallback: direct MLP (for loading old checkpoints without migration)
+            self.latent_to_memory = nn.Sequential(
+                nn.Linear(latent_dim, d_model * n_memory_tokens // 2),
+                nn.GELU(),
+                nn.Linear(d_model * n_memory_tokens // 2, d_model * n_memory_tokens),
+            )
 
         # Skip connection: project encoder representation to memory tokens
         if use_skip_connection:
@@ -699,9 +716,10 @@ class EnhancedTransformerDecoder(nn.Module):
         direct visibility into predicted element fractions.
         V13.0: stoich_pred is [batch, 13] = fractions(12) + count(1). numden removed.
         V14.3: heads_pred adds 4 tokens from encoder head predictions (tc, sc, hp, etc.)
+        V15.0: latent_to_memory bottleneck (42M→5.3M params). Token count unchanged.
 
-        Memory layout: [latent_tokens (16) | skip_tokens (8) | stoich_tokens (4) | heads_tokens (4)]
-        Total: up to 32 memory tokens for cross-attention
+        Memory layout: [latent_tokens (16) | stoich_tokens (4) | heads_tokens (4)]
+        Total: 24 memory tokens for cross-attention (skip connection disabled since V13.1)
         """
         batch_size = z.size(0)
 
