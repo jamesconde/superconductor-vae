@@ -1,75 +1,48 @@
 """
-R-MENN Superconductor Discovery Module
+Superconductor VAE — Generative model for superconductor formula discovery.
 
-A comprehensive module for predicting critical temperature (Tc) of superconductors
-and discovering new superconductor candidates using R-MENN architecture.
+Multi-task autoencoder that encodes superconductor compositions into a rich
+latent space (z=2048) and decodes back to formulas, Tc, Magpie features,
+SC classification, and hierarchical family labels.
+
+Active Architecture (V12+/V14):
+    FullMaterialsVAE (encoder):
+        Element attention + Magpie features (145) + Tc → Fusion → z (2048)
+    EnhancedTransformerDecoder (formula decoder):
+        z → 24 cross-attention memory tokens → autoregressive formula generation
+    Multi-head decoder:
+        z → Tc, Magpie, SC class, family, high-pressure, Tc bucket, fractions
 
 Key Features:
-- Chemical formula encoding with elemental property statistics
-- Isotope-aware encoding with 291 isotopes for 84 elements
 - Element-level attention for learning element importance
-- Bidirectional VAE for prediction and generation
-- Contrastive learning with non-superconductors and magnetic materials
-- Latent space analysis and visualization
-- Multiple candidate generation strategies
+- Semantic fraction tokenization (FRAC:p/q tokens) for exact stoichiometry
+- Contrastive learning with non-superconductors (46K dataset)
+- REINFORCE/RLOO for autoregressive formula generation
+- Token type classifier with hard vocab masking
+- Isotope-aware encoding with 291 isotopes for 84 elements
+- Latent space analysis and candidate generation
 - Rule-based validation (charge balance, element compatibility)
 
 Isotope Support:
-    The module supports isotope-specific encoding for exploring isotope effects
-    on superconductivity (Tc ∝ M^(-0.5) in BCS superconductors):
-
     from superconductor import IsotopeEncoder, estimate_isotope_effect
 
     encoder = IsotopeEncoder()
     result = encoder.encode('LaD10')  # Deuterium (H-2)
-    result = encoder.encode('Y(18O)Ba2Cu3O6')  # Oxygen-18
-
-    # Estimate isotope effect
     tc_h = 250.0  # LaH10 at ~250K
     tc_d = estimate_isotope_effect('H', 1, 2, tc_h)  # ~177K for LaD10
 
 Element Attention:
-    Learn which elements are most important for Tc prediction:
-
     from superconductor import ElementAttention, interpret_attention_weights
 
     attention = ElementAttention(hidden_dim=64, n_heads=4)
     output = attention(element_embeddings, element_mask)
     # output.attention_weights shows element importance (e.g., Cu/O high in YBCO)
 
-Example Usage:
-    from superconductor import (
-        SuperconductorDataset,
-        SuperconductorDiscoveryPipeline,
-        DiscoveryConfig
-    )
-
-    # Load data
-    dataset = SuperconductorDataset.from_supercon('path/to/supercon.csv')
-
-    # Configure pipeline
-    config = DiscoveryConfig(
-        latent_dim=64,
-        epochs=200,
-        min_tc_threshold=77.0  # Liquid nitrogen temperature
-    )
-
-    # Run discovery
-    pipeline = SuperconductorDiscoveryPipeline(dataset, config)
-    candidates, results = pipeline.run()
-
-    # Top candidates
-    print(results.head(10))
-
 Data Directory:
-    Place SuperCon dataset in:
-    RMENN-Signature-Clean/data/superconductor/raw/
+    data/processed/supercon_fractions_contrastive.csv (46,645 samples)
 
-Architecture Philosophy:
-    This module follows R-MENN's core philosophy of COMPETENCY over accuracy:
-    - Models learn to predict confidently on materials they understand
-    - Models abstain/hand off on materials they are uncertain about
-    - Validation ensures chemically plausible candidates
+Training:
+    cd superconductor-vae && PYTHONPATH=src python scripts/train_v12_clean.py
 """
 
 # Encoders
