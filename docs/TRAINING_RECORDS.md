@@ -46,6 +46,16 @@ V15.0 bottleneck reduced latent_to_memory from 151M → 19M params, freeing ~10-
 
 Estimated peak VRAM with RL active: ~25-30GB on A100-40GB (~10-15GB headroom).
 
+**A100-80GB "xlarge" tier** (added in env_config.py):
+
+| Setting | A100-40GB ("large") | A100-80GB ("xlarge") |
+|---------|---------------------|----------------------|
+| `batch_size_multiplier` | 12.0 (batch=504) | 24.0 (batch=1008) |
+| `n_samples_rloo` | 8 | 16 |
+| `compile_mode` | `"reduce-overhead"` | `"reduce-overhead"` |
+
+46K samples / 1008 batch = ~46 steps/epoch. Estimated peak with RL: ~40-50GB (~30GB headroom).
+
 ---
 
 ## V15.1: Per-Bin Tc Head Early Stopping — Snapshot/Restore (2026-02-23)

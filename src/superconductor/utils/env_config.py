@@ -53,8 +53,9 @@ def _classify_gpu() -> dict:
     """Return GPU name, VRAM in GB, and a size class.
 
     Size classes:
-        'large'  — 40GB+ (A100, H100, etc.)
-        'medium' — 14-40GB (V100, T4, L4, RTX 3090/4090)
+        'xlarge' — 70GB+ (A100-80GB, H100-80GB)
+        'large'  — 38-70GB (A100-40GB)
+        'medium' — 14-38GB (V100, T4, L4, RTX 3090/4090)
         'small'  — <14GB (RTX 4060, GTX 1080 Ti, etc.)
         'none'   — no CUDA GPU detected
     """
@@ -65,7 +66,9 @@ def _classify_gpu() -> dict:
         props = torch.cuda.get_device_properties(0)
         vram_gb = props.total_memory / (1024 ** 3)
         name = props.name
-        if vram_gb >= 38:  # A100-40GB reports 39.6GB usable
+        if vram_gb >= 70:  # A100-80GB reports ~78GB usable
+            gpu_class = "xlarge"
+        elif vram_gb >= 38:  # A100-40GB reports 39.6GB usable
             gpu_class = "large"
         elif vram_gb >= 14:
             gpu_class = "medium"
@@ -130,8 +133,23 @@ def detect_environment() -> dict:
         compile_mode = None  # Use TRAIN_CONFIG default (reduce-overhead works on local)
 
     elif runtime == "colab":
-        if gpu["class"] == "large":
-            # A100 / H100 (38GB+)
+        if gpu["class"] == "xlarge":
+            # A100-80GB / H100-80GB (70GB+)
+            # V15.2: With V15.0 bottleneck (19M params) and 80GB VRAM, we can
+            # push batch to ~1008 and RLOO to 16. ~46K samples / 1008 = 46 steps/epoch.
+            # Estimated peak with RL: ~40-50GB, leaving ~30GB headroom.
+            num_workers = min(8, cpus - 1) if cpus > 1 else 0
+            pin_memory = True
+            persistent_workers = True
+            prefetch_factor = 4
+            batch_size_multiplier = 24.0  # 42 * 24 = 1008
+            accumulation_steps = 1        # No accumulation needed with huge batch
+            n_samples_rloo = 16           # 16 samples: low-variance RLOO baseline
+            selective_backprop = False     # All samples get full gradients
+            use_torch_compile = True
+            compile_mode = "reduce-overhead"
+        elif gpu["class"] == "large":
+            # A100-40GB / H100-40GB (38-70GB)
             # V15.2: V15.0 bottleneck reduced latent_to_memory 151M→19M params,
             # freeing ~10-15GB VRAM. batch=504 + rloo=8 peaks ~25-30GB on A100-40GB.
             num_workers = min(8, cpus - 1) if cpus > 1 else 0
@@ -168,7 +186,7 @@ def detect_environment() -> dict:
             compile_mode = None
 
     elif runtime == "linux":
-        if gpu["class"] in ("large", "medium") and ram_gb >= 32:
+        if gpu["class"] in ("xlarge", "large", "medium") and ram_gb >= 32:
             # Big bare Linux workstation / server
             num_workers = min(8, cpus - 1) if cpus > 1 else 0
             pin_memory = True
