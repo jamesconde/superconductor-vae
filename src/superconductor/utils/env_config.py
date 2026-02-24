@@ -135,16 +135,17 @@ def detect_environment() -> dict:
     elif runtime == "colab":
         if gpu["class"] == "xlarge":
             # A100-80GB / H100-80GB (70GB+)
-            # V15.2: With V15.0 bottleneck (19M params) and 80GB VRAM, we can
-            # push batch to ~1008 and RLOO to 16. ~46K samples / 1008 = 46 steps/epoch.
-            # Estimated peak with RL: ~40-50GB, leaving ~30GB headroom.
+            # V15.2: With V15.0 bottleneck (19M params) and 80GB VRAM, spend
+            # the budget on batch size (faster epochs) rather than RLOO samples
+            # (4 already proved effective). 46K samples / 1512 = ~31 steps/epoch.
+            # Estimated peak with RL (4 samples): ~45-55GB, leaving ~25GB headroom.
             num_workers = min(8, cpus - 1) if cpus > 1 else 0
             pin_memory = True
             persistent_workers = True
             prefetch_factor = 4
-            batch_size_multiplier = 24.0  # 42 * 24 = 1008
+            batch_size_multiplier = 36.0  # 42 * 36 = 1512
             accumulation_steps = 1        # No accumulation needed with huge batch
-            n_samples_rloo = 16           # 16 samples: low-variance RLOO baseline
+            n_samples_rloo = 4            # 4 samples: proven effective, save VRAM for batch
             selective_backprop = False     # All samples get full gradients
             use_torch_compile = True
             compile_mode = "reduce-overhead"
