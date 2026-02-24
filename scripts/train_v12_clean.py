@@ -401,7 +401,7 @@ def build_family_lookup_tensors(device):
     return fine_to_coarse, fine_to_cuprate_sub, fine_to_iron_sub
 
 
-ALGO_VERSION = 'V15.1'  # Bump this when making algorithm changes
+ALGO_VERSION = 'V15.2'  # Bump this when making algorithm changes
 
 TRAIN_CONFIG = {
     'num_epochs': 5000,
@@ -480,10 +480,9 @@ TRAIN_CONFIG = {
     'magpie_skew_threshold': 3.0,   # Features with |skew| > this get quantile-transformed to Gaussian
     'magpie_sc_only_norm': True,    # Use SC-only mean/std for z-score (avoids non-SC distribution bias)
 
-    # Teacher forcing decay
-    'tf_start': 1.0,           # Start with full teacher forcing
-    'tf_end': 0.0,             # Decay to full autoregressive
-    'tf_decay_epochs': 100,    # Decay over 100 epochs
+    # Teacher forcing scheduling (V15.2)
+    'tf_scheduling_threshold': 0.80,  # Auto-activate TF=1-exact when TF exact exceeds this
+    'tf_scheduling_enabled': False,   # Start disabled; auto-enabled when threshold hit
 
     # Curriculum phases
     'curriculum_phase1_end': 30,  # Ramp up Tc/Magpie weights
@@ -6508,10 +6507,18 @@ def train():
         # Get curriculum weights for this epoch
         tc_weight, magpie_weight = get_curriculum_weights(epoch)
 
-        # V12.22: TF locked at 1.0 — feeding wrong predictions as context trains on
-        # corrupted input distribution, slowing convergence. Modern LLMs all use TF=1.0.
-        # The 83%→55% teacher-forced vs autoregressive gap is better closed via REINFORCE.
-        tf_ratio = 1.0
+        # V15.2: Auto-activate TF scheduling when exact match exceeds threshold
+        _tf_threshold = TRAIN_CONFIG.get('tf_scheduling_threshold', 0.80)
+        if not TRAIN_CONFIG.get('tf_scheduling_enabled', False):
+            if prev_exact >= _tf_threshold:
+                TRAIN_CONFIG['tf_scheduling_enabled'] = True
+                print(f"  [V15.2 TF-SCHED] ACTIVATED: prev_exact={prev_exact:.3f} >= "
+                      f"threshold={_tf_threshold} — switching to TF = 1 - exact", flush=True)
+
+        if TRAIN_CONFIG.get('tf_scheduling_enabled', False):
+            tf_ratio = get_teacher_forcing_ratio(prev_exact)
+        else:
+            tf_ratio = 1.0
 
         # V12.9: Update entropy weight and temperature from entropy manager
         if entropy_manager is not None and TRAIN_CONFIG.get('rl_weight', 0.0) > 0:

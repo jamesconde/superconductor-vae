@@ -4,6 +4,50 @@ Chronological record of training runs, architecture changes, and optimization de
 
 ---
 
+## V15.2: Auto-Activating TF Scheduling (2026-02-23)
+
+### Problem
+
+Training data (epochs 4256-4282) shows TF exact climbing 26%→66% while true AR exact is stuck at 3-5%. The gap grows every epoch because TF is locked at 1.0 — the decoder never practices generating from its own predictions.
+
+### Solution: TF = 1 - exact_match (auto-activated)
+
+The existing `get_teacher_forcing_ratio()` function implements `TF = 1 - exact_match` but was never called. V15.2 adds auto-activation:
+
+1. **Gate**: TF scheduling stays disabled until TF exact exceeds `tf_scheduling_threshold` (default 0.80)
+2. **Activation**: Once threshold is hit, `tf_scheduling_enabled` flips to `True` and stays active permanently
+3. **Formula**: `TF = 1.0 - prev_exact` (previous epoch's exact match)
+   - exact=80% → TF=0.20 (mostly autoregressive)
+   - exact=90% → TF=0.10 (nearly pure autoregressive)
+4. **Self-stabilizing**: If exact drops after activation (e.g., 80%→60%), TF automatically rises (0.20→0.40), providing more teacher forcing to aid recovery — natural negative feedback loop
+
+### Config Parameters
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `tf_scheduling_threshold` | `0.80` | Auto-activate when TF exact exceeds this |
+| `tf_scheduling_enabled` | `False` | Start disabled; set `True` to force-enable from epoch 0 |
+
+### Console Output
+
+On activation: `[V15.2 TF-SCHED] ACTIVATED: prev_exact=0.800 >= threshold=0.8 — switching to TF = 1 - exact`
+
+Every epoch (in existing summary line): `TF: 0.20` (reflects current scheduled ratio)
+
+### Colab A100 VRAM Optimization (env_config.py)
+
+V15.0 bottleneck reduced latent_to_memory from 151M → 19M params, freeing ~10-15GB VRAM. Updated Colab "large" GPU profile to use the headroom:
+
+| Setting | Old | New | Effect |
+|---------|-----|-----|--------|
+| `batch_size_multiplier` | 6.0 (batch=252) | 12.0 (batch=504) | ~2x faster epochs, smoother gradients |
+| `n_samples_rloo` | 4 | 8 | Better REINFORCE variance reduction when RL activates |
+| `compile_mode` | `"default"` | `"max-autotune"` | Slower first compile, faster steady-state kernels |
+
+Estimated peak VRAM with RL active: ~25-30GB on A100-40GB (~10-15GB headroom).
+
+---
+
 ## V15.1: Per-Bin Tc Head Early Stopping — Snapshot/Restore (2026-02-23)
 
 ### Problem

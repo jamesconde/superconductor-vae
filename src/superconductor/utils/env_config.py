@@ -132,21 +132,21 @@ def detect_environment() -> dict:
     elif runtime == "colab":
         if gpu["class"] == "large":
             # A100 / H100 (38GB+)
-            # V12.42: With d_model=1024, batch=252 estimated ~20-25GB on A100-40GB.
-            # With n_samples_rloo=4, REINFORCE pass adds ~8-10GB extra.
+            # V15.2: V15.0 bottleneck reduced latent_to_memory 151M→19M params,
+            # freeing ~10-15GB VRAM. batch=504 + rloo=8 peaks ~25-30GB on A100-40GB.
             num_workers = min(8, cpus - 1) if cpus > 1 else 0
             pin_memory = True
             persistent_workers = True
             prefetch_factor = 3
-            batch_size_multiplier = 6.0  # V12.42: 42 * 6 = 252 (reduced for 4x wider decoder d_model=1024)
+            batch_size_multiplier = 12.0  # V15.2: 42 * 12 = 504 (post-bottleneck model fits easily)
             accumulation_steps = 1        # No accumulation needed with large batch
-            n_samples_rloo = 4            # 2→4: better RLOO baseline, uses ~16GB extra VRAM
+            n_samples_rloo = 8            # V15.2: 4→8: better RLOO variance reduction, ~15GB headroom
             selective_backprop = False     # All samples get full gradients (no skipping)
             # V12.20: torch.compile works on Colab A100 (1.5-2x speedup).
-            # Use 'default' mode — 'reduce-overhead' has memory leak issues
-            # (pytorch/pytorch#116096, #128424).
+            # V15.2: 'max-autotune' — extra VRAM for kernel search, faster kernels.
+            # 30GB headroom post-V15.0 bottleneck makes this safe.
             use_torch_compile = True
-            compile_mode = "default"
+            compile_mode = "max-autotune"
         elif gpu["class"] in ("medium", "small") and gpu["class"] != "none":
             # T4 / V100 / L4 (14-40GB) or small Colab GPU
             num_workers = min(2, cpus - 1) if cpus > 1 else 0

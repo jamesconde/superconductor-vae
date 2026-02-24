@@ -38,22 +38,20 @@ def check_family_consistency(generated_tokens, predicted_family) -> bool:
 
 ---
 
-## Shelved: Teacher Forcing Scheduling — TF = 1 - Exact (2/23/2026)
+## Active: V15.2 TF Scheduling — TF = 1 - Exact (2/23/2026)
 
-**Status**: Shelved as Phase 2 after bottleneck stabilizes.
+**Status**: Implemented in V15.2. Auto-activates when TF exact reaches 80%.
 
-**Problem**: TF is locked at 1.0 (always ground-truth context). The decoder never practices autoregressive generation during training. The gap between TF accuracy and AR accuracy is the generalization gap.
+**Mechanism**: `TF = 1 - exact_match`, gated behind `tf_scheduling_threshold: 0.80`. Once TF exact exceeds 80%, scheduling activates permanently. Self-stabilizing: if exact drops, TF rises to compensate.
 
-**Proposal**: Set `TF = 1 - exact_match`. As exact match rises, TF drops, forcing the decoder to practice generation:
-- exact=0% → TF=1.0 (full teacher forcing, focus on learning)
-- exact=50% → TF=0.5 (half the time uses own predictions)
-- exact=90% → TF=0.1 (mostly autoregressive, fine-tuning)
-
-**Prerequisite**: Bottleneck recovery. Introducing TF scheduling while the model is at 0% exact would prevent recovery entirely. Wait until exact match is above 80%.
+**What to watch**:
+- `[V15.2 TF-SCHED] ACTIVATED` message when threshold is first hit
+- AR exact should start climbing once TF scheduling is active (decoder practicing generation)
+- If AR exact doesn't improve within 50 epochs of activation, the TF-AR gap may require additional intervention (e.g., REINFORCE)
 
 ---
 
-## Active: V15.0/V15.1 Bottleneck Recovery Monitoring (2/23/2026)
+## Active: V15.0/V15.1/V15.2 Bottleneck Recovery Monitoring (2/23/2026)
 
 **What to watch**:
 - Type accuracy should climb above 90% first (decoder relearning cross-attention)
@@ -69,3 +67,6 @@ def check_family_consistency(generated_tokens, predicted_family) -> bool:
 
 **Changes applied in V15.1**:
 - Per-bin Tc head early stopping (TcBinTracker): snapshot/restore tc_proj, tc_res_block, tc_out weights when high-Tc bin R² regresses >0.10 below best
+
+**Changes applied in V15.2**:
+- Auto-activating TF scheduling: `TF = 1 - exact` kicks in when TF exact exceeds 80% (`tf_scheduling_threshold`). Self-stabilizing negative feedback loop
