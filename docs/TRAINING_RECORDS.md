@@ -46,27 +46,18 @@ Previous `rl_temperature: 0.2` was tuned for the old model at epoch 3000+ (explo
 
 Matches the temperature that produced good AR performance in the earlier model.
 
-### Colab A100 VRAM Optimization (env_config.py)
+### Colab VRAM Optimization (env_config.py)
 
-V15.0 bottleneck reduced latent_to_memory from 151M → 19M params, freeing ~10-15GB VRAM. Updated Colab "large" GPU profile to use the headroom:
+**Critical lesson**: When TF scheduling activates (TF < 1.0), the decoder uses a **2-pass scheduled sampling** approach (line 911 of `autoregressive_decoder.py`): first pass gets predictions, second pass forwards with mixed GT/predicted tokens. This roughly **doubles forward memory** compared to TF=1.0. Batch sizes must account for this.
 
-| Setting | Old | New | Effect |
-|---------|-----|-----|--------|
-| `batch_size_multiplier` | 6.0 (batch=252) | 12.0 (batch=504) | ~2x faster epochs, smoother gradients |
-| `n_samples_rloo` | 4 | 8 | Better REINFORCE variance reduction when RL activates |
-| `compile_mode` | `"default"` | `"reduce-overhead"` | CUDA graphs for faster kernel dispatch (safe with ~15GB headroom) |
+batch=2100 on A100-80GB used 78/79GB at TF=1.0 and OOM'd immediately when TF scheduling activated at epoch 4329.
 
-Estimated peak VRAM with RL active: ~25-30GB on A100-40GB (~10-15GB headroom).
+| Tier | GPU | Batch | Steps/epoch | Rationale |
+|------|-----|-------|-------------|-----------|
+| `xlarge` | A100-80GB | 1008 (24x) | ~46 | ~39GB/pass × 2 passes = ~78GB peak |
+| `large` | A100-40GB | 252 (6x) | ~183 | ~19GB/pass × 2 passes = ~38GB peak |
 
-**A100-80GB "xlarge" tier** (added in env_config.py):
-
-| Setting | A100-40GB ("large") | A100-80GB ("xlarge") |
-|---------|---------------------|----------------------|
-| `batch_size_multiplier` | 12.0 (batch=504) | 50.0 (batch=2100) |
-| `n_samples_rloo` | 8 | 4 (proven effective, VRAM spent on batch instead) |
-| `compile_mode` | `"reduce-overhead"` | `"reduce-overhead"` |
-
-46K samples / 2100 batch = ~22 steps/epoch. ~10GB headroom is sufficient — only VRAM spikes are RLOO 4x no-grad forward (~2-3GB) and CUDA graphs (~1-2GB).
+Both tiers use `compile_mode="reduce-overhead"` and `n_samples_rloo=4`.
 
 ---
 

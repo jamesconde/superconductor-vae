@@ -135,16 +135,16 @@ def detect_environment() -> dict:
     elif runtime == "colab":
         if gpu["class"] == "xlarge":
             # A100-80GB / H100-80GB (70GB+)
-            # V15.2: With V15.0 bottleneck (19M params) and 80GB VRAM, spend
-            # the budget on batch size (faster epochs) rather than RLOO samples
-            # (4 already proved effective). 46K samples / 2100 = ~22 steps/epoch.
-            # VRAM spikes: RLOO 4x no-grad fwd (~2-3GB), CUDA graphs (~1-2GB).
-            # ~10GB headroom is sufficient for these.
+            # V15.2: When TF < 1.0 (activated at 80% exact), decoder uses 2-pass
+            # scheduled sampling (2x forward memory vs TF=1.0). batch=2100 used
+            # 78/79GB at TF=1.0 and OOM'd when TF scheduling activated.
+            # batch=1008 → ~39GB per pass, ~78GB for 2 passes. Safe for both modes.
+            # 46K samples / 1008 = ~46 steps/epoch.
             num_workers = min(8, cpus - 1) if cpus > 1 else 0
             pin_memory = True
             persistent_workers = True
             prefetch_factor = 4
-            batch_size_multiplier = 50.0  # 42 * 50 = 2100
+            batch_size_multiplier = 24.0  # 42 * 24 = 1008
             accumulation_steps = 1        # No accumulation needed with huge batch
             n_samples_rloo = 4            # 4 samples: proven effective, save VRAM for batch
             selective_backprop = False     # All samples get full gradients
@@ -152,15 +152,16 @@ def detect_environment() -> dict:
             compile_mode = "reduce-overhead"
         elif gpu["class"] == "large":
             # A100-40GB / H100-40GB (38-70GB)
-            # V15.2: V15.0 bottleneck reduced latent_to_memory 151M→19M params,
-            # freeing ~10-15GB VRAM. batch=504 + rloo=8 peaks ~25-30GB on A100-40GB.
+            # V15.2: 2-pass scheduled sampling (TF < 1.0) uses ~2x forward memory.
+            # batch=252 safe for both TF=1.0 and TF < 1.0 on 40GB.
+            # 46K samples / 252 = ~183 steps/epoch.
             num_workers = min(8, cpus - 1) if cpus > 1 else 0
             pin_memory = True
             persistent_workers = True
             prefetch_factor = 3
-            batch_size_multiplier = 12.0  # V15.2: 42 * 12 = 504 (post-bottleneck model fits easily)
+            batch_size_multiplier = 6.0   # 42 * 6 = 252 (safe for 2-pass TF scheduling)
             accumulation_steps = 1        # No accumulation needed with large batch
-            n_samples_rloo = 8            # V15.2: 4→8: better RLOO variance reduction, ~15GB headroom
+            n_samples_rloo = 4            # 4 samples: proven effective
             selective_backprop = False     # All samples get full gradients (no skipping)
             # V12.20: torch.compile works on Colab A100 (1.5-2x speedup).
             # V15.2: 'reduce-overhead' uses CUDA graphs for faster kernel dispatch.
