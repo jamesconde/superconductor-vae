@@ -505,7 +505,7 @@ TRAIN_CONFIG = {
     'rl_weight': 1.0,            # V13.2: Enabled for AR refinement (SCST). CE converged at 99.6% TF exact; RL closes the TF→AR gap.
     'ce_weight': 1.0,            # Cross-entropy weight (keep at 1.0)
     'n_samples_rloo': 4,         # Number of samples for RLOO baseline (A100: 4)
-    'rl_temperature': 0.2,       # V12.40: Reduced 0.5→0.2 — at epoch 3000+, exploration hurts more than helps
+    'rl_temperature': 1.2,       # V15.2: Match old model that achieved good AR. Post-bottleneck rebuild needs exploration.
     'entropy_weight': 0.2,       # Entropy bonus in REINFORCE reward (encourages exploration)
     'use_autoregressive_reinforce': True,  # Use KV-cached autoregressive sampling
     'rl_method': 'scst',         # 'scst' (Self-Critical, Rennie 2017) or 'rloo' (Ahmadian 2024)
@@ -570,8 +570,8 @@ TRAIN_CONFIG = {
     'rl_requires_physz_stable': True,
 
     # V14.0: Temperature schedule (exploration → exploitation)
-    'rl_temperature_start': 0.5,         # More exploration early in RL
-    'rl_temperature_end': 0.2,           # Focus exploitation later
+    'rl_temperature_start': 1.2,         # V15.2: High exploration (matched old model's successful AR)
+    'rl_temperature_end': 0.5,           # Decay to moderate exploitation
     'rl_temperature_decay_epochs': 50,   # Gradual decay over 50 epochs
 
     # V14.0: Phased reward curriculum (STRETCH GOAL — disabled by default)

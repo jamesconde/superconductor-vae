@@ -34,6 +34,18 @@ On activation: `[V15.2 TF-SCHED] ACTIVATED: prev_exact=0.800 >= threshold=0.8 â€
 
 Every epoch (in existing summary line): `TF: 0.20` (reflects current scheduled ratio)
 
+### RL Temperature Reset
+
+Previous `rl_temperature: 0.2` was tuned for the old model at epoch 3000+ (exploitation-focused). Post-bottleneck rebuild needs high exploration to discover new AR patterns:
+
+| Setting | Old (V12.40) | New (V15.2) |
+|---------|-------------|-------------|
+| `rl_temperature` | 0.2 | 1.2 |
+| `rl_temperature_start` | 0.5 | 1.2 |
+| `rl_temperature_end` | 0.2 | 0.5 |
+
+Matches the temperature that produced good AR performance in the earlier model.
+
 ### Colab A100 VRAM Optimization (env_config.py)
 
 V15.0 bottleneck reduced latent_to_memory from 151M â†’ 19M params, freeing ~10-15GB VRAM. Updated Colab "large" GPU profile to use the headroom:
