@@ -143,10 +143,11 @@ def detect_environment() -> dict:
             n_samples_rloo = 8            # V15.2: 4→8: better RLOO variance reduction, ~15GB headroom
             selective_backprop = False     # All samples get full gradients (no skipping)
             # V12.20: torch.compile works on Colab A100 (1.5-2x speedup).
-            # V15.2: 'max-autotune' — extra VRAM for kernel search, faster kernels.
-            # 30GB headroom post-V15.0 bottleneck makes this safe.
+            # V15.2: 'reduce-overhead' uses CUDA graphs for faster kernel dispatch.
+            # Previously avoided due to memory leak (pytorch#116096), but ~15GB
+            # headroom post-V15.0 bottleneck makes this safe on A100-40GB.
             use_torch_compile = True
-            compile_mode = "max-autotune"
+            compile_mode = "reduce-overhead"
         elif gpu["class"] in ("medium", "small") and gpu["class"] != "none":
             # T4 / V100 / L4 (14-40GB) or small Colab GPU
             num_workers = min(2, cpus - 1) if cpus > 1 else 0

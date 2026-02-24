@@ -42,7 +42,7 @@ V15.0 bottleneck reduced latent_to_memory from 151M → 19M params, freeing ~10-
 |---------|-----|-----|--------|
 | `batch_size_multiplier` | 6.0 (batch=252) | 12.0 (batch=504) | ~2x faster epochs, smoother gradients |
 | `n_samples_rloo` | 4 | 8 | Better REINFORCE variance reduction when RL activates |
-| `compile_mode` | `"default"` | `"max-autotune"` | Slower first compile, faster steady-state kernels |
+| `compile_mode` | `"default"` | `"reduce-overhead"` | CUDA graphs for faster kernel dispatch (safe with ~15GB headroom) |
 
 Estimated peak VRAM with RL active: ~25-30GB on A100-40GB (~10-15GB headroom).
 
