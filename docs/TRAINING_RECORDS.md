@@ -4,7 +4,27 @@ Chronological record of training runs, architecture changes, and optimization de
 
 ---
 
-## V15.2: Auto-Activating TF Scheduling (2026-02-23)
+## V15.3: Revert TF Scheduling — REINFORCE is the AR Trainer (2026-02-23)
+
+### Finding: 2-Pass Scheduled Sampling is a False Signal
+
+Epochs 4330-4348 with TF=0.14 showed 85% training exact but only 3-4% true AR exact. Root cause: the 2-pass approach generates "predicted" tokens in pass 1 using **full GT context** (~96% accurate), so the mixed inputs in pass 2 are effectively still teacher-forced. The model never sees real error cascading.
+
+### Action
+
+- **Reverted TF to locked 1.0** — 2-pass scheduled sampling removed
+- **Restored batch sizes** — A100-80GB: 1008→2100, A100-40GB: 252→504 (no longer need 2x memory headroom)
+- **REINFORCE is the sole AR trainer** — RLOO samples use `generate_with_kv_cache` (true step-by-step AR with error cascading)
+- **RL temperature 1.2** — high exploration for post-bottleneck recovery (from V15.2)
+- **Version bump** to V15.3
+
+### Lesson Learned
+
+2-pass scheduled sampling (pass 1: GT context → predictions, pass 2: mixed forward) does NOT approximate true autoregressive training. The predictions from pass 1 are near-perfect because they had GT context. Only true step-by-step generation (REINFORCE, beam search) exposes the model to its own error cascading.
+
+---
+
+## V15.2: Auto-Activating TF Scheduling [REVERTED in V15.3] (2026-02-23)
 
 ### Problem
 

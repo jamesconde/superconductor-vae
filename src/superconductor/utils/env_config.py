@@ -135,16 +135,14 @@ def detect_environment() -> dict:
     elif runtime == "colab":
         if gpu["class"] == "xlarge":
             # A100-80GB / H100-80GB (70GB+)
-            # V15.2: When TF < 1.0 (activated at 80% exact), decoder uses 2-pass
-            # scheduled sampling (2x forward memory vs TF=1.0). batch=2100 used
-            # 78/79GB at TF=1.0 and OOM'd when TF scheduling activated.
-            # batch=1008 → ~39GB per pass, ~78GB for 2 passes. Safe for both modes.
-            # 46K samples / 1008 = ~46 steps/epoch.
+            # V15.2: TF locked at 1.0 (single-pass forward). REINFORCE handles AR
+            # training via true generation. batch=2100 used 78/79GB — tight but stable.
+            # 46K samples / 2100 = ~22 steps/epoch.
             num_workers = min(8, cpus - 1) if cpus > 1 else 0
             pin_memory = True
             persistent_workers = True
             prefetch_factor = 4
-            batch_size_multiplier = 24.0  # 42 * 24 = 1008
+            batch_size_multiplier = 50.0  # 42 * 50 = 2100
             accumulation_steps = 1        # No accumulation needed with huge batch
             n_samples_rloo = 4            # 4 samples: proven effective, save VRAM for batch
             selective_backprop = False     # All samples get full gradients
@@ -152,14 +150,13 @@ def detect_environment() -> dict:
             compile_mode = "reduce-overhead"
         elif gpu["class"] == "large":
             # A100-40GB / H100-40GB (38-70GB)
-            # V15.2: 2-pass scheduled sampling (TF < 1.0) uses ~2x forward memory.
-            # batch=252 safe for both TF=1.0 and TF < 1.0 on 40GB.
-            # 46K samples / 252 = ~183 steps/epoch.
+            # V15.2: TF locked at 1.0 (single-pass). batch=504 fits comfortably.
+            # 46K samples / 504 = ~92 steps/epoch.
             num_workers = min(8, cpus - 1) if cpus > 1 else 0
             pin_memory = True
             persistent_workers = True
             prefetch_factor = 3
-            batch_size_multiplier = 6.0   # 42 * 6 = 252 (safe for 2-pass TF scheduling)
+            batch_size_multiplier = 12.0  # 42 * 12 = 504
             accumulation_steps = 1        # No accumulation needed with large batch
             n_samples_rloo = 4            # 4 samples: proven effective
             selective_backprop = False     # All samples get full gradients (no skipping)

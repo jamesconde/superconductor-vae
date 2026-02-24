@@ -38,20 +38,15 @@ def check_family_consistency(generated_tokens, predicted_family) -> bool:
 
 ---
 
-## Active: V15.2 TF Scheduling — TF = 1 - Exact (2/23/2026)
+## Reverted: TF Scheduling — 2-Pass Scheduled Sampling (V15.2→V15.3)
 
-**Status**: Implemented in V15.2. Auto-activates when TF exact reaches 80%.
+**Status**: Reverted. 2-pass scheduled sampling is a false signal — predictions from pass 1 use GT context (~96% accurate), so the model never sees real error cascading. REINFORCE with true AR generation is the correct mechanism.
 
-**Mechanism**: `TF = 1 - exact_match`, gated behind `tf_scheduling_threshold: 0.80`. Once TF exact exceeds 80%, scheduling activates permanently. Self-stabilizing: if exact drops, TF rises to compensate.
-
-**What to watch**:
-- `[V15.2 TF-SCHED] ACTIVATED` message when threshold is first hit
-- AR exact should start climbing once TF scheduling is active (decoder practicing generation)
-- If AR exact doesn't improve within 50 epochs of activation, the TF-AR gap may require additional intervention (e.g., REINFORCE)
+**Lesson**: Only true step-by-step generation (REINFORCE RLOO) exposes the model to its own error patterns. 2-pass scheduled sampling ≈ TF=1.0 in practice.
 
 ---
 
-## Active: V15.0/V15.1/V15.2 Bottleneck Recovery Monitoring (2/23/2026)
+## Active: V15.0/V15.1/V15.3 Bottleneck Recovery + REINFORCE AR Training (2/23/2026)
 
 **What to watch**:
 - Type accuracy should climb above 90% first (decoder relearning cross-attention)
@@ -68,5 +63,11 @@ def check_family_consistency(generated_tokens, predicted_family) -> bool:
 **Changes applied in V15.1**:
 - Per-bin Tc head early stopping (TcBinTracker): snapshot/restore tc_proj, tc_res_block, tc_out weights when high-Tc bin R² regresses >0.10 below best
 
-**Changes applied in V15.2**:
-- Auto-activating TF scheduling: `TF = 1 - exact` kicks in when TF exact exceeds 80% (`tf_scheduling_threshold`). Self-stabilizing negative feedback loop
+**Changes applied in V15.2** (partially reverted in V15.3):
+- ~~Auto-activating TF scheduling~~ — reverted: 2-pass scheduled sampling is a false signal
+- RL temperature reset: 0.2→1.2 (match old model's successful AR exploration)
+- Colab A100 VRAM optimization: xlarge tier for 80GB GPUs
+
+**Changes applied in V15.3**:
+- Reverted TF scheduling to locked TF=1.0 — REINFORCE is sole AR trainer
+- Restored batch sizes: A100-80GB=2100, A100-40GB=504
