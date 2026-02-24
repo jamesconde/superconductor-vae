@@ -50,11 +50,11 @@ Estimated peak VRAM with RL active: ~25-30GB on A100-40GB (~10-15GB headroom).
 
 | Setting | A100-40GB ("large") | A100-80GB ("xlarge") |
 |---------|---------------------|----------------------|
-| `batch_size_multiplier` | 12.0 (batch=504) | 36.0 (batch=1512) |
+| `batch_size_multiplier` | 12.0 (batch=504) | 50.0 (batch=2100) |
 | `n_samples_rloo` | 8 | 4 (proven effective, VRAM spent on batch instead) |
 | `compile_mode` | `"reduce-overhead"` | `"reduce-overhead"` |
 
-46K samples / 1512 batch = ~31 steps/epoch. Estimated peak with RL (4 samples): ~45-55GB (~25GB headroom).
+46K samples / 2100 batch = ~22 steps/epoch. ~10GB headroom is sufficient — only VRAM spikes are RLOO 4x no-grad forward (~2-3GB) and CUDA graphs (~1-2GB).
 
 ---
 
