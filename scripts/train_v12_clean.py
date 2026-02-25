@@ -114,9 +114,10 @@ from superconductor.losses.constraint_rewards import (
     ConstraintRewardConfig, FamilyConstraintConfig, compute_constraint_rewards,
     VocabConfig, make_v13_vocab_config, set_vocab_config,
 )
-from superconductor.losses.round_trip_loss import RoundTripConsistencyLoss
+from superconductor.losses.round_trip_loss import RoundTripConsistencyLoss, ExtendedRoundTripConsistencyLoss
 from superconductor.losses.constraint_zoo import SiteOccupancySumLoss, ChargeBalanceLoss
 from superconductor.losses.contrastive import category_to_label  # Dataset label mapping (not the loss itself)
+from superconductor.training.self_supervised import SelfSupervisedConfig, SelfSupervisedEpoch
 
 
 # ============================================================================
@@ -357,7 +358,7 @@ MODEL_CONFIG = {
     'num_layers': 12,
     'dim_feedforward': 4096,   # V12.42: 4x d_model (was 2048)
     'n_memory_tokens': 16,     # V15.0: Kept at 16 — V12 checkpoint had good AR behavior with 16 tokens
-    'memory_bottleneck_dim': 1024, # V15.0: Bottleneck for latent_to_memory (~98.5% SVD variance, headroom for self-supervised expansion)
+    'memory_bottleneck_dim': 0, # V15.0: 0=disabled (V12.41 uses direct MLP). Set 1024 for V15+ bottleneck.
     'element_embed_dim': 128,
 }
 
@@ -407,7 +408,7 @@ TRAIN_CONFIG = {
     'num_epochs': 5000,
     'learning_rate': 3e-5,      # Reduced for stable fine-tuning (was 1e-4)
     'lr_warmup_epochs': 0,      # V13.0: Disabled — Phase A/B handle LR transitions; warmup would throttle Phase A fraction embedding training
-    'max_formula_len': 30,      # V13.0: Reduced from 60 — semantic tokens shorten sequences (max=24, P99=16, mean=8.9)
+    'max_formula_len': 60,      # V12.41: 60 for digit-by-digit tokenization. V13.0: 30 with semantic fraction tokens.
     'checkpoint_interval': 50,
 
     # =========================================================================
@@ -454,6 +455,7 @@ TRAIN_CONFIG = {
     'tc_weight': 20.0,                # V12.26: 10→20, focus gradient on Tc accuracy for generation
     'magpie_weight': 2.0,
     'stoich_weight': 2.0,  # V12.4: Stoichiometry loss weight
+    'numden_weight': 1.0,  # V12.41: Numden head MSE loss weight (only when use_semantic_fractions=False)
     # V12.41: Stoich conditioning teacher forcing — feed GT fractions to decoder
     # Breaks the vicious cycle: decoder ignored noisy stoich tokens → no gradient → head stays bad
     # 1.0 = always GT (decoder learns to use stoich tokens), 0.0 = always predicted
@@ -649,6 +651,18 @@ TRAIN_CONFIG = {
     'z_cache_path': 'outputs/latent_cache.pt',  # Path to save z cache
     'z_cache_mode': 'z_and_predictions',    # 'z_only', 'z_and_predictions', or 'full'
     'z_cache_every_epoch': True,            # Cache EVERY epoch for full error analysis over time
+
+    # =========================================================================
+    # Topology Tracking (latent space topology metadata)
+    # =========================================================================
+    # Compute intrinsic dim, density, boundary, cluster metrics after z-cache.
+    # Compact (~15s): appends to outputs/topology_summary.jsonl each cache.
+    # Full (~30s): saves per-sample metadata on best checkpoint only.
+    # =========================================================================
+    'topology_tracking': False,             # Enable topology analysis after z-cache saves
+    'topology_full_on_best': True,          # Full analysis (per-sample metadata) on best checkpoint
+    'topology_k': 20,                       # k for k-NN in topology analysis
+    'topology_n_clusters': 9,               # Number of SC clusters for KMeans
 
     # =========================================================================
     # V12.15: Timing Instrumentation
@@ -941,7 +955,7 @@ TRAIN_CONFIG = {
     # Replace digit-by-digit fraction tokenization with single semantic tokens.
     # Each (p/q) becomes one FRAC:p/q token, eliminating cascading digit errors.
     # =========================================================================
-    'use_semantic_fractions': True,  # V13.0: Enable semantic fraction tokenizer
+    'use_semantic_fractions': False,  # V13.0: Set True for semantic fraction tokenizer (4647 vocab). False = V12.41 mode (148 vocab).
     'fraction_vocab_path': 'data/fraction_vocab.json',  # Fraction vocabulary file
     'fraction_token_weight': 2.0,  # Upweight fraction tokens in CE loss (optional)
 
@@ -957,8 +971,31 @@ TRAIN_CONFIG = {
     # Each {mass}Element in a formula becomes a single semantic token.
     # No training data exists yet — infrastructure for future theory-guided generation.
     # =========================================================================
-    'use_isotope_tokens': True,       # V14.0: Isotope-aware tokenization
+    'use_isotope_tokens': False,      # V14.0: Isotope-aware tokenization (requires use_semantic_fractions=True)
     'isotope_vocab_path': 'data/isotope_vocab.json',
+
+    # =========================================================================
+    # Phase 2: Self-Supervised Training
+    # =========================================================================
+    # Uses model's own generations as self-supervised signal to improve
+    # generalization. Runs as interleaved sub-epochs after supervised training.
+    # See docs/PHASE2_SELF_SUPERVISED_DESIGN.md for full design.
+    # =========================================================================
+    'phase2_enabled': False,              # Master toggle
+    'phase2_start': 'auto',              # Epoch number or 'auto' (activate when exact >= threshold)
+    'phase2_auto_min_exact': 0.80,       # Auto-activation threshold for exact match
+    'phase2_interval': 4,                 # Run Phase 2 every N supervised epochs
+    'phase2_max_weight': 0.1,            # Max total Phase 2 loss weight (ramped up over warmup)
+    'phase2_warmup': 50,                  # Epochs to linearly ramp Phase 2 weight from 0 to max
+    'phase2_n_samples': 'auto',           # 'auto' = z-vectors per sub-epoch, scales with VRAM: clamp(3.2*GB, 32, 512)
+    'phase2_noise_schedule': [0.02, 0.05, 0.08, 0.1],  # Perturbation sigma schedule [start, ..., end]
+    'phase2_noise_warmup_epochs': 200,    # Epochs to ramp noise from min to max sigma
+    'phase2_lr_factor': 0.1,             # Phase 2 LR = main_LR * this (prevents destabilizing converged heads)
+    'phase2_max_grad_norm': 0.5,         # Gradient clip for Phase 2 (tighter than Phase 1's 1.0)
+    'phase2_diversity_bonus': 5.0,       # REINFORCE bonus for unique formulas (mode collapse prevention)
+    'phase2_collapse_threshold': 0.3,    # unique_rate < this triggers mode collapse intervention
+    'holdout_eval_interval': 50,          # Mini holdout search every N epochs
+    'holdout_eval_budget': 200,           # Candidates per target in mini holdout search
 }
 
 CONTRASTIVE_DATA_PATH = PROJECT_ROOT / 'data/processed/supercon_fractions_contrastive.csv'
@@ -1792,12 +1829,34 @@ def load_and_prepare_data():
                 except:
                     continue
 
-        # V13.0: numden extraction removed — no longer needed for decoder conditioning.
-        # Fraction info is now implicit in semantic fraction tokens.
-        # Create zero tensors for backward compatibility with dataset/cache structure.
-        element_num_log = torch.zeros(len(formulas), MAX_ELEMENTS, dtype=torch.float32)
-        element_den_log = torch.zeros(len(formulas), MAX_ELEMENTS, dtype=torch.float32)
-        print(f"  V13.0: numden extraction skipped (semantic fraction tokens handle fractions)")
+        # Numden extraction: conditional on tokenizer mode
+        use_semantic = TRAIN_CONFIG.get('use_semantic_fractions', False)
+        if use_semantic:
+            # V13.0: numden not needed — fraction info in semantic fraction tokens
+            element_num_log = torch.zeros(len(formulas), MAX_ELEMENTS, dtype=torch.float32)
+            element_den_log = torch.zeros(len(formulas), MAX_ELEMENTS, dtype=torch.float32)
+            print(f"  V13.0: numden extraction skipped (semantic fraction tokens handle fractions)")
+        else:
+            # V12.41 mode: extract real numden for 37-dim stoich conditioning
+            element_numerators = torch.zeros(len(formulas), MAX_ELEMENTS, dtype=torch.float32)
+            element_denominators = torch.zeros(len(formulas), MAX_ELEMENTS, dtype=torch.float32)
+            for i, formula in enumerate(formulas):
+                if use_canonical:
+                    formula = canonicalize_fractions(formula)
+                if use_int_norm:
+                    formula = normalize_integers_to_fractions(formula)
+                numden = parse_numden_from_formula(formula)
+                if not numden:
+                    continue
+                for j, (num, den) in enumerate(numden):
+                    if j >= MAX_ELEMENTS:
+                        break
+                    if element_mask[i, j]:
+                        element_numerators[i, j] = num
+                        element_denominators[i, j] = den
+            element_num_log = torch.log1p(element_numerators)
+            element_den_log = torch.log1p(element_denominators)
+            print(f"  V12.41: numden extracted for stoich conditioning")
 
         # Create tensors
         tc_tensor = torch.tensor(tc_normalized, dtype=torch.float32).unsqueeze(1)
@@ -2031,6 +2090,8 @@ def create_models(magpie_dim: int, device: torch.device):
     print("Creating Models")
     print("=" * 60)
 
+    # V12.41 compat: Enable numden_head when NOT using semantic fractions
+    use_numden = not TRAIN_CONFIG.get('use_semantic_fractions', False)
     encoder = FullMaterialsVAE(
         n_elements=118,
         element_embed_dim=MODEL_CONFIG['element_embed_dim'],
@@ -2040,7 +2101,8 @@ def create_models(magpie_dim: int, device: torch.device):
         encoder_hidden=MODEL_CONFIG['encoder_hidden'],
         latent_dim=MODEL_CONFIG['latent_dim'],
         decoder_hidden=MODEL_CONFIG['decoder_hidden'],
-        dropout=0.1
+        dropout=0.1,
+        use_numden_head=use_numden,
     ).to(device)
 
     # V14.0: Determine vocab size and stoich input dim based on tokenizer mode
@@ -2198,7 +2260,7 @@ class CombinedLossWithREINFORCE(nn.Module):
         # GPU-native reward config
         # V14.0: Use continuous reward config when enabled
         if TRAIN_CONFIG.get('use_v14_reward', False):
-            self.gpu_reward_config = get_v14_gpu_reward_config(
+            reward_kwargs = dict(
                 use_continuous_reward=True,
                 max_reward=TRAIN_CONFIG.get('v14_max_reward', 100.0),
                 sharpness=TRAIN_CONFIG.get('v14_sharpness', 4.0),
@@ -2208,6 +2270,16 @@ class CombinedLossWithREINFORCE(nn.Module):
                 special_error_penalty=TRAIN_CONFIG.get('v14_special_error_penalty', -0.5),
                 use_phased_curriculum=TRAIN_CONFIG.get('rl_use_phased_curriculum', False),
             )
+            # V12.41 compat: Override token type boundaries for old 148-token vocab
+            if not TRAIN_CONFIG.get('use_semantic_fractions', False):
+                reward_kwargs.update(
+                    v14_element_start=20,   # H=20 through Og=137
+                    v14_element_end=137,
+                    v14_integer_start=138,  # Digits 0-9
+                    v14_integer_end=147,
+                    v14_fraction_start=148,  # Beyond vocab → no fraction tokens
+                )
+            self.gpu_reward_config = get_v14_gpu_reward_config(**reward_kwargs)
             print(f"  [V14] Continuous reward: sharpness={self.gpu_reward_config.sharpness}, "
                   f"element_penalty={self.gpu_reward_config.element_error_penalty}")
         else:
@@ -3281,6 +3353,9 @@ def save_checkpoint(encoder, decoder, epoch, suffix='', entropy_manager=None,
     if TRAIN_CONFIG.get('use_semantic_fractions', False):
         checkpoint_data['tokenizer_vocab_size'] = decoder.vocab_size
         checkpoint_data['stoich_input_dim'] = 13
+    else:
+        # V12.41 mode: 37-dim stoich (fractions + numden + count)
+        checkpoint_data['stoich_input_dim'] = 37
 
     torch.save(checkpoint_data, path)
     print(f"  Saved checkpoint: {path.name}", flush=True)
@@ -3592,6 +3667,57 @@ def cache_z_vectors(encoder, loader, device, epoch, cache_path, dataset_info=Non
             print(f"    Tc overall MAE: {kb['overall_mae_K']:.1f}K")
 
     return cache_data
+
+
+# ============================================================================
+# TOPOLOGY TRACKING
+# ============================================================================
+
+def _run_topology_analysis(cache_path, epoch, full=False):
+    """
+    Run topology analysis on a z-cache file.
+
+    Called after z-cache saves when topology_tracking is enabled.
+    Compact mode (~15s) appends to topology_summary.jsonl.
+    Full mode (~30s) also saves per-sample metadata .pt file.
+    """
+    try:
+        from superconductor.analysis.topology_analyzer import TopologyAnalyzer
+
+        analyzer = TopologyAnalyzer(
+            k=TRAIN_CONFIG.get('topology_k', 20),
+            n_clusters=TRAIN_CONFIG.get('topology_n_clusters', 9),
+            use_gpu=True,
+        )
+
+        cache = analyzer.load_z_cache(cache_path)
+        z = cache['z_vectors'].numpy()
+        is_sc = cache['is_sc'].numpy()
+        tc_values = cache.get('tc_values', None)
+        if tc_values is not None:
+            tc_values = tc_values.numpy()
+
+        jsonl_path = PROJECT_ROOT / 'outputs' / 'topology_summary.jsonl'
+
+        if full:
+            snapshot, metadata = analyzer.analyze_full(z, is_sc, tc_values=tc_values, epoch=epoch)
+            meta_path = PROJECT_ROOT / 'outputs' / f'topology_metadata_epoch{epoch:04d}.pt'
+            analyzer.save_full_metadata(metadata, meta_path)
+            print(f"  Topology (full): {snapshot.compute_time_seconds:.1f}s "
+                  f"| dim={snapshot.intrinsic_dim_mle:.1f} "
+                  f"| sep={snapshot.sc_nonsc_separation_ratio:.3f} "
+                  f"| sil={snapshot.silhouette_score_sc:.3f}")
+        else:
+            snapshot = analyzer.analyze_compact(z, is_sc, epoch=epoch)
+            print(f"  Topology (compact): {snapshot.compute_time_seconds:.1f}s "
+                  f"| dim={snapshot.intrinsic_dim_mle:.1f} "
+                  f"| sep={snapshot.sc_nonsc_separation_ratio:.3f} "
+                  f"| sil={snapshot.silhouette_score_sc:.3f}")
+
+        analyzer.save_snapshot(snapshot, jsonl_path)
+
+    except Exception as e:
+        print(f"  Topology analysis error: {e}")
 
 
 def log_training_metrics(epoch, metrics, log_path, true_eval=None):
@@ -4129,9 +4255,18 @@ def evaluate_true_autoregressive(encoder, decoder, loader, device, max_samples=1
         fraction_pred = encoder_out.get('fraction_pred')
         element_count_pred = encoder_out.get('element_count_pred')
 
-        # Assemble stoich_pred for decoder generation: fractions(12) + count(1) = 13 dims
+        # Assemble stoich_pred for decoder generation
+        # V12.41: 37 dims (fractions + numden + count). V13.0+: 13 dims (fractions + count).
+        _use_semantic = TRAIN_CONFIG.get('use_semantic_fractions', False)
         if fraction_pred is not None and element_count_pred is not None:
-            stoich_pred_eval = torch.cat([fraction_pred, element_count_pred.unsqueeze(-1)], dim=-1)
+            if _use_semantic:
+                stoich_pred_eval = torch.cat([fraction_pred, element_count_pred.unsqueeze(-1)], dim=-1)
+            else:
+                numden_pred = encoder_out.get('numden_pred')
+                if numden_pred is not None:
+                    stoich_pred_eval = torch.cat([fraction_pred, numden_pred, element_count_pred.unsqueeze(-1)], dim=-1)
+                else:
+                    stoich_pred_eval = torch.cat([fraction_pred, element_count_pred.unsqueeze(-1)], dim=-1)
         else:
             stoich_pred_eval = None
 
@@ -4212,8 +4347,12 @@ def evaluate_true_autoregressive(encoder, decoder, loader, device, max_samples=1
                     'family_composed_14': _family.detach() if _family is not None else None,
                 }
             # V14.3: Type masks for hard vocab masking during AR generation
-            if TRAIN_CONFIG.get('use_type_masking_ar', False) and v13_tokenizer is not None:
-                _ar_type_masks = v13_tokenizer.get_type_masks(device=str(device))
+            if TRAIN_CONFIG.get('use_type_masking_ar', False):
+                if v13_tokenizer is not None:
+                    _ar_type_masks = v13_tokenizer.get_type_masks(device=str(device))
+                else:
+                    from superconductor.models.autoregressive_decoder import get_v12_type_masks
+                    _ar_type_masks = get_v12_type_masks(device=str(device))
 
         # Generate autoregressively (TRUE inference - no teacher forcing)
         generated_tokens, _, _ = decoder.generate_with_kv_cache(
@@ -4680,6 +4819,9 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
     encoder.train()
     decoder.train()
 
+    # Cache semantic fractions flag for stoich assembly (V12.41 compat)
+    _use_semantic = TRAIN_CONFIG.get('use_semantic_fractions', False)
+
     # V12.40: Resolve stop_loss_weight (parameter for skip scheduling, fallback to config)
     if stop_loss_weight is None:
         stop_loss_weight = TRAIN_CONFIG.get('stop_loss_weight', 0.0)
@@ -4711,6 +4853,7 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
     total_a5_z_mse = 0  # V12.43
     total_a5_tc_mse = 0  # V12.43
     total_type_loss = 0  # V14.3
+    total_numden_loss = 0  # V12.41: Numden head MSE loss
     total_type_correct = 0  # V14.3: Type head accuracy tracking
     total_type_total = 0    # V14.3: Total non-PAD type positions
     total_sc_exact = 0
@@ -4729,8 +4872,13 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
 
     # V14.3: Precompute type masks once for RLOO type-constrained sampling
     _rloo_type_masks = None
-    if TRAIN_CONFIG.get('use_type_masking_ar', False) and v13_tokenizer is not None:
-        _rloo_type_masks = v13_tokenizer.get_type_masks(device=str(device))
+    if TRAIN_CONFIG.get('use_type_masking_ar', False):
+        if v13_tokenizer is not None:
+            _rloo_type_masks = v13_tokenizer.get_type_masks(device=str(device))
+        else:
+            # V12.41 compat: Use old 148-token vocab type masks
+            from superconductor.models.autoregressive_decoder import get_v12_type_masks
+            _rloo_type_masks = get_v12_type_masks(device=str(device))
 
     # Zero gradients at start of accumulation
     enc_opt.zero_grad()
@@ -4755,7 +4903,7 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
         elem_idx, elem_frac, elem_mask, tokens, tc, magpie, is_sc, labels = batch_tensors[:8]
         hp_labels = batch_tensors[8] if len(batch_tensors) > 8 else torch.zeros_like(is_sc, dtype=torch.float32)
         family_labels = batch_tensors[9] if len(batch_tensors) > 9 else None
-        # Indices 10, 11 were numden tensors (removed in V13.0) — skip to comp_targets
+        # Indices 10, 11 are numden tensors (real data in V12.41 mode, zeros in V13.0+)
         comp_targets = batch_tensors[12] if len(batch_tensors) > 12 else None
 
         sc_mask = is_sc.bool()  # True = superconductor
@@ -4792,16 +4940,32 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
             # V12.28: Tc classification logits
             tc_class_logits = encoder_out.get('tc_class_logits')
 
-            # Stoichiometry predictions for loss and conditioning: fractions(12) + count(1) = 13 dims
+            # Stoichiometry predictions for loss and conditioning
+            # V12.41: fractions(12) + numden(24) + count(1) = 37 dims
+            # V13.0+: fractions(12) + count(1) = 13 dims
             fraction_pred = encoder_out.get('fraction_pred')
             element_count_pred = encoder_out.get('element_count_pred')
             if fraction_pred is not None and element_count_pred is not None:
-                pred_stoich = torch.cat([fraction_pred, element_count_pred.unsqueeze(-1)], dim=-1)  # [batch, 13]
+                if _use_semantic:
+                    pred_stoich = torch.cat([fraction_pred, element_count_pred.unsqueeze(-1)], dim=-1)  # [batch, 13]
+                else:
+                    numden_pred = encoder_out.get('numden_pred')
+                    if numden_pred is not None:
+                        pred_stoich = torch.cat([fraction_pred, numden_pred, element_count_pred.unsqueeze(-1)], dim=-1)  # [batch, 37]
+                    else:
+                        pred_stoich = torch.cat([fraction_pred, element_count_pred.unsqueeze(-1)], dim=-1)  # [batch, 13] fallback
 
                 # Stoich conditioning teacher forcing
                 if stoich_cond_tf > 0:
                     gt_count = elem_mask.sum(dim=1).float()
-                    gt_stoich = torch.cat([elem_frac, gt_count.unsqueeze(-1)], dim=-1)  # [batch, 13]
+                    if _use_semantic:
+                        gt_stoich = torch.cat([elem_frac, gt_count.unsqueeze(-1)], dim=-1)  # [batch, 13]
+                    else:
+                        # V12.41: include numden ground truth — batch_tensors[10]=num_log, [11]=den_log
+                        gt_num_log = batch_tensors[10]  # [batch, 12]
+                        gt_den_log = batch_tensors[11]  # [batch, 12]
+                        gt_numden = torch.cat([gt_num_log, gt_den_log], dim=-1)  # [batch, 24]
+                        gt_stoich = torch.cat([elem_frac, gt_numden, gt_count.unsqueeze(-1)], dim=-1)  # [batch, 37]
                     stoich_pred = stoich_cond_tf * gt_stoich + (1.0 - stoich_cond_tf) * pred_stoich
                 else:
                     stoich_pred = pred_stoich
@@ -4852,7 +5016,12 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
             type_loss_val = torch.tensor(0.0, device=device)
             if token_type_loss_weight > 0 and type_logits is not None:
                 # Compute type targets from formula_targets using tokenizer LUT
-                type_targets = v13_tokenizer.compute_token_type_targets(formula_targets)
+                if v13_tokenizer is not None:
+                    type_targets = v13_tokenizer.compute_token_type_targets(formula_targets)
+                else:
+                    # V12.41 compat: Use old 148-token vocab type targets
+                    from superconductor.models.autoregressive_decoder import compute_v12_token_type_targets
+                    type_targets = compute_v12_token_type_targets(formula_targets)
                 # Mask: only compute on valid (non-PAD) positions
                 type_mask = (formula_targets != PAD_IDX)
                 # Flatten for CE: [batch*seq_len, N_TOKEN_TYPES] vs [batch*seq_len]
@@ -4864,6 +5033,20 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
                     type_preds_flat = type_logits_flat.argmax(dim=-1)
                     total_type_correct += (type_preds_flat == type_targets_flat).sum().item()
                     total_type_total += type_targets_flat.numel()
+
+            # V12.41: Numden prediction loss (MSE in log1p space, only when numden_head is active)
+            numden_loss_val = torch.tensor(0.0, device=device)
+            numden_weight = TRAIN_CONFIG.get('numden_weight', 1.0)
+            numden_pred = encoder_out.get('numden_pred')
+            if numden_pred is not None and not _use_semantic and numden_weight > 0:
+                gt_num_log = batch_tensors[10]  # [batch, 12]
+                gt_den_log = batch_tensors[11]  # [batch, 12]
+                gt_numden = torch.cat([gt_num_log, gt_den_log], dim=-1)  # [batch, 24]
+                # MSE over valid element positions only, normalized per sample
+                mask_24 = torch.cat([elem_mask, elem_mask], dim=-1).float()  # [batch, 24]
+                n_valid = elem_mask.float().sum(dim=1, keepdim=True).clamp(min=1)  # [batch, 1]
+                numden_loss_val = ((numden_pred - gt_numden) ** 2 * mask_24).sum(dim=1) / n_valid.squeeze(-1)
+                numden_loss_val = numden_loss_val.mean()
 
             # V12.30: Stop-prediction loss (BCE on stop head)
             stop_loss_val = torch.tensor(0.0, device=device)
@@ -5023,6 +5206,7 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
                         + theory_weight * theory_loss_val
                         + stop_loss_weight * stop_loss_val
                         + token_type_loss_weight * type_loss_val  # V14.3
+                        + numden_weight * numden_loss_val  # V12.41
                         + physics_z_loss_val  # V12.31
                         + family_loss_weight * family_loss_val)  # V12.32
 
@@ -5056,6 +5240,7 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
                         + theory_weight * theory_loss_val
                         + stop_loss_weight * stop_loss_val
                         + token_type_loss_weight * type_loss_val  # V14.3
+                        + numden_weight * numden_loss_val  # V12.41
                         + physics_z_loss_val  # V12.31
                         + family_loss_weight * family_loss_val)  # V12.32
 
@@ -5138,6 +5323,7 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
                         theory_weight * theory_loss_val +
                         stop_loss_weight * stop_loss_val +
                         token_type_loss_weight * type_loss_val +  # V14.3
+                        numden_weight * numden_loss_val +  # V12.41
                         physics_z_loss_val +  # V12.31
                         family_loss_weight * family_loss_val)  # V12.32
 
@@ -5249,6 +5435,7 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
         total_a5_z_mse += loss_dict.get('a5_z_mse', torch.tensor(0.0)).item()  # V12.43
         total_a5_tc_mse += loss_dict.get('a5_tc_mse', torch.tensor(0.0)).item()  # V12.43
         total_type_loss += type_loss_val.item() if torch.is_tensor(type_loss_val) else type_loss_val  # V14.3
+        total_numden_loss += numden_loss_val.item() if torch.is_tensor(numden_loss_val) else numden_loss_val  # V12.41
         z_norm_val = z.detach().float().norm(dim=1).mean().item()
         if not math.isnan(z_norm_val):
             total_z_norm += z_norm_val
@@ -5317,6 +5504,7 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
         'stop_loss': total_stop_loss / n_batches,  # V12.30
         'type_loss': total_type_loss / n_batches,  # V14.3
         'type_accuracy': total_type_correct / max(total_type_total, 1),  # V14.3: Type head accuracy
+        'numden_loss': total_numden_loss / n_batches,  # V12.41: Numden head MSE
         'physics_z_loss': total_physics_z_loss / n_batches,  # V12.31
         'family_loss': total_family_loss / n_batches,  # V12.32
         'constraint_zoo_loss': total_constraint_zoo_loss / n_batches,  # V12.43
@@ -5814,6 +6002,9 @@ def train():
     print(f"  Z-caching: {TRAIN_CONFIG.get('cache_z_vectors', False)} "
           f"(interval={TRAIN_CONFIG.get('z_cache_interval', 0)}, "
           f"path={TRAIN_CONFIG.get('z_cache_path', 'outputs/latent_cache.pt')})")
+    print(f"  Topology tracking: {TRAIN_CONFIG.get('topology_tracking', False)} "
+          f"(k={TRAIN_CONFIG.get('topology_k', 20)}, "
+          f"full_on_best={TRAIN_CONFIG.get('topology_full_on_best', True)})")
     print(f"\nLoss weights (final):")
     print(f"  Formula: {TRAIN_CONFIG['formula_weight']}")
     print(f"  Tc: {TRAIN_CONFIG['tc_weight']}" +
@@ -6178,6 +6369,49 @@ def train():
     physz_activation_exact = None  # Exact match when PhysZ was (re)activated — regression baseline
     physz_current_weight_scale = 1.0  # Regression guard multiplier (1.0 = full, halved on regression)
     physz_paused = False  # True if regression guard has paused PhysZ entirely
+
+    # Phase 2: Self-supervised training orchestrator
+    phase2_runner = None
+    if TRAIN_CONFIG.get('phase2_enabled', False):
+        phase2_config = SelfSupervisedConfig.from_train_config(TRAIN_CONFIG)
+
+        # Load known formulas for novel discovery tracking
+        _p2_known_formulas = set()
+        _p2_holdout_formulas = set()
+        try:
+            import pandas as _p2_pd
+            _p2_data_path = PROJECT_ROOT / 'data/processed/supercon_fractions_contrastive.csv'
+            if not _p2_data_path.exists():
+                _p2_data_path = DATA_PATH
+            _p2_known_formulas = set(_p2_pd.read_csv(_p2_data_path, usecols=['formula'])['formula'].tolist())
+        except Exception as _p2_e:
+            print(f"  [Phase 2] Warning: could not load training formulas: {_p2_e}")
+        try:
+            import json as _p2_json
+            _p2_holdout_path = PROJECT_ROOT / 'data/GENERATIVE_HOLDOUT_DO_NOT_TRAIN.json'
+            if _p2_holdout_path.exists():
+                with open(_p2_holdout_path) as _p2_hf:
+                    _p2_holdout_data = _p2_json.load(_p2_hf)
+                    _p2_holdout_formulas = {h['formula'] for h in _p2_holdout_data.get('holdout_samples', [])}
+        except Exception as _p2_e:
+            print(f"  [Phase 2] Warning: could not load holdout formulas: {_p2_e}")
+
+        phase2_runner = SelfSupervisedEpoch(
+            config=phase2_config,
+            encoder=encoder,
+            decoder=decoder,
+            device=device,
+            v13_tokenizer=v13_tokenizer,
+            max_formula_len=TRAIN_CONFIG.get('max_formula_len', 60),
+            known_formulas=_p2_known_formulas,
+            holdout_formulas=_p2_holdout_formulas,
+            discovery_output_path=str(OUTPUT_DIR / 'phase2_discoveries.jsonl'),
+        )
+        print(f"Phase 2 Self-Supervised: Enabled "
+              f"(start={phase2_config.start}, interval={phase2_config.interval}, "
+              f"max_weight={phase2_config.max_weight}, "
+              f"n_samples={phase2_config.n_samples or 'auto'}, "
+              f"lr_factor={phase2_config.lr_factor})")
 
     # V14.2: Pre-training baseline eval — verify loaded model quality before any training
     # This catches migration/loading problems before wasting an epoch.
@@ -6943,6 +7177,82 @@ def train():
         training_log_path = OUTPUT_DIR / 'training_log.csv'
         log_training_metrics(epoch, metrics, training_log_path, true_eval=true_eval)
 
+        # =====================================================================
+        # Phase 2: Self-Supervised Sub-Epoch (runs every N supervised epochs)
+        # =====================================================================
+        if phase2_runner is not None:
+            # Check activation condition
+            phase2_runner.should_activate(epoch, metrics['exact_match'])
+
+            if phase2_runner.is_active and phase2_runner.should_run_this_epoch(epoch):
+                print(f"\n  [Phase 2] Running self-supervised sub-epoch "
+                      f"(epoch {epoch}, Phase 2 epoch "
+                      f"{epoch - phase2_runner.activation_epoch})...", flush=True)
+
+                # Load or update z-cache for sampler
+                z_cache_path_p2 = PROJECT_ROOT / TRAIN_CONFIG.get(
+                    'z_cache_path', 'outputs/latent_cache.pt'
+                )
+                if z_cache_path_p2.exists():
+                    try:
+                        phase2_runner.load_z_cache(str(z_cache_path_p2))
+                    except Exception as e:
+                        print(f"  [Phase 2] Warning: could not load z-cache: {e}", flush=True)
+
+                try:
+                    main_lr = enc_opt.param_groups[0]['lr']
+                    phase2_metrics = phase2_runner.run(
+                        epoch=epoch,
+                        current_exact=metrics['exact_match'],
+                        enc_opt=enc_opt,
+                        dec_opt=dec_opt,
+                        main_lr=main_lr,
+                        use_amp=TRAIN_CONFIG.get('use_amp', True),
+                        amp_dtype=amp_dtype,
+                        scaler=scaler,
+                        stop_boost=TRAIN_CONFIG.get('stop_boost', 0.0),
+                        hard_stop_threshold=TRAIN_CONFIG.get('hard_stop_threshold', 0.0),
+                    )
+
+                    # Log Phase 2 metrics
+                    if not phase2_metrics.get('phase2_skipped', False):
+                        p2_time = phase2_metrics.get('phase2_time', 0)
+                        p2_valid = phase2_metrics.get('phase2_n_valid', 0)
+                        p2_sampled = phase2_metrics.get('phase2_n_sampled', 0)
+                        p2_degen = phase2_metrics.get('phase2_n_degenerate', 0)
+                        p2_loss = phase2_metrics.get('phase2_total_loss', 0)
+                        p2_z_mse = phase2_metrics.get('phase2_z_mse', 0)
+                        p2_unique_rate = phase2_metrics.get('phase2_unique_rate', 0)
+                        print(f"  [Phase 2] Done in {p2_time:.1f}s | "
+                              f"valid={p2_valid}/{p2_sampled} "
+                              f"(degen={p2_degen}, unique_rate={p2_unique_rate:.2f}) | "
+                              f"loss={p2_loss:.4f} | z_mse={p2_z_mse:.4f} | "
+                              f"weight={phase2_metrics.get('phase2_weight', 0):.4f}",
+                              flush=True)
+
+                        # Log Phase 2 metrics to separate CSV
+                        phase2_log_path = OUTPUT_DIR / 'phase2_log.csv'
+                        _p2_row = {'epoch': epoch, **phase2_metrics}
+                        import csv as _csv_p2
+                        _p2_exists = phase2_log_path.exists()
+                        with open(phase2_log_path, 'a', newline='') as _p2f:
+                            _p2w = _csv_p2.DictWriter(_p2f, fieldnames=list(_p2_row.keys()))
+                            if not _p2_exists:
+                                _p2w.writeheader()
+                            _p2w.writerow(_p2_row)
+                    else:
+                        print(f"  [Phase 2] Skipped (weight=0)", flush=True)
+
+                except Exception as e:
+                    print(f"  [Phase 2] ERROR: {e}", flush=True)
+                    import traceback
+                    traceback.print_exc()
+                    # Phase 2 errors should never crash training
+
+            elif phase2_runner.is_active and epoch == phase2_runner.activation_epoch:
+                print(f"\n  [Phase 2] ACTIVATED at epoch {epoch} "
+                      f"(exact={metrics['exact_match']*100:.1f}%)", flush=True)
+
         # Save checkpoints (V12.10: include full training state)
         _manifest = _build_current_manifest()  # V12.29
         checkpoint_kwargs = dict(
@@ -6972,6 +7282,11 @@ def train():
                                stop_boost=TRAIN_CONFIG.get('stop_boost', 0.0),
                                hard_stop_threshold=TRAIN_CONFIG.get('hard_stop_threshold', 0.0))
 
+                # Topology tracking on best checkpoint
+                if TRAIN_CONFIG.get('topology_tracking', False):
+                    _run_topology_analysis(z_cache_path, epoch,
+                                          full=TRAIN_CONFIG.get('topology_full_on_best', True))
+
         # V12.17: Cache z-vectors at configured interval (or every epoch if configured)
         z_cache_interval = TRAIN_CONFIG.get('z_cache_interval', 0)
         cache_every_epoch = TRAIN_CONFIG.get('z_cache_every_epoch', False)
@@ -6987,6 +7302,10 @@ def train():
                            manifest=_manifest,
                            stop_boost=TRAIN_CONFIG.get('stop_boost', 0.0),
                            hard_stop_threshold=TRAIN_CONFIG.get('hard_stop_threshold', 0.0))
+
+            # Topology tracking on interval caches (compact only)
+            if TRAIN_CONFIG.get('topology_tracking', False):
+                _run_topology_analysis(epoch_cache_path, epoch, full=False)
 
         if (epoch + 1) % TRAIN_CONFIG['checkpoint_interval'] == 0:
             save_checkpoint(encoder, decoder, epoch, **checkpoint_kwargs)

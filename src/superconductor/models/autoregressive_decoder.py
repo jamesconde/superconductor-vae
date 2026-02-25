@@ -105,6 +105,68 @@ SPECIAL_CHARS = set([
 ])
 
 
+# ============================================================================
+# V12.41 COMPAT: Token type mapping for old 148-token vocab
+# ============================================================================
+# These functions provide the same type classification that V13+ gets from
+# FractionAwareTokenizer, but for the original 148-token character-level vocab.
+# Used by the token_type_head and hard type masking during AR generation.
+# ============================================================================
+
+# V12 vocab layout: SPECIAL[0:20] + ELEMENTS[20:138] + DIGITS[138:148]
+_V12_ELEMENT_START = 20   # First element token (H)
+_V12_ELEMENT_END = 137    # Last element token (Og)
+_V12_DIGIT_START = 138    # First digit token (0)
+_V12_DIGIT_END = 147      # Last digit token (9)
+
+
+def get_v12_type_masks(device='cpu'):
+    """Build [N_TOKEN_TYPES, VOCAB_SIZE] type masks for old 148-token vocab.
+
+    Token types (matching fraction_tokenizer.py constants):
+        0 = TOKEN_TYPE_ELEMENT
+        1 = TOKEN_TYPE_INTEGER
+        2 = TOKEN_TYPE_FRACTION (empty — no single-token fractions in V12 vocab)
+        3 = TOKEN_TYPE_SPECIAL
+        4 = TOKEN_TYPE_EOS
+    """
+    from superconductor.tokenizer.fraction_tokenizer import (
+        N_TOKEN_TYPES, TOKEN_TYPE_ELEMENT, TOKEN_TYPE_INTEGER,
+        TOKEN_TYPE_FRACTION, TOKEN_TYPE_SPECIAL, TOKEN_TYPE_EOS
+    )
+    masks = torch.zeros(N_TOKEN_TYPES, VOCAB_SIZE, dtype=torch.bool, device=device)
+    for tid in range(VOCAB_SIZE):
+        if tid == END_IDX:
+            masks[TOKEN_TYPE_EOS, tid] = True
+        elif _V12_ELEMENT_START <= tid <= _V12_ELEMENT_END:
+            masks[TOKEN_TYPE_ELEMENT, tid] = True
+        elif _V12_DIGIT_START <= tid <= _V12_DIGIT_END:
+            masks[TOKEN_TYPE_INTEGER, tid] = True
+        else:
+            masks[TOKEN_TYPE_SPECIAL, tid] = True
+    # TOKEN_TYPE_FRACTION (2) stays all-False — no single-token fractions in V12 vocab
+    return masks
+
+
+def compute_v12_token_type_targets(token_ids: torch.Tensor) -> torch.Tensor:
+    """Compute type class targets for old 148-token vocab.
+
+    Args:
+        token_ids: [batch, seq_len] token indices from V12 vocab.
+
+    Returns:
+        [batch, seq_len] type class indices (0-4).
+    """
+    from superconductor.tokenizer.fraction_tokenizer import (
+        TOKEN_TYPE_ELEMENT, TOKEN_TYPE_INTEGER, TOKEN_TYPE_SPECIAL, TOKEN_TYPE_EOS
+    )
+    targets = torch.full_like(token_ids, TOKEN_TYPE_SPECIAL)
+    targets[token_ids == END_IDX] = TOKEN_TYPE_EOS
+    targets[(token_ids >= _V12_ELEMENT_START) & (token_ids <= _V12_ELEMENT_END)] = TOKEN_TYPE_ELEMENT
+    targets[(token_ids >= _V12_DIGIT_START) & (token_ids <= _V12_DIGIT_END)] = TOKEN_TYPE_INTEGER
+    return targets
+
+
 def tokenize_formula(formula: str) -> List[str]:
     """
     Tokenize a chemical formula into elements, numbers, and special symbols.

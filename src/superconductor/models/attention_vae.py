@@ -357,7 +357,8 @@ class FullMaterialsVAE(nn.Module):
         encoder_hidden: List[int] = [512, 256],
         latent_dim: int = 2048,
         decoder_hidden: List[int] = [256, 512],
-        dropout: float = 0.1
+        dropout: float = 0.1,
+        use_numden_head: bool = False,
     ):
         super().__init__()
 
@@ -514,14 +515,27 @@ class FullMaterialsVAE(nn.Module):
         )
 
         # =====================================================================
-        # NUMERATOR/DENOMINATOR PREDICTION HEAD — REMOVED in V13.0
+        # NUMERATOR/DENOMINATOR PREDICTION HEAD (V12.38-V12.41)
         # =====================================================================
-        # V12.38-V12.41: numden_head predicted raw (num, den) in log1p space for
-        # decoder conditioning. V13.0 removes this because fraction prediction is
-        # now handled by the decoder's cross-entropy over semantic fraction tokens.
-        # The numden signal is implicit in the fraction tokens themselves.
-        # Old checkpoints with numden_head weights can be loaded with strict=False.
+        # Predicts raw (num, den) in log1p space for decoder stoich conditioning.
+        # Enabled when use_numden_head=True (V12.41 mode with 37-dim stoich).
+        # V13.0+: Disabled because fraction prediction is handled by semantic
+        # fraction tokens. Old checkpoints load with strict=False.
+        # Architecture matches V12.41 checkpoint: [512,2048]->[512]LN->[256,512]->[256]LN->[24,256]
         # =====================================================================
+        self.use_numden_head = use_numden_head
+        if use_numden_head:
+            self.numden_head = nn.Sequential(
+                nn.Linear(latent_dim, 512),
+                nn.LayerNorm(512),
+                nn.GELU(),
+                nn.Dropout(0.1),
+                nn.Linear(512, 256),
+                nn.LayerNorm(256),
+                nn.GELU(),
+                nn.Dropout(0.1),
+                nn.Linear(256, 24),  # 12 numerators + 12 denominators (in log1p space)
+            )
 
         # =====================================================================
         # HIGH-PRESSURE PREDICTION HEAD (V12.19)
@@ -725,9 +739,9 @@ class FullMaterialsVAE(nn.Module):
         fraction_pred = fraction_output[:, :self.max_elements]  # [batch, max_elements]
         element_count_pred = fraction_output[:, -1]  # [batch]
 
-        # V13.0: numden_head removed — fraction info now in semantic fraction tokens
-        # numden_pred kept as None for backward compatibility with loss function signatures
-        numden_pred = None
+        # V12.41: numden_head predicts (num, den) in log1p space for decoder stoich conditioning
+        # V13.0+: numden_head disabled — fraction info in semantic fraction tokens
+        numden_pred = self.numden_head(enc_out['z']) if self.use_numden_head else None
 
         # High-pressure prediction (V12.19)
         hp_pred = self.hp_head(enc_out['z']).squeeze(-1)  # [batch] logits

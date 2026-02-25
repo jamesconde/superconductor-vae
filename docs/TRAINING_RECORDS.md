@@ -4,6 +4,136 @@ Chronological record of training runs, architecture changes, and optimization de
 
 ---
 
+## V12.41 Backward Compatibility Mode (2026-02-24)
+
+### Problem
+
+The V12.41 checkpoint (epoch 3292, best_exact=85.4%, trained on A100) remains the best-performing model for autoregressive formula generation. Since V12.41, several architecture changes were made (V13.0 semantic fractions, V14.0 isotopes, V14.3 token type head + heads memory, V15.0 memory bottleneck) that changed the vocab (148→4647), stoich dims (37→13), and decoder structure. The current codebase assumed V13+ mode, making it impossible to resume training from V12.41.
+
+### Solution: Config-Driven V12.41 Compatibility
+
+Made the codebase config-driven so V12.41 can load and train with worthwhile newer features while disabling incompatible ones.
+
+**Features KEPT (new heads, random init, learn from scratch):**
+- Token type classifier head (V14.3) — with V12 vocab type mapping
+- Enriched decoder memory / heads_to_memory (V14.3) — vocab-agnostic
+- RL auto-scaling (V14.1) — config-only
+- V14 continuous reward — with V12 token range overrides
+- Hierarchical family head (V15.0) — already in V12.41 checkpoint
+
+**Features DISABLED (incompatible with 148-token vocab):**
+- Semantic fraction tokenization (V13.0) — `use_semantic_fractions: False`
+- Isotope tokens (V14.0) — `use_isotope_tokens: False`
+- Memory bottleneck (V15.0) — `memory_bottleneck_dim: 0`
+- Migration LR boost (V14.1) — not needed
+
+### Config Defaults Changed
+
+| Config Key | Old Default | New Default | Reason |
+|------------|-------------|-------------|--------|
+| `use_semantic_fractions` | `True` | `False` | V12.41 uses 148-token vocab |
+| `use_isotope_tokens` | `True` | `False` | Requires semantic fractions |
+| `memory_bottleneck_dim` | `1024` | `0` | V12.41 uses direct MLP |
+| `max_formula_len` | `30` | `60` | Digit-by-digit needs longer sequences |
+| `numden_weight` | (new) | `1.0` | MSE loss for numden_head |
+
+### Architecture Changes
+
+1. **`FullMaterialsVAE`**: Added `use_numden_head` parameter. When `True`, creates the numden_head (matching V12.41 checkpoint shapes: 512→256→24). Computes `numden_pred` in forward().
+
+2. **`autoregressive_decoder.py`**: Added `get_v12_type_masks()` and `compute_v12_token_type_targets()` for token type classification with old 148-token vocab.
+
+3. **`train_v12_clean.py`**:
+   - Conditional numden data extraction (real extraction vs zeros)
+   - 37-dim stoich assembly (fractions + numden + count) in training loop, eval, and RLOO
+   - Numden MSE loss added to all 3 loss branches
+   - V14 reward token range overrides for V12 vocab layout
+   - Type mask/target fallbacks when `v13_tokenizer is None`
+   - Checkpoint saves `stoich_input_dim=37` in V12.41 mode
+
+### Files Modified
+
+| File | Changes |
+|------|---------|
+| `src/superconductor/models/attention_vae.py` | `use_numden_head` param, conditional numden_head creation, numden_pred in forward() |
+| `src/superconductor/models/autoregressive_decoder.py` | `get_v12_type_masks()`, `compute_v12_token_type_targets()` |
+| `scripts/train_v12_clean.py` | Config defaults, conditional numden extraction, 37-dim stoich assembly, numden loss, type fallbacks, V14 reward overrides, checkpoint stoich_input_dim |
+
+### Expected Checkpoint Loading Behavior
+
+- **Loaded from V12.41**: numden_head weights load successfully. New heads (token_type_head, heads_to_memory) appear as "missing keys" (expected — random init). skip_to_memory appears as "unexpected keys" (expected — `strict=False` ignores).
+- **37-dim stoich**: Decoder's stoich_to_memory expects 37-dim input, matching V12.41 architecture.
+- **true_exact**: Should read ~85.4% immediately after loading (no architecture mismatch).
+
+---
+
+## Phase 2: Self-Supervised Training System (2026-02-24)
+
+### Problem
+
+V12.41 achieves 86.5% TRUE AR exact match on training data but only 22.2% exact match on 45 holdout superconductors. The generalization gap is the core problem. V13-V15 semantic fraction experiments failed (<1% AR) and were abandoned.
+
+### Solution: Interleaved Self-Supervised Sub-Epochs
+
+Phase 2 uses the model's own generations as self-supervised signal to improve z-space consistency at novel points, without requiring new labeled data. Key design:
+
+- **When**: Runs every 4 supervised epochs, after main `train_epoch()` completes
+- **Activation**: Auto-activates when training exact match >= 80%
+- **Weight**: Linear warmup from 0 to 0.1 over 50 epochs
+
+### Z-Space Sampling (3 strategies)
+
+| Strategy | Budget | Method |
+|----------|--------|--------|
+| Perturbation (60%) | ~154 samples | Add Gaussian noise to training z-vectors (sigma ramp 0.02→0.1) |
+| SLERP (25%) | ~64 samples | Spherical interpolation between same-family pairs |
+| PCA Walk (15%) | ~38 samples | Walk along top-20 PCs at +/- sigma steps |
+
+### Four Loss Signals
+
+1. **Extended Round-Trip**: Re-encode generated formulas, compare z/Tc with originals (encoder gradients)
+2. **Multi-Head Consistency**: Ensure SC classifier, Tc, Tc bucket, and family heads agree (encoder head gradients)
+3. **Physics Constraints**: A3 site occupancy + A6 charge balance on generated formulas (encoder gradients)
+4. **REINFORCE Round-Trip**: Reward = cosine_sim(z, z_recon) * validity (decoder gradients)
+
+### Safety Guards
+
+- Weight ramp (0→0.1 over 50 epochs)
+- Exact match monitor (halve weight if training exact drops >2%)
+- Separate LR (0.1x main LR)
+- Tight gradient clipping (0.5 vs 1.0 for Phase 1)
+- Frequency control (every 4 epochs)
+- Mode collapse detection (unique rate < 0.3 → temp boost + diversity bonus)
+
+### New Files
+
+| File | Purpose |
+|------|---------|
+| `src/superconductor/training/self_supervised.py` | Phase 2 orchestrator |
+| `src/superconductor/losses/round_trip_loss.py` | + `ExtendedRoundTripConsistencyLoss` |
+| `scripts/analysis/phase2_dashboard.py` | Monitoring dashboard |
+| `docs/PHASE2_SELF_SUPERVISED_DESIGN.md` | Full design document |
+
+### Config
+
+All Phase 2 config keys prefixed with `phase2_` in TRAIN_CONFIG. Set `phase2_enabled: True` to activate. Metrics logged to `outputs/phase2_log.csv`.
+
+### Holdout Integration
+
+- Mini holdout search (200 candidates/target) via `--mini` flag on `holdout_search_targeted.py`
+- Full holdout search on new best checkpoints
+
+### Success Milestones
+
+| Milestone | Metric |
+|-----------|--------|
+| Alpha | Round-trip Z-MSE < 0.1 |
+| Beta | Holdout exact > 30% (from 22.2%) |
+| Gold | Holdout exact > 50% |
+| Complete | All 45 holdout at >= 0.99 similarity |
+
+---
+
 ## V15.3: Revert TF Scheduling — REINFORCE is the AR Trainer (2026-02-23)
 
 ### Finding: 2-Pass Scheduled Sampling is a False Signal
