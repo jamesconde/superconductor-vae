@@ -4,6 +4,115 @@ Chronological record of training runs, architecture changes, and optimization de
 
 ---
 
+## Phase 2: Z-Space Coverage Tracking + State Persistence (2026-02-25)
+
+### Problem
+
+Phase 2 self-supervised training (`ZSpaceSampler`) samples z-vectors uniformly at random from the training cache. This means dense cluster regions get over-sampled while sparse regions are rarely explored. Additionally, Phase 2 state (activation epoch, collapse flags, exact history) was NOT saved to checkpoints — it reset on resume.
+
+### Solution
+
+1. **K-Means Coverage Tracking** (`src/superconductor/training/coverage_tracker.py`):
+   - Partition z-space into 64 clusters via MiniBatchKMeans
+   - Track per-cluster visit counts with exponential decay (0.995/sub-epoch)
+   - Bias sampling toward underexplored clusters: `w = 1/(1+visits)^temperature`
+   - Track per-cluster quality (valid formula rate) to identify latent geometry bounds
+
+2. **Phase 2 State Persistence**:
+   - `SelfSupervisedEpoch.get_state()/load_state()` for full state serialization
+   - Saved to checkpoints via `phase2_runner` parameter in `save_checkpoint()`
+   - Includes: activation epoch, collapse flags, exact history, coverage tracker, discovery tracker
+
+### Quality Categories
+- **Garbage clusters** (<10% valid rate): True latent geometry bounds — model can't produce valid formulas
+- **Boundary clusters** (10-50% valid rate): Targets for additional self-supervised training
+- **Good clusters** (>=50% valid rate): Model reliably generates valid formulas
+
+### Config
+```python
+'phase2_coverage_k': 64,             # K-means clusters
+'phase2_coverage_temperature': 1.0,  # Sampling weight exponent
+'phase2_coverage_decay': 0.995,      # Visit count decay
+```
+
+### Files
+- **NEW**: `src/superconductor/training/coverage_tracker.py`
+- **Modified**: `src/superconductor/training/self_supervised.py` (ZSpaceSampler + SelfSupervisedEpoch)
+- **Modified**: `scripts/train_v12_clean.py` (checkpoint integration, TRAIN_CONFIG entries)
+- **Modified**: `src/superconductor/training/__init__.py` (exports)
+
+---
+
+## V12.43: Net2Net 12.5% Encoder+Decoder Expansion (2026-02-24)
+
+### Problem
+
+V12.41 (d_model=512, epoch 3292) achieves 86.5% TRUE AR exact match but plateaus. The model needs more representational capacity across both encoder and decoder to:
+1. Reach 100% exact match on training data
+2. Handle the effectively larger dataset from Phase 2 self-supervised generations
+
+### Solution: Net2Net 12.5% Width Expansion
+
+Expand both encoder and decoder by ~12.5% using Net2Net weight transfer from the V12.41 checkpoint. All dimensions are multiples of 32 for CUDA warp efficiency. Latent dim stays at 2048 (the z-space geometry is the most valuable asset from 3292 epochs).
+
+### Architecture Changes
+
+| Parameter | V12.41 | V12.43 | Change |
+|-----------|--------|--------|--------|
+| `fusion_dim` | 256 | 288 | +12.5% |
+| `encoder_hidden` | [512, 256] | [576, 288] | +12.5% |
+| `decoder_hidden` | [256, 512] | [288, 576] | +12.5% |
+| `d_model` | 512 | 576 | +12.5% |
+| `dim_feedforward` | 2048 | 2304 | +12.5% (4x d_model) |
+| `nhead` | 8 | 8 | unchanged (head_dim 64→72) |
+| `latent_dim` | 2048 | 2048 | **unchanged** |
+| `num_layers` | 12 | 12 | unchanged |
+| `n_memory_tokens` | 16 | 16 | unchanged |
+
+### Net2Net Primitives Used
+
+- `expand_full_materials_vae()` — NEW function for encoder expansion
+  - Element encoder output_projection (wider output)
+  - Magpie encoder all layers
+  - Tc encoder all layers
+  - Fusion layer (3x fusion_dim → 3x fusion_dim)
+  - VAE encoder hidden layers + fc_mean input expansion
+  - Decoder backbone layers
+  - All heads reading from backbone (tc_proj, magpie_head, attended_head, tc_class_head, hierarchical_family_head)
+  - Heads reading from latent_dim: copied unchanged
+- `expand_enhanced_decoder()` — UPDATED for V14.3 heads
+  - Added heads_to_memory expansion (V14.3)
+  - Added token_type_head expansion (V14.3)
+  - Existing: token_embedding, pos_encoding, latent_to_memory, stoich_to_memory, transformer layers, output_proj, stop_head
+
+### Migration Command
+
+```bash
+cd /home/james/superconductor-vae
+conda activate recursivemenn-py311
+PYTHONPATH=src python scripts/migrate_checkpoint_v1243_wider.py
+# Dry run: PYTHONPATH=src python scripts/migrate_checkpoint_v1243_wider.py --dry-run
+```
+
+### Files Modified
+
+| File | Change |
+|------|--------|
+| `src/superconductor/models/net2net_expansion.py` | Added `expand_full_materials_vae()`, updated `expand_enhanced_decoder()` for V14.3 heads |
+| `scripts/migrate_checkpoint_v1243_wider.py` | **NEW**: Migration script |
+| `scripts/train_v12_clean.py` | Updated MODEL_CONFIG dims |
+| `notebooks/train_colab.ipynb` | Updated header description for V12.43 |
+
+### Training Plan
+
+1. Run migration locally
+2. Upload expanded checkpoint to Colab Drive
+3. Enable Phase 2: `PHASE2_ENABLED = True`, `PHASE2_INTERVAL = 2`
+4. Train on A100 with fresh optimizer + LR warmup (20 epochs)
+5. Monitor via gist: exact match recovery → plateau → Phase 2 → generalization
+
+---
+
 ## V12.41 Backward Compatibility Mode (2026-02-24)
 
 ### Problem

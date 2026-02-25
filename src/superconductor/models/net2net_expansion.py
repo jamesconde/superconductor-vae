@@ -667,9 +667,21 @@ def expand_enhanced_decoder(
     num_layers = old_decoder.num_layers
     max_len = old_decoder.max_len
 
+    # Detect memory_bottleneck_dim from old decoder structure
+    # Direct MLP (bottleneck=0): Sequential(Linear, GELU, Linear) — 3 layers
+    # Bottleneck (>0): Sequential(Linear, LN, GELU, Linear) — 4 layers
+    old_ltm_first = old_decoder.latent_to_memory[0]
+    old_ltm_mid = old_ltm_first.out_features
+    expected_direct_mid = old_d * n_mem // 2  # d_model * n_memory_tokens // 2
+    if old_ltm_mid == expected_direct_mid:
+        memory_bottleneck_dim = 0  # Direct MLP (pre-V15)
+    else:
+        memory_bottleneck_dim = old_ltm_mid  # Bottleneck mode
+
     if verbose:
         print(f"  Expanding decoder: d_model {old_d} -> {new_d_model}, "
               f"dim_feedforward -> {new_dim_feedforward}")
+        print(f"  Detected memory_bottleneck_dim={memory_bottleneck_dim}")
 
     # Create new decoder with expanded config
     new_decoder = EnhancedTransformerDecoder(
@@ -687,6 +699,7 @@ def expand_enhanced_decoder(
         max_elements=old_decoder.max_elements if hasattr(old_decoder, 'max_elements') else 12,
         n_stoich_tokens=old_decoder.stoich_n_tokens if old_decoder.use_stoich_conditioning else 4,
         use_gradient_checkpointing=old_decoder.use_gradient_checkpointing,
+        memory_bottleneck_dim=memory_bottleneck_dim,
     )
 
     with torch.no_grad():
@@ -845,6 +858,87 @@ def expand_enhanced_decoder(
                   f"Lin({new_d_model}, {new_stop_hidden})")
             print(f"    stop_head[2]: Lin({old_stop_hidden}, 1) -> Lin({new_stop_hidden}, 1)")
 
+        # 9. heads_to_memory (V14.3): Sequential(Linear, LN, GELU, Linear, GELU, Linear)
+        #    Converts encoder head predictions to decoder memory tokens
+        if hasattr(old_decoder, 'heads_to_memory'):
+            heads_input_dim = old_decoder.heads_input_dim  # 24 (unchanged)
+            old_hm_mid = old_d // 2  # d_model // 2
+            new_hm_mid = new_d_model // 2
+            # [0]: Linear(24, d_model//2) -> Linear(24, new_d_model//2)
+            new_decoder.heads_to_memory[0] = _expand_linear_both_dims(
+                old_decoder.heads_to_memory[0],
+                new_in_features=heads_input_dim,  # unchanged (24)
+                new_out_features=new_hm_mid,
+                noise_std=noise_std
+            )
+            # [1]: LN(d_model//2) -> LN(new_d_model//2)
+            new_decoder.heads_to_memory[1] = expand_layernorm(
+                old_decoder.heads_to_memory[1], new_hm_mid, noise_std=noise_std
+            )
+            # [3]: Linear(d_model//2, d_model) -> Linear(new_d_model//2, new_d_model)
+            new_decoder.heads_to_memory[3] = _expand_linear_both_dims(
+                old_decoder.heads_to_memory[3],
+                new_in_features=new_hm_mid,
+                new_out_features=new_d_model,
+                noise_std=noise_std
+            )
+            # [5]: Linear(d_model, d_model*n_tokens) -> Linear(new_d_model, new_d_model*n_tokens)
+            heads_n_tokens = old_decoder.heads_n_tokens  # 4
+            new_decoder.heads_to_memory[5] = _expand_linear_both_dims(
+                old_decoder.heads_to_memory[5],
+                new_in_features=new_d_model,
+                new_out_features=new_d_model * heads_n_tokens,
+                noise_std=noise_std
+            )
+            if verbose:
+                print(f"    heads_to_memory[0]: Lin({heads_input_dim}, {old_hm_mid}) -> "
+                      f"Lin({heads_input_dim}, {new_hm_mid})")
+                print(f"    heads_to_memory[1]: LN({old_hm_mid}) -> LN({new_hm_mid})")
+                print(f"    heads_to_memory[3]: Lin({old_hm_mid}, {old_d}) -> "
+                      f"Lin({new_hm_mid}, {new_d_model})")
+                print(f"    heads_to_memory[5]: Lin({old_d}, {old_d * heads_n_tokens}) -> "
+                      f"Lin({new_d_model}, {new_d_model * heads_n_tokens})")
+
+        # 10. token_type_head (V14.3): Sequential(LN, Linear, GELU, Dropout, Linear, GELU, Dropout, Linear)
+        #     Predicts token type for hard vocab masking during inference
+        if hasattr(old_decoder, 'token_type_head'):
+            old_tth_mid = old_d // 4  # d_model // 4
+            new_tth_mid = new_d_model // 4
+            # [0]: LN(d_model) -> LN(new_d_model)
+            new_decoder.token_type_head[0] = expand_layernorm(
+                old_decoder.token_type_head[0], new_d_model, noise_std=noise_std
+            )
+            # [1]: Linear(d_model, d_model) -> Linear(new_d_model, new_d_model)
+            new_decoder.token_type_head[1] = _expand_linear_both_dims(
+                old_decoder.token_type_head[1],
+                new_in_features=new_d_model,
+                new_out_features=new_d_model,
+                noise_std=noise_std
+            )
+            # [4]: Linear(d_model, d_model//4) -> Linear(new_d_model, new_d_model//4)
+            new_decoder.token_type_head[4] = _expand_linear_both_dims(
+                old_decoder.token_type_head[4],
+                new_in_features=new_d_model,
+                new_out_features=new_tth_mid,
+                noise_std=noise_std
+            )
+            # [7]: Linear(d_model//4, N_TOKEN_TYPES) -> expand input only
+            n_token_types = old_decoder.token_type_head[7].out_features  # 5
+            new_decoder.token_type_head[7] = _expand_linear_both_dims(
+                old_decoder.token_type_head[7],
+                new_in_features=new_tth_mid,
+                new_out_features=n_token_types,  # unchanged (5)
+                noise_std=noise_std
+            )
+            if verbose:
+                print(f"    token_type_head[0]: LN({old_d}) -> LN({new_d_model})")
+                print(f"    token_type_head[1]: Lin({old_d}, {old_d}) -> "
+                      f"Lin({new_d_model}, {new_d_model})")
+                print(f"    token_type_head[4]: Lin({old_d}, {old_tth_mid}) -> "
+                      f"Lin({new_d_model}, {new_tth_mid})")
+                print(f"    token_type_head[7]: Lin({old_tth_mid}, {n_token_types}) -> "
+                      f"Lin({new_tth_mid}, {n_token_types})")
+
     # Update the d_model attribute on the new decoder
     new_decoder.d_model = new_d_model
 
@@ -855,6 +949,421 @@ def expand_enhanced_decoder(
               f"(+{new_params - old_params:,}, {(new_params / old_params - 1) * 100:.1f}% increase)")
 
     return new_decoder
+
+
+def expand_full_materials_vae(
+    old_encoder: 'FullMaterialsVAE',
+    new_fusion_dim: int,
+    new_encoder_hidden: List[int],
+    new_decoder_hidden: List[int],
+    noise_std: float = 0.01,
+    verbose: bool = True
+) -> 'FullMaterialsVAE':
+    """
+    Expand a FullMaterialsVAE encoder to wider dimensions using Net2Net.
+
+    Expands all three encoder branches (element, magpie, tc), the fusion layer,
+    the VAE encoder, the decoder backbone, and all heads that read from the
+    backbone. Heads reading from latent_dim (2048) are UNCHANGED.
+
+    Args:
+        old_encoder: The existing FullMaterialsVAE to expand
+        new_fusion_dim: New fusion dimension (e.g. 288)
+        new_encoder_hidden: New encoder hidden dims (e.g. [576, 288])
+        new_decoder_hidden: New decoder hidden dims (e.g. [288, 576])
+        noise_std: Noise std for new weight initialization
+        verbose: Print expansion details
+
+    Returns:
+        New FullMaterialsVAE with expanded weights
+    """
+    from superconductor.models.attention_vae import FullMaterialsVAE
+
+    old_fusion_dim = old_encoder.fusion_dim
+    old_latent_dim = old_encoder.latent_dim
+    old_magpie_dim = old_encoder.magpie_dim
+
+    if verbose:
+        print(f"\n  Expanding FullMaterialsVAE: fusion_dim {old_fusion_dim} -> {new_fusion_dim}")
+
+    # Create new encoder with expanded config
+    new_encoder = FullMaterialsVAE(
+        n_elements=old_encoder.n_elements,
+        element_embed_dim=old_encoder.element_encoder.element_embed_dim,
+        n_attention_heads=old_encoder.element_encoder.element_attention.n_heads
+        if hasattr(old_encoder.element_encoder.element_attention, 'n_heads') else 8,
+        magpie_dim=old_magpie_dim,
+        fusion_dim=new_fusion_dim,
+        encoder_hidden=new_encoder_hidden,
+        latent_dim=old_latent_dim,  # UNCHANGED
+        decoder_hidden=new_decoder_hidden,
+        dropout=0.1,
+        use_numden_head=old_encoder.use_numden_head,
+    )
+
+    with torch.no_grad():
+        # =====================================================================
+        # BRANCH 1: Element Encoder (element_embed_dim unchanged, output_dim expands)
+        # =====================================================================
+        # Copy element_embedding and element_attention as-is (embed_dim unchanged)
+        new_encoder.element_encoder.element_embedding.load_state_dict(
+            old_encoder.element_encoder.element_embedding.state_dict()
+        )
+        new_encoder.element_encoder.element_attention.load_state_dict(
+            old_encoder.element_encoder.element_attention.state_dict()
+        )
+        # Copy isotope_mlp if present (input/output dim unchanged)
+        if hasattr(old_encoder.element_encoder, 'isotope_mlp') and \
+           hasattr(new_encoder.element_encoder, 'isotope_mlp'):
+            new_encoder.element_encoder.isotope_mlp.load_state_dict(
+                old_encoder.element_encoder.isotope_mlp.state_dict()
+            )
+
+        # output_projection[0]: Linear(proj_input_dim, fusion_dim) -> wider output
+        old_proj_in = old_encoder.element_encoder.output_projection[0].in_features
+        new_encoder.element_encoder.output_projection[0] = _expand_linear_both_dims(
+            old_encoder.element_encoder.output_projection[0],
+            new_in_features=old_proj_in,  # unchanged (128 or 256)
+            new_out_features=new_fusion_dim,
+            noise_std=noise_std
+        )
+        # output_projection[1]: LN(fusion_dim) -> LN(new_fusion_dim)
+        new_encoder.element_encoder.output_projection[1] = expand_layernorm(
+            old_encoder.element_encoder.output_projection[1], new_fusion_dim, noise_std=noise_std
+        )
+        if verbose:
+            print(f"    element_encoder.output_projection[0]: Lin({old_proj_in}, {old_fusion_dim}) -> "
+                  f"Lin({old_proj_in}, {new_fusion_dim})")
+            print(f"    element_encoder.output_projection[1]: LN({old_fusion_dim}) -> LN({new_fusion_dim})")
+
+        # =====================================================================
+        # BRANCH 2: Magpie Encoder
+        # =====================================================================
+        old_mag_mid = old_fusion_dim * 2  # fusion_dim * 2
+        new_mag_mid = new_fusion_dim * 2
+        # [0]: Linear(145, fusion_dim*2) -> wider output
+        new_encoder.magpie_encoder[0] = _expand_linear_both_dims(
+            old_encoder.magpie_encoder[0],
+            new_in_features=old_magpie_dim,  # 145, unchanged
+            new_out_features=new_mag_mid,
+            noise_std=noise_std
+        )
+        # [1]: LN(fusion_dim*2) -> LN(new)
+        new_encoder.magpie_encoder[1] = expand_layernorm(
+            old_encoder.magpie_encoder[1], new_mag_mid, noise_std=noise_std
+        )
+        # [4]: Linear(fusion_dim*2, fusion_dim) -> both dims expand
+        new_encoder.magpie_encoder[4] = _expand_linear_both_dims(
+            old_encoder.magpie_encoder[4],
+            new_in_features=new_mag_mid,
+            new_out_features=new_fusion_dim,
+            noise_std=noise_std
+        )
+        # [5]: LN(fusion_dim) -> LN(new)
+        new_encoder.magpie_encoder[5] = expand_layernorm(
+            old_encoder.magpie_encoder[5], new_fusion_dim, noise_std=noise_std
+        )
+        if verbose:
+            print(f"    magpie_encoder[0]: Lin({old_magpie_dim}, {old_mag_mid}) -> "
+                  f"Lin({old_magpie_dim}, {new_mag_mid})")
+            print(f"    magpie_encoder[4]: Lin({old_mag_mid}, {old_fusion_dim}) -> "
+                  f"Lin({new_mag_mid}, {new_fusion_dim})")
+
+        # =====================================================================
+        # BRANCH 3: Tc Encoder
+        # =====================================================================
+        old_tc_mid = old_fusion_dim // 2
+        new_tc_mid = new_fusion_dim // 2
+        # [0]: Linear(1, fusion_dim//2) -> wider output
+        new_encoder.tc_encoder[0] = _expand_linear_both_dims(
+            old_encoder.tc_encoder[0],
+            new_in_features=1,  # unchanged
+            new_out_features=new_tc_mid,
+            noise_std=noise_std
+        )
+        # [2]: Linear(fusion_dim//2, fusion_dim) -> both dims
+        new_encoder.tc_encoder[2] = _expand_linear_both_dims(
+            old_encoder.tc_encoder[2],
+            new_in_features=new_tc_mid,
+            new_out_features=new_fusion_dim,
+            noise_std=noise_std
+        )
+        # [3]: LN(fusion_dim) -> LN(new)
+        new_encoder.tc_encoder[3] = expand_layernorm(
+            old_encoder.tc_encoder[3], new_fusion_dim, noise_std=noise_std
+        )
+        if verbose:
+            print(f"    tc_encoder[0]: Lin(1, {old_tc_mid}) -> Lin(1, {new_tc_mid})")
+            print(f"    tc_encoder[2]: Lin({old_tc_mid}, {old_fusion_dim}) -> "
+                  f"Lin({new_tc_mid}, {new_fusion_dim})")
+
+        # =====================================================================
+        # FUSION LAYER (3 * fusion_dim)
+        # =====================================================================
+        old_total = old_fusion_dim * 3
+        new_total = new_fusion_dim * 3
+        # [0]: Linear(3*fusion, 3*fusion) -> both dims expand
+        new_encoder.fusion[0] = _expand_linear_both_dims(
+            old_encoder.fusion[0],
+            new_in_features=new_total,
+            new_out_features=new_total,
+            noise_std=noise_std
+        )
+        # [1]: LN(3*fusion) -> LN(new)
+        new_encoder.fusion[1] = expand_layernorm(
+            old_encoder.fusion[1], new_total, noise_std=noise_std
+        )
+        if verbose:
+            print(f"    fusion[0]: Lin({old_total}, {old_total}) -> Lin({new_total}, {new_total})")
+
+        # =====================================================================
+        # VAE ENCODER (encoder_hidden layers + fc_mean)
+        # =====================================================================
+        old_enc_hidden = [old_encoder.vae_encoder.encoder[0].in_features]  # first input dim
+        # Get old hidden dims from layer weights
+        old_enc_layers = list(old_encoder.vae_encoder.encoder.children())
+        new_enc_layers = list(new_encoder.vae_encoder.encoder.children())
+
+        # encoder is Sequential of [Linear, LN, GELU, Linear, LN, GELU, ...]
+        # Each group of 3 = (Linear, LN, GELU)
+        prev_old_dim = old_total  # Input to first encoder layer
+        prev_new_dim = new_total
+        layer_idx = 0
+        for i in range(0, len(old_enc_layers), 3):
+            old_linear = old_enc_layers[i]
+            old_ln = old_enc_layers[i + 1]
+            new_hidden = new_encoder_hidden[layer_idx]
+            old_hidden = old_linear.out_features
+
+            # Linear: expand both dims
+            expanded_linear = _expand_linear_both_dims(
+                old_linear,
+                new_in_features=prev_new_dim,
+                new_out_features=new_hidden,
+                noise_std=noise_std
+            )
+            new_encoder.vae_encoder.encoder[i] = expanded_linear
+
+            # LN: expand
+            expanded_ln = expand_layernorm(old_ln, new_hidden, noise_std=noise_std)
+            new_encoder.vae_encoder.encoder[i + 1] = expanded_ln
+
+            if verbose:
+                print(f"    vae_encoder.encoder[{i}]: Lin({prev_old_dim}, {old_hidden}) -> "
+                      f"Lin({prev_new_dim}, {new_hidden})")
+
+            prev_old_dim = old_hidden
+            prev_new_dim = new_hidden
+            layer_idx += 1
+
+        # fc_mean: Linear(last_hidden, latent_dim) -> expand input only
+        new_encoder.vae_encoder.fc_mean = _expand_linear_both_dims(
+            old_encoder.vae_encoder.fc_mean,
+            new_in_features=new_encoder_hidden[-1],
+            new_out_features=old_latent_dim,  # UNCHANGED (2048)
+            noise_std=noise_std
+        )
+        if verbose:
+            old_mean_in = old_encoder.vae_encoder.fc_mean.in_features
+            print(f"    vae_encoder.fc_mean: Lin({old_mean_in}, {old_latent_dim}) -> "
+                  f"Lin({new_encoder_hidden[-1]}, {old_latent_dim})")
+
+        # fc_logvar if present (non-deterministic mode)
+        if hasattr(old_encoder.vae_encoder, 'fc_logvar'):
+            new_encoder.vae_encoder.fc_logvar = _expand_linear_both_dims(
+                old_encoder.vae_encoder.fc_logvar,
+                new_in_features=new_encoder_hidden[-1],
+                new_out_features=old_latent_dim,
+                noise_std=noise_std
+            )
+
+        # =====================================================================
+        # DECODER BACKBONE (latent_dim -> decoder_hidden layers)
+        # =====================================================================
+        old_bb_layers = list(old_encoder.decoder_backbone.children())
+        prev_old_dim = old_latent_dim
+        prev_new_dim = old_latent_dim  # Latent dim unchanged
+        layer_idx = 0
+        for i in range(0, len(old_bb_layers), 4):  # Groups of 4: Linear, LN, GELU, Dropout
+            old_linear = old_bb_layers[i]
+            old_ln = old_bb_layers[i + 1]
+            new_hidden = new_decoder_hidden[layer_idx]
+            old_hidden = old_linear.out_features
+
+            expanded_linear = _expand_linear_both_dims(
+                old_linear,
+                new_in_features=prev_new_dim,
+                new_out_features=new_hidden,
+                noise_std=noise_std
+            )
+            new_encoder.decoder_backbone[i] = expanded_linear
+
+            expanded_ln = expand_layernorm(old_ln, new_hidden, noise_std=noise_std)
+            new_encoder.decoder_backbone[i + 1] = expanded_ln
+
+            if verbose:
+                print(f"    decoder_backbone[{i}]: Lin({prev_old_dim}, {old_hidden}) -> "
+                      f"Lin({prev_new_dim}, {new_hidden})")
+
+            prev_old_dim = old_hidden
+            prev_new_dim = new_hidden
+            layer_idx += 1
+
+        # prev_dim is now the last decoder_hidden dim (old: 512, new: 576)
+        old_prev_dim = prev_old_dim  # 512
+        new_prev_dim = prev_new_dim  # 576
+
+        # =====================================================================
+        # HEADS READING FROM DECODER BACKBONE (prev_dim changes)
+        # =====================================================================
+
+        # tc_proj: Linear(prev_dim, 256) -> expand input only
+        new_encoder.tc_proj = _expand_linear_both_dims(
+            old_encoder.tc_proj,
+            new_in_features=new_prev_dim,
+            new_out_features=256,  # tc residual dim unchanged
+            noise_std=noise_std
+        )
+        # tc_res_block and tc_out: unchanged (all 256-dim internal)
+        new_encoder.tc_res_block.load_state_dict(old_encoder.tc_res_block.state_dict())
+        new_encoder.tc_out.load_state_dict(old_encoder.tc_out.state_dict())
+        if verbose:
+            print(f"    tc_proj: Lin({old_prev_dim}, 256) -> Lin({new_prev_dim}, 256)")
+
+        # magpie_head: Sequential(Linear(prev_dim, prev_dim), GELU, Linear(prev_dim, 145))
+        # [0]: Linear(prev_dim, prev_dim) -> both dims expand
+        new_encoder.magpie_head[0] = _expand_linear_both_dims(
+            old_encoder.magpie_head[0],
+            new_in_features=new_prev_dim,
+            new_out_features=new_prev_dim,
+            noise_std=noise_std
+        )
+        # [2]: Linear(prev_dim, 145) -> expand input only
+        new_encoder.magpie_head[2] = _expand_linear_both_dims(
+            old_encoder.magpie_head[2],
+            new_in_features=new_prev_dim,
+            new_out_features=old_magpie_dim,  # 145, unchanged
+            noise_std=noise_std
+        )
+        if verbose:
+            print(f"    magpie_head[0]: Lin({old_prev_dim}, {old_prev_dim}) -> "
+                  f"Lin({new_prev_dim}, {new_prev_dim})")
+            print(f"    magpie_head[2]: Lin({old_prev_dim}, {old_magpie_dim}) -> "
+                  f"Lin({new_prev_dim}, {old_magpie_dim})")
+
+        # attended_head: Sequential(Linear(prev_dim, fusion_dim), LN(fusion_dim))
+        # [0]: both dims expand
+        new_encoder.attended_head[0] = _expand_linear_both_dims(
+            old_encoder.attended_head[0],
+            new_in_features=new_prev_dim,
+            new_out_features=new_fusion_dim,
+            noise_std=noise_std
+        )
+        # [1]: LN expand
+        new_encoder.attended_head[1] = expand_layernorm(
+            old_encoder.attended_head[1], new_fusion_dim, noise_std=noise_std
+        )
+        if verbose:
+            print(f"    attended_head[0]: Lin({old_prev_dim}, {old_fusion_dim}) -> "
+                  f"Lin({new_prev_dim}, {new_fusion_dim})")
+
+        # tc_class_head: Sequential(Linear(prev_dim, 256), GELU, Dropout, Linear(256, 5))
+        # [0]: expand input only
+        new_encoder.tc_class_head[0] = _expand_linear_both_dims(
+            old_encoder.tc_class_head[0],
+            new_in_features=new_prev_dim,
+            new_out_features=256,  # unchanged
+            noise_std=noise_std
+        )
+        # [3]: Linear(256, 5) — unchanged, copy directly
+        new_encoder.tc_class_head[3].load_state_dict(old_encoder.tc_class_head[3].state_dict())
+        if verbose:
+            print(f"    tc_class_head[0]: Lin({old_prev_dim}, 256) -> Lin({new_prev_dim}, 256)")
+
+        # =====================================================================
+        # HIERARCHICAL FAMILY HEAD (backbone_dim + 1 inputs)
+        # =====================================================================
+        old_bb_plus1 = old_prev_dim + 1  # 513
+        new_bb_plus1 = new_prev_dim + 1  # 577
+
+        # coarse_head[0]: Linear(backbone_dim+1, 256) -> expand input only
+        new_encoder.hierarchical_family_head.coarse_head[0] = _expand_linear_both_dims(
+            old_encoder.hierarchical_family_head.coarse_head[0],
+            new_in_features=new_bb_plus1,
+            new_out_features=256,
+            noise_std=noise_std
+        )
+        # Remaining layers of coarse_head (LN, GELU, Dropout, Linear 256->128, GELU, Linear 128->7) unchanged
+        for idx in [1, 4, 6]:
+            if idx < len(old_encoder.hierarchical_family_head.coarse_head):
+                layer = old_encoder.hierarchical_family_head.coarse_head[idx]
+                if hasattr(layer, 'state_dict') and len(layer.state_dict()) > 0:
+                    new_encoder.hierarchical_family_head.coarse_head[idx].load_state_dict(
+                        layer.state_dict()
+                    )
+
+        # cuprate_sub_head[0]: Linear(backbone_dim+1, 128) -> expand input only
+        new_encoder.hierarchical_family_head.cuprate_sub_head[0] = _expand_linear_both_dims(
+            old_encoder.hierarchical_family_head.cuprate_sub_head[0],
+            new_in_features=new_bb_plus1,
+            new_out_features=128,
+            noise_std=noise_std
+        )
+        # Remaining layers unchanged
+        for idx in [1, 4, 6]:
+            if idx < len(old_encoder.hierarchical_family_head.cuprate_sub_head):
+                layer = old_encoder.hierarchical_family_head.cuprate_sub_head[idx]
+                if hasattr(layer, 'state_dict') and len(layer.state_dict()) > 0:
+                    new_encoder.hierarchical_family_head.cuprate_sub_head[idx].load_state_dict(
+                        layer.state_dict()
+                    )
+
+        # iron_sub_head[0]: Linear(backbone_dim+1, 64) -> expand input only
+        new_encoder.hierarchical_family_head.iron_sub_head[0] = _expand_linear_both_dims(
+            old_encoder.hierarchical_family_head.iron_sub_head[0],
+            new_in_features=new_bb_plus1,
+            new_out_features=64,
+            noise_std=noise_std
+        )
+        # Remaining layers unchanged
+        for idx in [1, 4]:
+            if idx < len(old_encoder.hierarchical_family_head.iron_sub_head):
+                layer = old_encoder.hierarchical_family_head.iron_sub_head[idx]
+                if hasattr(layer, 'state_dict') and len(layer.state_dict()) > 0:
+                    new_encoder.hierarchical_family_head.iron_sub_head[idx].load_state_dict(
+                        layer.state_dict()
+                    )
+
+        if verbose:
+            print(f"    hierarchical_family_head.coarse_head[0]: Lin({old_bb_plus1}, 256) -> "
+                  f"Lin({new_bb_plus1}, 256)")
+            print(f"    hierarchical_family_head.cuprate_sub_head[0]: Lin({old_bb_plus1}, 128) -> "
+                  f"Lin({new_bb_plus1}, 128)")
+            print(f"    hierarchical_family_head.iron_sub_head[0]: Lin({old_bb_plus1}, 64) -> "
+                  f"Lin({new_bb_plus1}, 64)")
+
+        # =====================================================================
+        # HEADS READING FROM LATENT_DIM (2048) — UNCHANGED, copy directly
+        # =====================================================================
+        new_encoder.competence_head.load_state_dict(old_encoder.competence_head.state_dict())
+        new_encoder.fraction_head.load_state_dict(old_encoder.fraction_head.state_dict())
+        new_encoder.hp_head.load_state_dict(old_encoder.hp_head.state_dict())
+        new_encoder.sc_head.load_state_dict(old_encoder.sc_head.state_dict())
+        if old_encoder.use_numden_head:
+            new_encoder.numden_head.load_state_dict(old_encoder.numden_head.state_dict())
+        if verbose:
+            print(f"    competence_head, fraction_head, hp_head, sc_head: copied (latent_dim unchanged)")
+
+    # Update fusion_dim attribute
+    new_encoder.fusion_dim = new_fusion_dim
+
+    if verbose:
+        old_params = sum(p.numel() for p in old_encoder.parameters())
+        new_params = sum(p.numel() for p in new_encoder.parameters())
+        print(f"\n  Encoder parameter count: {old_params:,} -> {new_params:,} "
+              f"(+{new_params - old_params:,}, {(new_params / old_params - 1) * 100:.1f}% increase)")
+
+    return new_encoder
 
 
 class ModelExpander:

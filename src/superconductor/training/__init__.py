@@ -40,6 +40,17 @@ from .entropy_maintenance import (
     compute_position_weighted_entropy_loss,
 )
 
+from .self_supervised import (
+    SelfSupervisedConfig,
+    SelfSupervisedEpoch,
+    ZSpaceSampler,
+    CandidateFilter,
+    Phase2LossComputer,
+    NovelDiscoveryTracker,
+)
+
+from .coverage_tracker import CoverageTracker
+
 __all__ = [
     # Mastery-aware sampling
     'MasteryTracker',
@@ -71,4 +82,13 @@ __all__ = [
     'create_entropy_manager',
     'get_adaptive_entropy_weight',
     'compute_position_weighted_entropy_loss',
+    # Phase 2: Self-supervised training
+    'SelfSupervisedConfig',
+    'SelfSupervisedEpoch',
+    'ZSpaceSampler',
+    'CandidateFilter',
+    'Phase2LossComputer',
+    'NovelDiscoveryTracker',
+    # Phase 2: Coverage tracking
+    'CoverageTracker',
 ]

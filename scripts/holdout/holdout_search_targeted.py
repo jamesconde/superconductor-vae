@@ -784,7 +784,23 @@ def main():
                         help='Search all 45 holdouts (not just previous failures)')
     parser.add_argument('--targets', type=int, default=0,
                         help='Only search first N targets (0=all)')
+    parser.add_argument('--mini', action='store_true',
+                        help='Mini search mode: reduced budget (200 candidates/target), JSON-only output. '
+                             'For Phase 2 periodic evaluation during training.')
+    parser.add_argument('--mini-budget', type=int, default=200,
+                        help='Candidates per target in mini mode (default: 200)')
     args = parser.parse_args()
+
+    # Mini mode: override search parameters for fast Phase 2 evaluation
+    if args.mini:
+        global N_PERTURBATIONS, NOISE_SCALES, N_INTERPOLATION_STEPS
+        global N_TEMPERATURE_SAMPLES, TEMPERATURES
+        N_PERTURBATIONS = 5
+        NOISE_SCALES = [0.05, 0.1, 0.2]
+        N_INTERPOLATION_STEPS = 5
+        N_TEMPERATURE_SAMPLES = 5
+        TEMPERATURES = [0.1, 0.3]
+        args.all = True  # Always search all 45 in mini mode
 
     checkpoint_path = Path(args.checkpoint)
     if not checkpoint_path.is_absolute():
@@ -794,10 +810,14 @@ def main():
         sys.exit(1)
 
     ckpt_stem = checkpoint_path.stem
-    output_path = PROJECT_ROOT / 'outputs' / f'holdout_search_targeted_{ckpt_stem}.json'
+    if args.mini:
+        output_path = PROJECT_ROOT / 'outputs' / f'holdout_mini_{ckpt_stem}.json'
+    else:
+        output_path = PROJECT_ROOT / 'outputs' / f'holdout_search_targeted_{ckpt_stem}.json'
 
+    search_mode = "MINI" if args.mini else "TARGETED"
     print("=" * 70)
-    print("TARGETED HOLDOUT SEARCH (Element-Anchored)")
+    print(f"{search_mode} HOLDOUT SEARCH (Element-Anchored)")
     print("=" * 70)
     print(f"Device: {DEVICE}")
     print(f"Checkpoint: {checkpoint_path}")
@@ -905,7 +925,7 @@ def main():
     output = {
         'timestamp': time.strftime('%Y-%m-%dT%H:%M:%S'),
         'checkpoint': str(checkpoint_path),
-        'search_mode': 'all' if args.all else 'failures_only',
+        'search_mode': 'mini' if args.mini else ('all' if args.all else 'failures_only'),
         'n_targets_searched': len(targets_to_search),
         'n_found_095': found_count,
         'n_exact': sum(1 for r in results if r.get('exact')),

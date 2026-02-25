@@ -273,3 +273,96 @@ class RoundTripConsistencyLoss(nn.Module):
             'tc_mse': tc_mse.detach(),
             'n_valid': n_valid,
         }
+
+
+class ExtendedRoundTripConsistencyLoss(nn.Module):
+    """Phase 2: Extended round-trip consistency for arbitrary z-vectors.
+
+    Unlike RoundTripConsistencyLoss (A5) which operates on batch z from the
+    training forward pass, this operates on externally-sampled z-vectors
+    (perturbed, interpolated, PCA-walked). Used by Phase 2 self-supervised
+    training to enforce z-space consistency at novel points.
+
+    Key differences from A5:
+    - Takes pre-sampled z-vectors as input (not batch z from encoder)
+    - Takes pre-generated formulas (already decoded and filtered)
+    - No decoder generation (done externally by SelfSupervisedEpoch)
+    - Gradients flow through encoder weights via re-encoding
+
+    Reference: docs/PHASE2_SELF_SUPERVISED_DESIGN.md (Loss 1)
+    """
+
+    def __init__(
+        self,
+        z_weight: float = 1.0,
+        tc_weight: float = 5.0,
+        max_elements: int = 12,
+    ):
+        super().__init__()
+        self.z_weight = z_weight
+        self.tc_weight = tc_weight
+        self.max_elements = max_elements
+
+    def forward(
+        self,
+        encoder: nn.Module,
+        z_original: torch.Tensor,         # [N, 2048] sampled z-vectors (detached)
+        elem_indices: torch.Tensor,       # [N, max_elements] from parsed formulas
+        elem_fractions: torch.Tensor,     # [N, max_elements]
+        elem_mask: torch.Tensor,          # [N, max_elements]
+        device: torch.device,
+    ) -> Dict[str, torch.Tensor]:
+        """Compute extended round-trip consistency loss.
+
+        Flow: z_original -> [already decoded + parsed externally] -> re-encode -> z_recon
+        Loss = z_weight * MSE(z_original, z_recon) + tc_weight * MSE(Tc(z), Tc(z_recon))
+
+        Gradients flow through encoder parameters. z_original is detached.
+
+        Returns dict with:
+            'ext_round_trip_loss': total loss (differentiable)
+            'z_mse': Z reconstruction error (detached)
+            'tc_mse': Tc reconstruction error (detached)
+        """
+        n = z_original.shape[0]
+        if n == 0:
+            zero = torch.tensor(0.0, device=device, requires_grad=True)
+            return {
+                'ext_round_trip_loss': zero,
+                'z_mse': torch.tensor(0.0, device=device),
+                'tc_mse': torch.tensor(0.0, device=device),
+            }
+
+        z_target = z_original.detach()
+
+        # Get Magpie proxy from decoder (no gradient through original path)
+        with torch.no_grad():
+            decode_result = encoder.decode(z_target)
+            magpie_proxy = decode_result['magpie_pred']  # [N, 145]
+            tc_proxy = decode_result['tc_pred']           # [N]
+
+        # Re-encode WITH gradients through encoder weights
+        encode_result = encoder.encode(
+            element_indices=elem_indices,
+            element_fractions=elem_fractions,
+            element_mask=elem_mask,
+            magpie_features=magpie_proxy,
+            tc=tc_proxy.detach(),
+        )
+        z_recon = encode_result['z']  # [N, 2048]
+
+        # Z reconstruction loss
+        z_mse = F.mse_loss(z_recon, z_target)
+
+        # Tc consistency via decode of reconstructed z
+        decode_recon = encoder.decode(z_recon)
+        tc_recon = decode_recon['tc_pred']  # [N]
+        tc_mse = F.mse_loss(tc_recon, tc_proxy.detach())
+
+        total_loss = self.z_weight * z_mse + self.tc_weight * tc_mse
+
+        return {
+            'ext_round_trip_loss': total_loss,
+            'z_mse': z_mse.detach(),
+            'tc_mse': tc_mse.detach(),
+        }

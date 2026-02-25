@@ -349,16 +349,16 @@ def get_timing_stats() -> Optional[TimingStats]:
 
 MODEL_CONFIG = {
     'latent_dim': 2048,
-    'fusion_dim': 256,
-    'magpie_dim': 145,  # V12.28: Will be 151 after physics features added (dynamically detected from CSV)
-    'encoder_hidden': [512, 256],
-    'decoder_hidden': [256, 512],
-    'd_model': 1024,            # V12.42: Net2Net 2x wider (confirmed applied on Colab checkpoint epoch 4245)
-    'nhead': 8,
+    'fusion_dim': 288,              # V12.43: Net2Net 12.5% wider (was 256)
+    'magpie_dim': 145,  # Nominal; actual value dynamically detected from CSV (151 with physics features)
+    'encoder_hidden': [576, 288],   # V12.43: Matched to fusion_dim (was [512, 256])
+    'decoder_hidden': [288, 576],   # V12.43: Matched to fusion_dim (was [256, 512])
+    'd_model': 576,                 # V12.43: Net2Net 12.5% wider (was 512)
+    'nhead': 8,                     # head_dim = 72 (was 64)
     'num_layers': 12,
-    'dim_feedforward': 4096,   # V12.42: 4x d_model (was 2048)
-    'n_memory_tokens': 16,     # V15.0: Kept at 16 — V12 checkpoint had good AR behavior with 16 tokens
-    'memory_bottleneck_dim': 0, # V15.0: 0=disabled (V12.41 uses direct MLP). Set 1024 for V15+ bottleneck.
+    'dim_feedforward': 2304,        # V12.43: 4x d_model (was 2048)
+    'n_memory_tokens': 16,
+    'memory_bottleneck_dim': 0,     # V12.41 compat (direct MLP, no bottleneck)
     'element_embed_dim': 128,
 }
 
@@ -984,7 +984,7 @@ TRAIN_CONFIG = {
     'phase2_enabled': False,              # Master toggle
     'phase2_start': 'auto',              # Epoch number or 'auto' (activate when exact >= threshold)
     'phase2_auto_min_exact': 0.80,       # Auto-activation threshold for exact match
-    'phase2_interval': 4,                 # Run Phase 2 every N supervised epochs
+    'phase2_interval': 2,                 # Run Phase 2 every N supervised epochs
     'phase2_max_weight': 0.1,            # Max total Phase 2 loss weight (ramped up over warmup)
     'phase2_warmup': 50,                  # Epochs to linearly ramp Phase 2 weight from 0 to max
     'phase2_n_samples': 'auto',           # 'auto' = z-vectors per sub-epoch, scales with VRAM: clamp(3.2*GB, 32, 512)
@@ -994,6 +994,15 @@ TRAIN_CONFIG = {
     'phase2_max_grad_norm': 0.5,         # Gradient clip for Phase 2 (tighter than Phase 1's 1.0)
     'phase2_diversity_bonus': 5.0,       # REINFORCE bonus for unique formulas (mode collapse prevention)
     'phase2_collapse_threshold': 0.3,    # unique_rate < this triggers mode collapse intervention
+    'phase2_coverage_k': 64,             # K-means clusters for z-space coverage tracking
+    'phase2_coverage_temperature': 1.0,  # Sampling weight exponent (higher = more uniform)
+    'phase2_coverage_decay': 0.995,      # Visit count decay per sub-epoch (half-life ~139)
+    # Strategy 4: Element-Anchored Sampling (explores z-neighborhoods of chemically similar materials)
+    'phase2_element_anchored': True,              # Enable element-anchored sampling (Strategy 4)
+    'phase2_element_anchored_fraction': 0.20,     # Fraction of sampling budget (reduces perturbation from 60% to 40%)
+    'phase2_element_min_shared': 2,               # Min shared elements for neighbor status
+    'phase2_element_perturb_sigma': 0.05,         # Perturbation sigma for element-anchored blends
+    'phase2_element_interpolate_fraction': 0.3,   # Fraction of element-anchored using SLERP (rest uses centroid blend)
     'holdout_eval_interval': 50,          # Mini holdout search every N epochs
     'holdout_eval_budget': 200,           # Candidates per target in mini holdout search
 }
@@ -3292,7 +3301,8 @@ class TcBinTracker:
 def save_checkpoint(encoder, decoder, epoch, suffix='', entropy_manager=None,
                     enc_opt=None, dec_opt=None, enc_scheduler=None, dec_scheduler=None,
                     prev_exact=None, best_exact=None, theory_loss_fn=None,
-                    manifest=None, physics_z_loss_fn=None, tc_bin_tracker=None):
+                    manifest=None, physics_z_loss_fn=None, tc_bin_tracker=None,
+                    phase2_runner=None):
     """Save model checkpoint with full training state for proper resumption."""
     OUTPUT_DIR.mkdir(exist_ok=True)
 
@@ -3343,6 +3353,10 @@ def save_checkpoint(encoder, decoder, epoch, suffix='', entropy_manager=None,
     # V15.1: Save Tc bin tracker state for resume
     if tc_bin_tracker is not None:
         checkpoint_data['tc_bin_tracker_state'] = tc_bin_tracker.get_state()
+
+    # Phase 2: Save self-supervised training state (activation, coverage, collapse flags)
+    if phase2_runner is not None:
+        checkpoint_data['phase2_state'] = phase2_runner.get_state()
 
     # V13.0: Store decoder architecture params for auto-detection by holdout/analysis scripts
     checkpoint_data['d_model'] = MODEL_CONFIG.get('d_model', 512)
@@ -3423,6 +3437,8 @@ def cache_z_vectors(encoder, loader, device, epoch, cache_path, dataset_info=Non
     all_generated_tokens = []
     all_exact_match = []
     all_log_probs = []
+    all_elem_idx = []   # Element indices per sample (for Phase 2 element-anchored sampling)
+    all_elem_mask = []  # Element mask per sample (which element slots are active)
     sample_idx = 0
     include_predictions = mode in ['z_and_predictions', 'full'] and decoder is not None
     include_log_probs = mode == 'full' and decoder is not None
@@ -3447,6 +3463,8 @@ def cache_z_vectors(encoder, loader, device, epoch, cache_path, dataset_info=Non
             all_tc_pred.append(encoder_out['tc_pred'].cpu())
             all_is_sc.append(is_sc.cpu())
             all_target_tokens.append(tokens.cpu())
+            all_elem_idx.append(elem_idx.cpu())
+            all_elem_mask.append(elem_mask.cpu())
 
             if include_predictions:
                 # Assemble stoich_pred for decoder generation: fractions(12) + count(1) = 13 dims
@@ -3533,6 +3551,8 @@ def cache_z_vectors(encoder, loader, device, epoch, cache_path, dataset_info=Non
     tc_pred_values = torch.cat(all_tc_pred, dim=0)
     is_sc_values = torch.cat(all_is_sc, dim=0)
     target_tokens = torch.cat(all_target_tokens, dim=0)
+    element_indices = torch.cat(all_elem_idx, dim=0)   # [N, 12] atomic numbers
+    element_mask = torch.cat(all_elem_mask, dim=0)      # [N, 12] active element slots
 
     # Build cache dict
     cache_data = {
@@ -3541,6 +3561,8 @@ def cache_z_vectors(encoder, loader, device, epoch, cache_path, dataset_info=Non
         'tc_pred': tc_pred_values,
         'is_sc': is_sc_values,
         'target_tokens': target_tokens,
+        'element_indices': element_indices,  # Phase 2 element-anchored sampling
+        'element_mask': element_mask,        # Phase 2 element-anchored sampling
         'epoch': epoch,
         'timestamp': datetime.datetime.now().isoformat(),
         'latent_dim': z_vectors.size(1),
@@ -3696,6 +3718,9 @@ def _run_topology_analysis(cache_path, epoch, full=False):
         tc_values = cache.get('tc_values', None)
         if tc_values is not None:
             tc_values = tc_values.numpy()
+            # Flatten [N,1] to [N] if needed (z-cache stores as [N,1])
+            if tc_values.ndim > 1:
+                tc_values = tc_values.flatten()
 
         jsonl_path = PROJECT_ROOT / 'outputs' / 'topology_summary.jsonl'
 
@@ -4144,6 +4169,7 @@ def load_checkpoint(encoder, decoder, checkpoint_path, entropy_manager=None,
         'physics_z_is_new': physics_z_is_new,        # V12.31: Warmup from introduction
         'vocab_expanded': _vocab_expanded,            # V14.2: Migration LR boost needed
         'tc_bin_tracker_state': checkpoint.get('tc_bin_tracker_state', None),  # V15.1
+        'phase2_state': checkpoint.get('phase2_state', None),  # Phase 2 state persistence
     }
 
     if 'prev_exact' in checkpoint:
@@ -6051,6 +6077,7 @@ def train():
     migration_lr_boost_end = 0  # V14.2: No boost unless vocab expansion detected
     migration_lr_boost_factor = 1.0
     _tc_bin_tracker_state = None  # V15.1: Deferred resume state for Tc bin tracker
+    _phase2_state = None  # Phase 2: Deferred resume state for self-supervised training
 
     _resume_val = TRAIN_CONFIG.get('resume_checkpoint')
     if _resume_val:
@@ -6169,6 +6196,7 @@ def train():
             best_exact = resume_state['best_exact']
             # V15.1: Deferred — store state, apply after tracker is created (~line after family_lookup_tables)
             _tc_bin_tracker_state = resume_state.get('tc_bin_tracker_state')
+            _phase2_state = resume_state.get('phase2_state')
             print(f"  Starting from epoch {start_epoch}")
 
             # V12.31: Grace period when optimizers were freshly initialized
@@ -6411,7 +6439,14 @@ def train():
               f"(start={phase2_config.start}, interval={phase2_config.interval}, "
               f"max_weight={phase2_config.max_weight}, "
               f"n_samples={phase2_config.n_samples or 'auto'}, "
-              f"lr_factor={phase2_config.lr_factor})")
+              f"lr_factor={phase2_config.lr_factor}, "
+              f"coverage_k={phase2_config.coverage_k})")
+
+        # Restore Phase 2 state from checkpoint if resuming
+        if _phase2_state is not None:
+            phase2_runner.load_state(_phase2_state)
+        else:
+            print(f"  [Phase 2] No saved state — starting fresh", flush=True)
 
     # V14.2: Pre-training baseline eval — verify loaded model quality before any training
     # This catches migration/loading problems before wasting an epoch.
@@ -7223,12 +7258,29 @@ def train():
                         p2_loss = phase2_metrics.get('phase2_total_loss', 0)
                         p2_z_mse = phase2_metrics.get('phase2_z_mse', 0)
                         p2_unique_rate = phase2_metrics.get('phase2_unique_rate', 0)
+                        p2_cov = phase2_metrics.get('coverage_fraction', 0)
+                        p2_gini = phase2_metrics.get('coverage_visit_gini', 0)
+                        p2_garbage = phase2_metrics.get('coverage_garbage_clusters', 0)
+                        p2_boundary = phase2_metrics.get('coverage_boundary_clusters', 0)
+                        p2_n_elem = phase2_metrics.get('phase2_sample_n_element_anchored', 0)
                         print(f"  [Phase 2] Done in {p2_time:.1f}s | "
                               f"valid={p2_valid}/{p2_sampled} "
                               f"(degen={p2_degen}, unique_rate={p2_unique_rate:.2f}) | "
                               f"loss={p2_loss:.4f} | z_mse={p2_z_mse:.4f} | "
                               f"weight={phase2_metrics.get('phase2_weight', 0):.4f}",
                               flush=True)
+                        print(f"  [Phase 2] Coverage: {p2_cov*100:.0f}% clusters visited, "
+                              f"gini={p2_gini:.3f}, "
+                              f"garbage={p2_garbage}, boundary={p2_boundary}"
+                              f"{f', elem_anchored={p2_n_elem}' if p2_n_elem > 0 else ''}",
+                              flush=True)
+                        p2_avg_novelty = phase2_metrics.get('coverage_avg_novelty', 0)
+                        p2_saturated = phase2_metrics.get('coverage_saturated_clusters', 0)
+                        p2_productive = phase2_metrics.get('coverage_productive_clusters', 0)
+                        p2_total_unique = phase2_metrics.get('coverage_total_unique_formulas', 0)
+                        print(f"  [Phase 2] Novelty: avg={p2_avg_novelty:.2f}, "
+                              f"saturated={p2_saturated}, productive={p2_productive}, "
+                              f"unique_formulas={p2_total_unique}", flush=True)
 
                         # Log Phase 2 metrics to separate CSV
                         phase2_log_path = OUTPUT_DIR / 'phase2_log.csv'
@@ -7264,6 +7316,7 @@ def train():
             physics_z_loss_fn=physics_z_loss_fn,  # V12.31
             manifest=_manifest,  # V12.29
             tc_bin_tracker=tc_bin_tracker,  # V15.1
+            phase2_runner=phase2_runner,  # Phase 2 state persistence
         )
 
         if metrics['exact_match'] > best_exact:
