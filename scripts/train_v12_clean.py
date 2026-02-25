@@ -1256,6 +1256,7 @@ def signal_handler(signum, frame):
             physics_z_loss_fn=_shutdown_state.get('physics_z_loss_fn'),  # V12.31
             manifest=_interrupt_manifest,  # V12.29
             tc_bin_tracker=_shutdown_state.get('tc_bin_tracker'),  # V15.1
+            phase2_runner=_shutdown_state.get('phase2_runner'),  # Phase 2 state
         )
     sys.exit(0)
 
@@ -6448,6 +6449,9 @@ def train():
         else:
             print(f"  [Phase 2] No saved state — starting fresh", flush=True)
 
+        # Register in shutdown state for interrupt handler
+        _shutdown_state['phase2_runner'] = phase2_runner
+
     # V14.2: Pre-training baseline eval — verify loaded model quality before any training
     # This catches migration/loading problems before wasting an epoch.
     if start_epoch > 0 and TRAIN_CONFIG.get('pre_train_eval', True):
@@ -6935,7 +6939,8 @@ def train():
                                theory_loss_fn=theory_loss_fn,
                                physics_z_loss_fn=physics_z_loss_fn,
                                manifest=_build_current_manifest(),
-                               tc_bin_tracker=tc_bin_tracker)  # V15.1
+                               tc_bin_tracker=tc_bin_tracker,
+                               phase2_runner=phase2_runner)
                 raise RuntimeError(f"Training stopped: {max_rollbacks} consecutive rollbacks detected. "
                                    f"Check data, model architecture, or hyperparameters.")
 
