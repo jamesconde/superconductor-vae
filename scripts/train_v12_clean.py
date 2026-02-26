@@ -402,7 +402,7 @@ def build_family_lookup_tensors(device):
     return fine_to_coarse, fine_to_cuprate_sub, fine_to_iron_sub
 
 
-ALGO_VERSION = 'V15.3'  # Bump this when making algorithm changes
+ALGO_VERSION = 'V12.43'  # Model architecture version (Net2Net expanded from V12.41)
 
 TRAIN_CONFIG = {
     'num_epochs': 5000,
