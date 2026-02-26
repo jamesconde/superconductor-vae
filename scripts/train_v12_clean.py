@@ -650,7 +650,7 @@ TRAIN_CONFIG = {
     'z_cache_interval': 50,                 # Cache every N epochs (0 = only on best checkpoint)
     'z_cache_path': 'outputs/latent_cache.pt',  # Path to save z cache
     'z_cache_mode': 'z_and_predictions',    # 'z_only', 'z_and_predictions', or 'full'
-    'z_cache_every_epoch': True,            # Cache EVERY epoch for full error analysis over time
+    'z_cache_every_epoch': False,           # True = cache EVERY epoch (~200MB each, 1TB+ at 5000 epochs)
 
     # =========================================================================
     # Topology Tracking (latent space topology metadata)
@@ -714,9 +714,10 @@ TRAIN_CONFIG = {
     'retrain_new_data': False,
 
     # V12.31: Disable catastrophic drop detection entirely
-    # Use when making large architectural changes (e.g., physics Z reorganizes 512 Z coords)
-    # that will cause expected multi-epoch performance drops during adaptation.
-    'disable_drop_detection': True,
+    # Use TEMPORARILY when making large architectural changes (e.g., physics Z reorganizes
+    # 512 Z coords) that will cause expected multi-epoch performance drops during adaptation.
+    # Reset to False after the architectural change stabilizes.
+    'disable_drop_detection': False,
 
     # =========================================================================
     # Contrastive dataset mode: loads 46K mixed SC + non-SC data
@@ -3362,9 +3363,10 @@ def save_checkpoint(encoder, decoder, epoch, suffix='', entropy_manager=None,
         checkpoint_data['phase2_state'] = phase2_runner.get_state()
 
     # V13.0: Store decoder architecture params for auto-detection by holdout/analysis scripts
-    checkpoint_data['d_model'] = MODEL_CONFIG.get('d_model', 512)
+    # Fallback values must match current MODEL_CONFIG defaults (V12.43: Net2Net expanded)
+    checkpoint_data['d_model'] = MODEL_CONFIG.get('d_model', 576)
     checkpoint_data['nhead'] = MODEL_CONFIG.get('nhead', 8)
-    checkpoint_data['dim_feedforward'] = MODEL_CONFIG.get('dim_feedforward', 2048)
+    checkpoint_data['dim_feedforward'] = MODEL_CONFIG.get('dim_feedforward', 2304)
     checkpoint_data['num_layers'] = MODEL_CONFIG.get('num_layers', 12)
     checkpoint_data['max_formula_len'] = TRAIN_CONFIG.get('max_formula_len', 30)
     if TRAIN_CONFIG.get('use_semantic_fractions', False):
