@@ -1124,6 +1124,10 @@ class EnhancedTransformerDecoder(nn.Module):
                     next_token = logits.argmax(dim=-1, keepdim=True)
                 else:
                     probs = F.softmax(logits, dim=-1)
+                    # Guard against NaN/inf from degenerate logits (e.g., after
+                    # Net2Net expansion or with fresh/mismatched weights)
+                    if torch.isnan(probs).any() or torch.isinf(probs).any():
+                        probs = torch.ones_like(probs) / probs.size(-1)
                     next_token = torch.multinomial(probs, num_samples=1)
 
                 finished = finished | (next_token.squeeze(-1) == END_IDX)
@@ -1446,6 +1450,10 @@ class EnhancedTransformerDecoder(nn.Module):
                         log_prob = torch.zeros(batch_size, device=device)
                 else:
                     probs = F.softmax(logits, dim=-1)
+                    # Guard against NaN/inf from degenerate logits (e.g., after
+                    # Net2Net expansion or with fresh/mismatched weights)
+                    if torch.isnan(probs).any() or torch.isinf(probs).any():
+                        probs = torch.ones_like(probs) / probs.size(-1)
                     next_token = torch.multinomial(probs, num_samples=1)
                     if return_log_probs:
                         log_prob = F.log_softmax(logits, dim=-1).gather(1, next_token).squeeze(-1)

@@ -708,8 +708,10 @@ TRAIN_CONFIG = {
     'resume_checkpoint': 'auto',
 
     # V12.12: Retrain on new/combined data - resets catastrophic drop detector
-    # Set to True when training data has changed (new normalization stats)
-    'retrain_new_data': True,
+    # Set to True TEMPORARILY when training data has changed (new normalization stats).
+    # WARNING: This resets best_exact=0.0, so the first completed epoch will overwrite
+    # checkpoint_best.pt even if the model is degraded. Set back to False after first run.
+    'retrain_new_data': False,
 
     # V12.31: Disable catastrophic drop detection entirely
     # Use when making large architectural changes (e.g., physics Z reorganizes 512 Z coords)
@@ -6225,7 +6227,20 @@ def train():
             if TRAIN_CONFIG.get('retrain_new_data', False):
                 print(f"  [RETRAIN MODE] Resetting drop detector (prev_exact was {prev_exact:.3f})")
                 prev_exact = 0.0
-                best_exact = 0.0  # Deliberate: new data means old metrics are incomparable
+                # Reset best_exact but preserve a safety floor from the checkpoint.
+                # This prevents the very first epoch from overwriting checkpoint_best.pt
+                # with a degraded model (e.g., right after Net2Net expansion or when
+                # weights don't load due to shape mismatches).
+                _ckpt_best = resume_state.get('best_exact', 0)
+                if _ckpt_best > 0.5:
+                    # High prior best — use 50% of it as safety floor. Model must
+                    # recover past this threshold before overwriting the checkpoint.
+                    best_exact = _ckpt_best * 0.5
+                    print(f"  [RETRAIN MODE] best_exact safety floor: {best_exact:.3f} "
+                          f"(50% of checkpoint best {_ckpt_best:.3f})")
+                else:
+                    best_exact = 0.0
+                    print(f"  [RETRAIN MODE] best_exact reset to 0.0 (checkpoint best was {_ckpt_best:.3f})")
 
             # V14.2: Migration LR boost — temporarily increase LR after vocab expansion
             # At late cosine schedule epochs, LR is very low (~10% of initial).
