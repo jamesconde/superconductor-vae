@@ -7018,36 +7018,56 @@ def train():
         # V12.40: Update per-loss convergence state
         # Each loss independently: converge below threshold → skip, spike above baseline + delta → resume
         if loss_skip_enabled:
-            for key, state in loss_skip_state.items():
-                thresh, delta = loss_skip_schedule[key]
-                current_val = metrics.get(key, 0)
-
-                if key in losses_skipped_this_epoch:
-                    # This loss was skipped — metric is 0, don't use it for convergence check
-                    continue
-
-                # V12.40 fix: Compare WEIGHTED loss value against threshold
-                # Thresholds represent actual contribution to total loss, not raw values
-                weight = state['base_weight']
-                weighted_val = current_val * weight
-
-                if not state['converged']:
-                    # Check if this loss should enter converged state
-                    if weighted_val < thresh:
-                        state['converged'] = True
-                        state['baseline'] = current_val
-                        print(f"  [LossSkip] {key} converged: {current_val:.4f}*{weight:.3f}={weighted_val:.4f} < {thresh} — "
-                              f"skipping every {loss_skip_freq-1}/{loss_skip_freq} epochs", flush=True)
-                else:
-                    # Already converged — check for spike on check epochs
-                    weighted_baseline = state['baseline'] * weight
-                    if weighted_val > weighted_baseline + delta:
+            # Guard: if ALL batches were NaN-skipped, metrics are all 0 and meaningless.
+            # Do NOT update convergence state from an all-NaN epoch — it would
+            # permanently mark every loss as "converged" with baseline=0.
+            _all_nan_epoch = metrics.get('n_total_batches', 1) == 0
+            if _all_nan_epoch:
+                # Also reset any losses that were falsely converged with baseline=0
+                for key, state in loss_skip_state.items():
+                    if state['converged'] and state['baseline'] == 0.0:
                         state['converged'] = False
-                        print(f"  [LossSkip] {key} spiked: {weighted_val:.4f} > "
-                              f"{weighted_baseline:.4f} + {delta} — resuming every-epoch", flush=True)
+                        print(f"  [LossSkip] {key} RECOVERY: baseline was 0 (NaN epoch) — resetting",
+                              flush=True)
+            else:
+                for key, state in loss_skip_state.items():
+                    thresh, delta = loss_skip_schedule[key]
+                    current_val = metrics.get(key, 0)
+
+                    if key in losses_skipped_this_epoch:
+                        # This loss was skipped — metric is 0, don't use it for convergence check
+                        continue
+
+                    # Recovery: if previously converged with baseline=0 (from NaN epoch),
+                    # reset to not-converged now that we have real data
+                    if state['converged'] and state['baseline'] == 0.0 and current_val > 0:
+                        state['converged'] = False
+                        print(f"  [LossSkip] {key} RECOVERY: baseline was 0 (NaN epoch), "
+                              f"now {current_val:.4f} — resetting", flush=True)
+                        continue  # Let next epoch re-evaluate convergence
+
+                    # V12.40 fix: Compare WEIGHTED loss value against threshold
+                    # Thresholds represent actual contribution to total loss, not raw values
+                    weight = state['base_weight']
+                    weighted_val = current_val * weight
+
+                    if not state['converged']:
+                        # Check if this loss should enter converged state
+                        if weighted_val < thresh:
+                            state['converged'] = True
+                            state['baseline'] = current_val
+                            print(f"  [LossSkip] {key} converged: {current_val:.4f}*{weight:.3f}={weighted_val:.4f} < {thresh} — "
+                                  f"skipping every {loss_skip_freq-1}/{loss_skip_freq} epochs", flush=True)
                     else:
-                        # Still converged — update baseline to track drift downward
-                        state['baseline'] = min(state['baseline'], current_val)
+                        # Already converged — check for spike on check epochs
+                        weighted_baseline = state['baseline'] * weight
+                        if weighted_val > weighted_baseline + delta:
+                            state['converged'] = False
+                            print(f"  [LossSkip] {key} spiked: {weighted_val:.4f} > "
+                                  f"{weighted_baseline:.4f} + {delta} — resuming every-epoch", flush=True)
+                        else:
+                            # Still converged — update baseline to track drift downward
+                            state['baseline'] = min(state['baseline'], current_val)
 
         # Learning rate scheduling
         enc_scheduler.step()
