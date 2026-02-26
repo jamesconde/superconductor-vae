@@ -6827,15 +6827,16 @@ def train():
         # negative gradients when the model can't produce correct formulas (e.g.,
         # post-expansion at 0% exact). RL is restored when exact crosses threshold.
         _rl_min_exact = TRAIN_CONFIG.get('rl_min_exact', 0.0)
-        if _rl_min_exact > 0 and rl_reactivated and loss_fn.rl_weight > 0:
+        _rl_gated = getattr(loss_fn, '_rl_gated_off', False)
+        if _rl_min_exact > 0 and rl_reactivated and (loss_fn.rl_weight > 0 or _rl_gated):
             if prev_exact < _rl_min_exact:
-                if not getattr(loss_fn, '_rl_gated_off', False):
+                if not _rl_gated:
                     loss_fn._rl_gated_weight = loss_fn.rl_weight  # Save current weight
                     loss_fn._rl_gated_off = True
                     loss_fn.rl_weight = 0.0
                     print(f"  [RL GATE] Suppressed: exact {prev_exact*100:.1f}% < "
                           f"{_rl_min_exact*100:.0f}% threshold", flush=True)
-            elif getattr(loss_fn, '_rl_gated_off', False):
+            elif _rl_gated:
                 loss_fn.rl_weight = loss_fn._rl_gated_weight
                 loss_fn._rl_gated_off = False
                 print(f"  [RL GATE] Restored: exact {prev_exact*100:.1f}% >= "
