@@ -1552,6 +1552,25 @@ class SelfSupervisedEpoch:
         metrics['phase2_time'] = time.time() - t_start
         return metrics
 
+    @torch.no_grad()
+    def _build_stoich_pred(self, z: torch.Tensor) -> Optional[torch.Tensor]:
+        """Build stoich_pred from encoder heads for decoder conditioning.
+
+        V12 mode (37-dim): fractions(12) + numden(24) + count(1)
+        V13 mode (13-dim): fractions(12) + count(1)
+
+        Returns None if encoder lacks fraction_head.
+        """
+        if not hasattr(self.encoder, 'fraction_head'):
+            return None
+        fraction_output = self.encoder.fraction_head(z)
+        fraction_pred = fraction_output[:, :12]
+        element_count_pred = fraction_output[:, 12]
+        if hasattr(self.encoder, 'numden_head') and self.encoder.use_numden_head:
+            numden_pred = self.encoder.numden_head(z)
+            return torch.cat([fraction_pred, numden_pred, element_count_pred.unsqueeze(-1)], dim=-1)
+        return torch.cat([fraction_pred, element_count_pred.unsqueeze(-1)], dim=-1)
+
     def _run_inner(
         self,
         epoch: int,
@@ -1597,8 +1616,7 @@ class SelfSupervisedEpoch:
         with torch.no_grad():
             if n_greedy > 0:
                 z_g = z_sampled[:n_greedy]
-                dec_g = self.encoder.decode(z_g)
-                stoich_g = dec_g.get('attended_input', None)
+                stoich_g = self._build_stoich_pred(z_g)
                 tok_g, _, _ = self.decoder.generate_with_kv_cache(
                     z=z_g, stoich_pred=stoich_g, temperature=0.0,
                     max_len=self.max_formula_len,
@@ -1624,8 +1642,7 @@ class SelfSupervisedEpoch:
                 temp = self.config.collapse_temp_boost
 
             with torch.no_grad():
-                dec_e = self.encoder.decode(z_e)
-                stoich_e = dec_e.get('attended_input', None)
+                stoich_e = self._build_stoich_pred(z_e)
 
             tok_e, lp_e, _, mask_e = self.decoder.sample_for_reinforce(
                 z=z_e, stoich_pred=stoich_e, temperature=temp,

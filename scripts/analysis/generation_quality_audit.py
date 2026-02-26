@@ -292,9 +292,17 @@ def decode_z_batch(encoder, decoder, z_batch, temperature=0.01):
     all_formulas = []
     for start in range(0, len(z_batch), batch_size):
         z = z_batch[start:start + batch_size].to(DEVICE)
+        # Build stoich_pred: V12 (37-dim with numden) or V13 (13-dim without)
         fraction_output = encoder.fraction_head(z)
+        if hasattr(encoder, 'numden_head'):
+            fraction_pred = fraction_output[:, :12]
+            element_count_pred = fraction_output[:, 12]
+            numden_pred = encoder.numden_head(z)
+            stoich_pred = torch.cat([fraction_pred, numden_pred, element_count_pred.unsqueeze(-1)], dim=-1)
+        else:
+            stoich_pred = fraction_output  # [batch, 13]
         generated, _, _ = decoder.generate_with_kv_cache(
-            z=z, stoich_pred=fraction_output,  # V13.1: no encoder_skip
+            z=z, stoich_pred=stoich_pred,  # V12: 37-dim, V13+: 13-dim
             temperature=temperature,
         )
         for i in range(len(z)):

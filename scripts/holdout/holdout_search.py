@@ -377,7 +377,14 @@ def get_decoder_conditioning(encoder, z_batch):
         # Get fraction_pred from fraction_head
         fraction_output = encoder.fraction_head(z)
         fraction_pred = fraction_output[:, :12]  # max_elements=12
-        all_stoich.append(fraction_pred.cpu())
+        element_count_pred = fraction_output[:, 12]  # scalar count
+        # Build full stoich: V12 (37-dim with numden) or V13 (13-dim without)
+        if hasattr(encoder, 'numden_head'):
+            numden_pred = encoder.numden_head(z)
+            stoich = torch.cat([fraction_pred, numden_pred, element_count_pred.unsqueeze(-1)], dim=-1)
+        else:
+            stoich = torch.cat([fraction_pred, element_count_pred.unsqueeze(-1)], dim=-1)
+        all_stoich.append(stoich.cpu())
 
     return None, torch.cat(all_stoich, dim=0)
 
@@ -406,8 +413,15 @@ def decode_z_batch(encoder, decoder, z_batch, temperature=0.01, stop_boost=0.0):
         z = z_batch[start:start + batch_size].to(DEVICE)
 
         # Get stoichiometry prediction
+        # V12 (37-dim: fractions + numden + count) or V13 (13-dim: fractions + count)
         fraction_output = encoder.fraction_head(z)
-        stoich_pred = fraction_output  # [batch, 13] (12 fractions + count)
+        fraction_pred = fraction_output[:, :12]
+        element_count_pred = fraction_output[:, 12]
+        if hasattr(encoder, 'numden_head'):
+            numden_pred = encoder.numden_head(z)
+            stoich_pred = torch.cat([fraction_pred, numden_pred, element_count_pred.unsqueeze(-1)], dim=-1)
+        else:
+            stoich_pred = fraction_output  # [batch, 13] (12 fractions + count)
 
         generated, _, _ = decoder.generate_with_kv_cache(
             z=z,
