@@ -3474,11 +3474,20 @@ def cache_z_vectors(encoder, loader, device, epoch, cache_path, dataset_info=Non
             all_elem_mask.append(elem_mask.cpu())
 
             if include_predictions:
-                # Assemble stoich_pred for decoder generation: fractions(12) + count(1) = 13 dims
+                # Assemble stoich_pred for decoder generation
+                # V12.41: 37 dims (fractions + numden + count). V13.0+: 13 dims (fractions + count).
                 _frac = encoder_out.get('fraction_pred')
                 _ecount = encoder_out.get('element_count_pred')
+                _use_semantic = TRAIN_CONFIG.get('use_semantic_fractions', False)
                 if _frac is not None and _ecount is not None:
-                    _stoich = torch.cat([_frac, _ecount.unsqueeze(-1)], dim=-1)
+                    if _use_semantic:
+                        _stoich = torch.cat([_frac, _ecount.unsqueeze(-1)], dim=-1)  # [batch, 13]
+                    else:
+                        _numden = encoder_out.get('numden_pred')
+                        if _numden is not None:
+                            _stoich = torch.cat([_frac, _numden, _ecount.unsqueeze(-1)], dim=-1)  # [batch, 37]
+                        else:
+                            _stoich = torch.cat([_frac, _ecount.unsqueeze(-1)], dim=-1)  # [batch, 13] fallback
                 else:
                     _stoich = None
 
