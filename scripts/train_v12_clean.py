@@ -508,6 +508,7 @@ TRAIN_CONFIG = {
     #   - Higher n_samples_rloo = lower variance but slower
     # =========================================================================
     'rl_weight': 1.0,            # V13.2: Enabled for AR refinement (SCST). CE converged at 99.6% TF exact; RL closes the TF→AR gap.
+    'rl_min_exact': 0.0,         # V12.43: Suppress RL until TF exact >= this threshold (0=no gate)
     'ce_weight': 1.0,            # Cross-entropy weight (keep at 1.0)
     'n_samples_rloo': 4,         # Number of samples for RLOO baseline (A100: 4)
     'rl_temperature': 1.2,       # V15.2: Match old model that achieved good AR. Post-bottleneck rebuild needs exploration.
@@ -6811,6 +6812,26 @@ def train():
 
         # Get curriculum weights for this epoch
         tc_weight, magpie_weight = get_curriculum_weights(epoch)
+
+        # V12.43: RL minimum exact gate — suppress RL until model reaches a minimum
+        # exact match threshold. This prevents REINFORCE from generating massive
+        # negative gradients when the model can't produce correct formulas (e.g.,
+        # post-expansion at 0% exact). RL is restored when exact crosses threshold.
+        _rl_min_exact = TRAIN_CONFIG.get('rl_min_exact', 0.0)
+        if _rl_min_exact > 0 and rl_reactivated and loss_fn.rl_weight > 0:
+            if prev_exact < _rl_min_exact:
+                if not getattr(loss_fn, '_rl_gated_off', False):
+                    loss_fn._rl_gated_weight = loss_fn.rl_weight  # Save current weight
+                    loss_fn._rl_gated_off = True
+                    loss_fn.rl_weight = 0.0
+                    print(f"  [RL GATE] Suppressed: exact {prev_exact*100:.1f}% < "
+                          f"{_rl_min_exact*100:.0f}% threshold", flush=True)
+            elif getattr(loss_fn, '_rl_gated_off', False):
+                loss_fn.rl_weight = loss_fn._rl_gated_weight
+                loss_fn._rl_gated_off = False
+                print(f"  [RL GATE] Restored: exact {prev_exact*100:.1f}% >= "
+                      f"{_rl_min_exact*100:.0f}% → rl_weight={loss_fn.rl_weight:.4f}",
+                      flush=True)
 
         # TF locked at 1.0 — REINFORCE handles AR training via true generation
         # V15.2 LESSON: 2-pass scheduled sampling doesn't expose real error cascading
