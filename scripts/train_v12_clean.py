@@ -1023,36 +1023,58 @@ def _find_best_checkpoint(output_dir: Path) -> Path | None:
     """V14.3: Auto-detect the best checkpoint in the output directory.
 
     Priority:
-      1. checkpoint_best.pt (saved whenever TF exact match improves)
-      2. Highest-numbered checkpoint_epoch_XXXX.pt (most recent periodic save)
+      1. If checkpoint_best.pt exists AND no epoch checkpoint is newer → use best
+      2. If a checkpoint_epoch_*.pt has a HIGHER epoch number → prefer it
+         (handles post-expansion: best has stale weights, epoch has retrained weights)
+      3. Fall back to highest-numbered checkpoint_epoch_*.pt if no best exists
 
     Returns None if no checkpoint is found.
     """
     best = output_dir / 'checkpoint_best.pt'
+    best_epoch = -1
+    best_exact_val = None
+
+    # Check checkpoint_best.pt
     if best.exists():
-        # Peek at epoch to report which epoch this is from
         try:
             meta = torch.load(best, map_location='cpu', weights_only=False)
-            epoch = meta.get('epoch', '?')
-            best_exact = meta.get('best_exact', None)
+            best_epoch = meta.get('epoch', 0)
+            best_exact_val = meta.get('best_exact', None)
             del meta
-            info = f"epoch {epoch}"
-            if best_exact is not None:
-                info += f", best_exact={best_exact:.4f}"
+            info = f"epoch {best_epoch}"
+            if best_exact_val is not None:
+                info += f", best_exact={best_exact_val:.4f}"
             print(f"  [AUTO] Found checkpoint_best.pt ({info})")
         except Exception:
             print(f"  [AUTO] Found checkpoint_best.pt (could not peek at metadata)")
-        return best
 
-    # Fall back to highest-numbered epoch checkpoint
+    # Check epoch checkpoints
     epoch_files = sorted(
         output_dir.glob('checkpoint_epoch_*.pt'),
         key=lambda p: int(p.stem.split('_')[-1]) if p.stem.split('_')[-1].isdigit() else 0,
     )
-    if epoch_files:
-        latest = epoch_files[-1]
-        print(f"  [AUTO] No checkpoint_best.pt found, using latest: {latest.name}")
-        return latest
+    latest_epoch_file = epoch_files[-1] if epoch_files else None
+    latest_epoch_num = -1
+    if latest_epoch_file is not None:
+        try:
+            latest_epoch_num = int(latest_epoch_file.stem.split('_')[-1])
+        except ValueError:
+            pass
+
+    # Decision: prefer whichever has the higher epoch number
+    if best.exists() and latest_epoch_file is not None:
+        if latest_epoch_num > best_epoch:
+            print(f"  [AUTO] Epoch checkpoint {latest_epoch_file.name} (epoch {latest_epoch_num}) "
+                  f"is newer than checkpoint_best.pt (epoch {best_epoch}) — using epoch checkpoint")
+            print(f"  [AUTO] (checkpoint_best.pt has stale weights from before retraining)")
+            return latest_epoch_file
+        else:
+            return best
+    elif best.exists():
+        return best
+    elif latest_epoch_file is not None:
+        print(f"  [AUTO] No checkpoint_best.pt found, using latest: {latest_epoch_file.name}")
+        return latest_epoch_file
 
     return None
 
@@ -6214,6 +6236,26 @@ def train():
             _tc_bin_tracker_state = resume_state.get('tc_bin_tracker_state')
             _phase2_state = resume_state.get('phase2_state')
             print(f"  Starting from epoch {start_epoch}")
+
+            # V12.43: Detect stale checkpoint_best.pt — if we resumed from an epoch
+            # checkpoint (not best), reset best_exact to prev_exact so the retrained
+            # model can start updating checkpoint_best.pt. Without this, post-expansion
+            # training never overwrites best because prev_exact < old best_exact (0.854).
+            best_path = OUTPUT_DIR / 'checkpoint_best.pt'
+            if best_path.exists() and checkpoint_path != best_path:
+                try:
+                    _best_meta = torch.load(best_path, map_location='cpu', weights_only=False)
+                    _best_epoch = _best_meta.get('epoch', 0)
+                    del _best_meta
+                    if start_epoch > _best_epoch:
+                        _old_best = best_exact
+                        best_exact = prev_exact  # Reset to current model's actual performance
+                        print(f"  [AUTO] Resumed from epoch checkpoint (epoch {start_epoch}) "
+                              f"newer than checkpoint_best.pt (epoch {_best_epoch})")
+                        print(f"  [AUTO] Reset best_exact: {_old_best:.4f} → {best_exact:.4f} "
+                              f"(so checkpoint_best.pt gets updated)")
+                except Exception:
+                    pass  # If we can't read best, leave best_exact as-is
 
             # V12.31: Grace period when optimizers were freshly initialized
             # Fresh optimizers (lost Adam momentum) cause multi-epoch performance drops.
