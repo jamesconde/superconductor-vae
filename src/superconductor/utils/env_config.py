@@ -135,35 +135,33 @@ def detect_environment() -> dict:
     elif runtime == "colab":
         if gpu["class"] == "xlarge":
             # A100-80GB / H100-80GB (70GB+)
-            # V15.2: TF locked at 1.0 (single-pass forward). REINFORCE handles AR
-            # training via true generation. batch=2100 used 78/79GB — tight but stable.
-            # 46K samples / 2100 = ~22 steps/epoch.
+            # V12.43 Net2Net expansion (d_model 512→576, dim_ff 2048→2304) increased
+            # per-sample memory ~15-20%. Old batch=2100 (50x) OOM'd at 76.7/79.3GB.
+            # New: 25x * 2 accum = same effective batch (2100), half peak memory.
+            # 42 * 25 = 1050 per step, ~45 steps/epoch (52K / 1050).
             num_workers = min(8, cpus - 1) if cpus > 1 else 0
             pin_memory = True
             persistent_workers = True
             prefetch_factor = 4
-            batch_size_multiplier = 50.0  # 42 * 50 = 2100
-            accumulation_steps = 1        # No accumulation needed with huge batch
+            batch_size_multiplier = 25.0  # 42 * 25 = 1050 (halved from 50 post-expansion)
+            accumulation_steps = 2        # Effective batch = 1050 * 2 = 2100
             n_samples_rloo = 4            # 4 samples: proven effective, save VRAM for batch
             selective_backprop = False     # All samples get full gradients
             use_torch_compile = True
             compile_mode = "reduce-overhead"
         elif gpu["class"] == "large":
             # A100-40GB / H100-40GB (38-70GB)
-            # V15.2: TF locked at 1.0 (single-pass). batch=504 fits comfortably.
-            # 46K samples / 504 = ~92 steps/epoch.
+            # V12.43 Net2Net expansion: batch=504 (12x) was borderline on 40GB.
+            # Reduced to 8x with 2-step accumulation: 42*8=336 per step,
+            # effective=672. ~157 steps/epoch (52K / 336).
             num_workers = min(8, cpus - 1) if cpus > 1 else 0
             pin_memory = True
             persistent_workers = True
             prefetch_factor = 3
-            batch_size_multiplier = 12.0  # 42 * 12 = 504
-            accumulation_steps = 1        # No accumulation needed with large batch
+            batch_size_multiplier = 8.0   # 42 * 8 = 336 (reduced from 12 post-expansion)
+            accumulation_steps = 2        # Effective batch = 336 * 2 = 672
             n_samples_rloo = 4            # 4 samples: proven effective
             selective_backprop = False     # All samples get full gradients (no skipping)
-            # V12.20: torch.compile works on Colab A100 (1.5-2x speedup).
-            # V15.2: 'reduce-overhead' uses CUDA graphs for faster kernel dispatch.
-            # Previously avoided due to memory leak (pytorch#116096), but ~15GB
-            # headroom post-V15.0 bottleneck makes this safe on A100-40GB.
             use_torch_compile = True
             compile_mode = "reduce-overhead"
         elif gpu["class"] in ("medium", "small") and gpu["class"] != "none":
