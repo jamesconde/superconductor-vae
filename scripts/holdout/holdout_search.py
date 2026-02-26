@@ -366,7 +366,7 @@ def get_decoder_conditioning(encoder, z_batch):
         z_batch: [N, 2048] latent vectors (CPU or GPU)
 
     Returns:
-        None (no skip connection), stoich_pred: [N, 13] stoichiometry prediction
+        None (no skip connection), stoich_pred: [N, 37] (V12 w/ numden) or [N, 13] (V13+)
     """
     batch_size = 128
     all_stoich = []
