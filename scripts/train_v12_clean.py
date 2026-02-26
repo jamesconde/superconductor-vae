@@ -6487,6 +6487,7 @@ def train():
             print(f"  LR boost active: x{migration_lr_boost_factor:.1f} until epoch {migration_lr_boost_end}")
         print(f"{'='*70}\n", flush=True)
 
+    epoch = start_epoch - 1  # Guard: if loop is empty (num_epochs <= start_epoch), epoch is still defined
     for epoch in range(start_epoch, TRAIN_CONFIG['num_epochs']):
         _shutdown_state['epoch'] = epoch
 
