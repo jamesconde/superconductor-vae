@@ -987,6 +987,7 @@ TRAIN_CONFIG = {
     'phase2_enabled': False,              # Master toggle
     'phase2_start': 'auto',              # Epoch number or 'auto' (activate when exact >= threshold)
     'phase2_auto_min_exact': 0.80,       # Auto-activation threshold for exact match
+    'phase2_min_resume_epochs': 0,       # Suppress Phase 2 for N epochs after resume (post-expansion recovery)
     'phase2_interval': 2,                 # Run Phase 2 every N supervised epochs
     'phase2_max_weight': 0.1,            # Max total Phase 2 loss weight (ramped up over warmup)
     'phase2_warmup': 50,                  # Epochs to linearly ramp Phase 2 weight from 0 to max
@@ -7240,7 +7241,8 @@ def train():
         # =====================================================================
         if phase2_runner is not None:
             # Check activation condition
-            phase2_runner.should_activate(epoch, metrics['exact_match'])
+            phase2_runner.should_activate(epoch, metrics['exact_match'],
+                                             start_epoch=start_epoch)
 
             if phase2_runner.is_active and phase2_runner.should_run_this_epoch(epoch):
                 print(f"\n  [Phase 2] Running self-supervised sub-epoch "
@@ -7304,10 +7306,30 @@ def train():
                         print(f"  [Phase 2] Novelty: avg={p2_avg_novelty:.2f}, "
                               f"saturated={p2_saturated}, productive={p2_productive}, "
                               f"unique_formulas={p2_total_unique}", flush=True)
+                        # Individual loss breakdown
+                        p2_l1 = phase2_metrics.get('phase2_loss1_rt', 0)
+                        p2_l2 = phase2_metrics.get('phase2_loss2_consist', 0)
+                        p2_l3 = phase2_metrics.get('phase2_loss3_physics', 0)
+                        p2_l4 = phase2_metrics.get('phase2_loss4_reinforce', 0)
+                        p2_tc_mse = phase2_metrics.get('phase2_tc_mse', 0)
+                        print(f"  [Phase 2] Losses: rt={p2_l1:.4f}, consist={p2_l2:.4f}, "
+                              f"physics={p2_l3:.4f}, rl={p2_l4:.4f}, tc_mse={p2_tc_mse:.4f}",
+                              flush=True)
+                        # Example formulas (up to 5 valid, up to 5 invalid/rejected)
+                        _ex_valid = phase2_metrics.get('phase2_example_valid', [])
+                        _ex_invalid = phase2_metrics.get('phase2_example_invalid', [])
+                        if _ex_valid:
+                            print(f"  [Phase 2] Valid examples: {', '.join(_ex_valid[:5])}",
+                                  flush=True)
+                        if _ex_invalid:
+                            print(f"  [Phase 2] Rejected examples: {', '.join(_ex_invalid[:5])}",
+                                  flush=True)
 
-                        # Log Phase 2 metrics to separate CSV
+                        # Log Phase 2 metrics to separate CSV (exclude list-valued keys)
                         phase2_log_path = OUTPUT_DIR / 'phase2_log.csv'
-                        _p2_row = {'epoch': epoch, **phase2_metrics}
+                        _p2_row = {'epoch': epoch,
+                                   **{k: v for k, v in phase2_metrics.items()
+                                      if not isinstance(v, list)}}
                         import csv as _csv_p2
                         _p2_exists = phase2_log_path.exists()
                         with open(phase2_log_path, 'a', newline='') as _p2f:

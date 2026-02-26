@@ -1411,15 +1411,29 @@ class EnhancedTransformerDecoder(nn.Module):
                         length_boost = 10.0 * (position - 10) / max(max_len - 10, 1)
                         logits[:, END_IDX] = logits[:, END_IDX] + length_boost
 
+                # V12.43: Early NaN/Inf detection on logits. If degenerate,
+                # use uniform distribution for entropy, probs, AND log_probs.
+                # Previously the guard only fixed probs for multinomial but
+                # log_probs still used F.log_softmax(NaN_logits) → NaN,
+                # poisoning REINFORCE loss and blocking all training.
+                _logits_degenerate = (
+                    torch.isnan(logits).any() or torch.isinf(logits).any()
+                )
+
                 # V12.8: Compute proper entropy BEFORE temperature/filtering
                 # H(p) = -sum(p * log(p)) over vocabulary
                 if return_entropy:
-                    # Use raw logits (no temperature) for true distribution entropy
-                    # V12.40: Clamp to avoid 0*log(0)=NaN when softmax produces exact 0.0
-                    probs_for_entropy = F.softmax(logits, dim=-1).clamp(min=1e-8)
-                    log_probs_for_entropy = probs_for_entropy.log()
-                    # Entropy: -sum(p * log(p)), sum over vocab dimension
-                    step_entropy = -(probs_for_entropy * log_probs_for_entropy).sum(dim=-1)  # [batch]
+                    if _logits_degenerate:
+                        import math as _math
+                        step_entropy = torch.full(
+                            (batch_size,), _math.log(max(logits.size(-1), 1)),
+                            device=device,
+                        )
+                    else:
+                        # V12.40: Clamp to avoid 0*log(0)=NaN when softmax produces exact 0.0
+                        probs_for_entropy = F.softmax(logits, dim=-1).clamp(min=1e-8)
+                        log_probs_for_entropy = probs_for_entropy.log()
+                        step_entropy = -(probs_for_entropy * log_probs_for_entropy).sum(dim=-1)  # [batch]
                     entropy_list.append(step_entropy)
 
                 # Apply temperature
@@ -1450,13 +1464,13 @@ class EnhancedTransformerDecoder(nn.Module):
                         log_prob = torch.zeros(batch_size, device=device)
                 else:
                     probs = F.softmax(logits, dim=-1)
-                    # Guard against NaN/inf from degenerate logits (e.g., after
-                    # Net2Net expansion or with fresh/mismatched weights)
-                    if torch.isnan(probs).any() or torch.isinf(probs).any():
+                    if _logits_degenerate:
                         probs = torch.ones_like(probs) / probs.size(-1)
                     next_token = torch.multinomial(probs, num_samples=1)
                     if return_log_probs:
-                        log_prob = F.log_softmax(logits, dim=-1).gather(1, next_token).squeeze(-1)
+                        # Use clamped probs.log() instead of F.log_softmax(logits)
+                        # so NaN-guarded probs produce valid finite log_probs
+                        log_prob = probs.clamp(min=1e-8).log().gather(1, next_token).squeeze(-1)
 
                 # Record generated token and log prob
                 generated_tokens.append(next_token)

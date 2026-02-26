@@ -95,6 +95,11 @@ def _formula_to_encoder_input(
         z = _SYMBOL_TO_Z.get(symbol, 0)
         if z == 0:
             continue  # Skip unknown elements without advancing pos
+        # Guard: garbage formulas from broken models can produce fraction
+        # values that overflow float32 (e.g., "H999999999"). Clamp to [0, 1000].
+        if not isinstance(frac, (int, float)) or frac != frac:  # NaN check
+            continue
+        frac = max(0.0, min(float(frac), 1000.0))
         indices[pos] = z
         fractions[pos] = frac
         mask[pos] = 1.0

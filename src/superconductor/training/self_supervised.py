@@ -63,6 +63,8 @@ class SelfSupervisedConfig:
     start: str = 'auto'          # Epoch number or 'auto'
     auto_min_exact: float = 0.80  # Min exact match to auto-activate
     interval: int = 2            # Run every N supervised epochs
+    min_resume_epochs: int = 0   # Suppress activation for N epochs after training starts
+                                 # (e.g., 50 for post-expansion recovery)
 
     # Weight ramping
     max_weight: float = 0.1      # Max total Phase 2 loss weight
@@ -134,6 +136,7 @@ class SelfSupervisedConfig:
             start=config.get('phase2_start', 'auto'),
             auto_min_exact=config.get('phase2_auto_min_exact', 0.80),
             interval=config.get('phase2_interval', 2),
+            min_resume_epochs=config.get('phase2_min_resume_epochs', 0),
             max_weight=config.get('phase2_max_weight', 0.1),
             warmup_epochs=config.get('phase2_warmup', 50),
             n_samples=n,
@@ -1353,14 +1356,27 @@ class SelfSupervisedEpoch:
         # Track unique formulas across sub-epochs for diversity
         self._all_unique_formulas = set()
 
-    def should_activate(self, epoch: int, current_exact: float) -> bool:
-        """Check if Phase 2 should activate this epoch."""
+    def should_activate(self, epoch: int, current_exact: float,
+                        start_epoch: int = 0) -> bool:
+        """Check if Phase 2 should activate this epoch.
+
+        Args:
+            epoch: Current training epoch
+            current_exact: Current exact match rate
+            start_epoch: Epoch training resumed from (for min_resume_epochs guard)
+        """
         if not self.config.enabled:
             return False
 
         # Already activated?
         if self._phase2_activation_epoch is not None:
             return True
+
+        # Suppress for N epochs after training starts/resumes (post-expansion recovery)
+        if self.config.min_resume_epochs > 0:
+            epochs_since_resume = epoch - start_epoch
+            if epochs_since_resume < self.config.min_resume_epochs:
+                return False
 
         # Check activation condition
         if self.config.start == 'auto':
@@ -1371,8 +1387,8 @@ class SelfSupervisedEpoch:
             return False
         else:
             # Explicit epoch
-            start_epoch = int(self.config.start)
-            if epoch >= start_epoch:
+            start_ep = int(self.config.start)
+            if epoch >= start_ep:
                 self._phase2_activation_epoch = epoch
                 self._activation_exact = current_exact
                 return True
@@ -1674,6 +1690,11 @@ class SelfSupervisedEpoch:
         n_degenerate = sum(c - 1 for c in formula_counts.values())  # Extra copies
         unique_rate = n_unique_formulas / max(1, n_valid)
 
+        # Collect example formulas for logging (up to 5 valid + 5 invalid)
+        _example_valid = list(dict.fromkeys(valid_formulas))[:5]  # Unique, preserving order
+        _rejected_set = set(valid_formulas)
+        _example_invalid = [f for f in all_formulas if f not in _rejected_set][:5]
+
         # Mode collapse detection
         if n_valid > 0 and unique_rate < self.config.collapse_threshold:
             if not self._collapse_active:
@@ -1692,6 +1713,8 @@ class SelfSupervisedEpoch:
                 'phase2_n_degenerate': 0,
                 'phase2_valid_rate': 0.0,
                 'phase2_unique_rate': 0.0,
+                'phase2_example_valid': [],
+                'phase2_example_invalid': _example_invalid,
                 **{f'phase2_filter_{k}': v for k, v in filter_stats.items()},
                 **{f'phase2_sample_{k}': v for k, v in sample_stats.items()},
             }
@@ -1782,6 +1805,8 @@ class SelfSupervisedEpoch:
             'phase2_collapse_active': int(self._collapse_active),
             'phase2_n_novel': discovery_stats['n_novel'],
             'phase2_n_holdout_recovered': discovery_stats['n_holdout_recovered'],
+            'phase2_example_valid': _example_valid,
+            'phase2_example_invalid': _example_invalid,
             'phase2_elem_total_unique': (
                 sum(len(s) for s in self.sampler._element_seen_formulas.values())
                 if self.sampler._element_seen_formulas else 0
