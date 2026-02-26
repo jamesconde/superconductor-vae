@@ -146,6 +146,7 @@ This is the only signal that reaches the decoder.
 | Separate LR | Phase 2 uses 0.1x main LR | Prevents destabilizing converged heads |
 | Gradient clipping | Phase 2 gradients clipped at 0.5 (vs 1.0 for Phase 1) | Tighter clip for novel z |
 | Frequency control | Phase 2 runs every 2 epochs (model already at 86.5% — supervised epochs have diminishing returns) | Configurable via `phase2_interval` |
+| Resume delay | Suppress Phase 2 for N epochs after training resumes (post-expansion, checkpoint resume) | `phase2_min_resume_epochs = 50` in Colab |
 
 ---
 
@@ -220,6 +221,8 @@ double round-trip weight + add diversity bonus to REINFORCE reward.
 'phase2_element_min_shared': 2,               # Min shared elements for neighbor status
 'phase2_element_perturb_sigma': 0.05,         # Perturbation sigma for centroid blends
 'phase2_element_interpolate_fraction': 0.3,   # Fraction using SLERP (rest = centroid blend)
+'phase2_min_resume_epochs': 0,               # Suppress Phase 2 for N epochs after resume
+                                              # (e.g., 50 for post-Net2Net-expansion recovery)
 'holdout_eval_interval': 50,
 'holdout_eval_budget': 200,
 ```
@@ -363,6 +366,26 @@ elem_weight = (1 / (1 + visits)) * novelty_factor
 | `coverage_productive_clusters` | Clusters with novelty rate >= 20% (still discovering) |
 | `coverage_total_unique_formulas` | Sum of unique formulas across all clusters |
 | `phase2_elem_total_unique` | Sum of unique formulas across all elements |
+
+### Console Logging
+
+Each Phase 2 sub-epoch prints 5 lines to console (and to Gist via stdout capture):
+
+1. **Summary**: valid/sampled counts, degeneracy, total loss, z_mse, weight
+2. **Coverage**: cluster visit stats, Gini coefficient, garbage/boundary clusters
+3. **Novelty**: avg novelty rate, saturated/productive cluster counts, total unique formulas
+4. **Losses**: Individual loss breakdown (round-trip, consistency, physics, REINFORCE, Tc MSE)
+5. **Examples**: Up to 5 valid formulas + up to 5 rejected formulas (for diagnostic inspection)
+
+Example output:
+```
+  [Phase 2] Done in 12.3s | valid=45/128 (degen=3, unique_rate=0.93) | loss=0.0234 | z_mse=0.0012 | weight=0.0500
+  [Phase 2] Coverage: 78% clusters visited, gini=0.312, garbage=5, boundary=8, elem_anchored=26
+  [Phase 2] Novelty: avg=0.45, saturated=12, productive=28, unique_formulas=156
+  [Phase 2] Losses: rt=0.0120, consist=0.0050, physics=0.0030, rl=0.0034, tc_mse=0.0089
+  [Phase 2] Valid examples: Ba(2/3)Cu(1/3)O, Y(1/2)Ba(1/2)CuO(3/2), ...
+  [Phase 2] Rejected examples: AAAA, Cu(999999/1), ...
+```
 
 ### State Persistence
 
