@@ -111,6 +111,30 @@ PYTHONPATH=src python scripts/migrate_checkpoint_v1243_wider.py
 4. Train on A100 with fresh optimizer + LR warmup (20 epochs)
 5. Monitor via gist: exact match recovery → plateau → Phase 2 → generalization
 
+### Post-Expansion Training Fixes (2026-02-26)
+
+Model starts at 0% exact after expansion. Several issues discovered during first Colab run:
+
+| Fix | Root Cause | Solution |
+|-----|-----------|----------|
+| **NaN log_probs** | `F.log_softmax(NaN_logits)` in REINFORCE sampling — probs fixed for multinomial but log_prob still used raw logits | Added `_logits_degenerate` flag; use `probs.clamp(min=1e-8).log()` instead |
+| **Round-trip overflow** | Garbage formulas from 0% model produce fraction values overflowing float32 | Clamp fractions to [0, 1000] + NaN check |
+| **LossSkip false convergence** | All-NaN epoch returns 0.0 → LossSkip marks all losses as "converged" with baseline=0 | Skip convergence updates on NaN epochs + recovery for baseline=0 |
+| **CUDA graph crash** | Encoder compiled with `reduce-overhead` but called 3x per batch (main + A5 + REINFORCE) | Compile encoder with `mode='default'` (7% of model, minimal perf impact) |
+| **RL domination** | REINFORCE generates -15000 loss at 0% exact, consuming 92% of epoch time | New `rl_min_exact` gate (see below) |
+
+### RL Minimum Exact Gate (`rl_min_exact`)
+
+New config key `rl_min_exact` (default 0.0 = disabled) suppresses REINFORCE until teacher-forced exact match reaches the specified threshold. When suppressed:
+- `loss_fn.rl_weight` is set to 0.0 (saved and restored)
+- Console prints `[RL GATE] Suppressed: exact X% < Y% threshold`
+- When exact crosses the threshold: `[RL GATE] Restored: ... → rl_weight=Z`
+- RL auto-scale then calibrates the weight on the first RL-active epoch
+
+**Colab setting**: `rl_min_exact=0.65` — at 0-65% exact, training uses only CE + Tc + Magpie losses, which is ~2x faster per epoch and avoids RL's massive negative gradients from drowning out reconstruction signals.
+
+**Phase 2 threshold**: Raised from `phase2_auto_min_exact=0.80` to `0.90` — self-supervised z-space exploration needs a model that can reliably decode formulas.
+
 ---
 
 ## V12.41 Backward Compatibility Mode (2026-02-24)
