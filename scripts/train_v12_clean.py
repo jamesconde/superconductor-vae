@@ -6284,7 +6284,15 @@ def train():
     if use_compile:
         compile_mode = TRAIN_CONFIG.get('compile_mode', 'reduce-overhead')
         print(f"\nCompiling models with mode='{compile_mode}'...")
-        encoder = torch.compile(encoder, mode=compile_mode)
+        # V12.43: Do NOT compile encoder with 'reduce-overhead' — the encoder is
+        # called multiple times per batch (main forward, A5 round-trip re-encode,
+        # REINFORCE baseline) and CUDA graph static buffers get overwritten between
+        # calls, crashing backward(). Encoder is only 9M params (7% of total),
+        # so compile benefit is minimal. Use 'default' mode for encoder instead.
+        if compile_mode == 'reduce-overhead':
+            encoder = torch.compile(encoder, mode='default')
+        else:
+            encoder = torch.compile(encoder, mode=compile_mode)
         # Compile decoder's transformer, not the whole decoder (KV cache needs dynamic shapes)
         decoder.transformer_decoder = torch.compile(
             decoder.transformer_decoder, mode=compile_mode
@@ -6299,7 +6307,9 @@ def train():
         if TRAIN_CONFIG.get('constraint_zoo_enabled', False):
             loss_fn.set_constraint_zoo(encoder, decoder, TRAIN_CONFIG,
                                     v13_tokenizer=v13_tokenizer)
-        print("  Encoder and decoder.transformer_decoder compiled")
+        _enc_mode = 'default' if compile_mode == 'reduce-overhead' else compile_mode
+        print(f"  Encoder compiled (mode='{_enc_mode}'), "
+              f"decoder.transformer_decoder compiled (mode='{compile_mode}')")
 
         # Warmup pass: initialize CUDA graphs with a real batch to prevent NaN on first epoch
         # reduce-overhead mode uses CUDA graphs which need stable tensor shapes/states
