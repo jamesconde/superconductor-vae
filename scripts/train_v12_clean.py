@@ -509,6 +509,7 @@ TRAIN_CONFIG = {
     # =========================================================================
     'rl_weight': 1.0,            # V13.2: Enabled for AR refinement (SCST). CE converged at 99.6% TF exact; RL closes the TF→AR gap.
     'rl_min_exact': 0.0,         # V12.43: Suppress RL until TF exact >= this threshold (0=no gate)
+    'rl_min_ar_exact': 0.0,      # V12.43: Suppress RL until TRUE AR exact >= threshold (preferred over rl_min_exact)
     'ce_weight': 1.0,            # Cross-entropy weight (keep at 1.0)
     'n_samples_rloo': 4,         # Number of samples for RLOO baseline (A100: 4)
     'rl_temperature': 1.2,       # V15.2: Match old model that achieved good AR. Post-bottleneck rebuild needs exploration.
@@ -3421,6 +3422,10 @@ def save_checkpoint(encoder, decoder, epoch, suffix='', entropy_manager=None,
         checkpoint_data['prev_exact'] = prev_exact
     if best_exact is not None:
         checkpoint_data['best_exact'] = best_exact
+    # V12.43: Save last-known AR exact for RL gate (set via _shutdown_state)
+    _last_ar = _shutdown_state.get('last_ar_exact', 0.0)
+    if _last_ar > 0:
+        checkpoint_data['last_ar_exact'] = _last_ar
 
     # V12.29: Embed training manifest for version/config tracking
     if manifest is not None:
@@ -4251,6 +4256,7 @@ def load_checkpoint(encoder, decoder, checkpoint_path, entropy_manager=None,
         'start_epoch': start_epoch,
         'prev_exact': checkpoint.get('prev_exact', 0),
         'best_exact': checkpoint.get('best_exact', 0),
+        'last_ar_exact': checkpoint.get('last_ar_exact', 0.0),  # V12.43: RL AR gate
         'fresh_optimizers': fresh_optimizers,        # V12.31: Grace period needed
         'physics_z_is_new': physics_z_is_new,        # V12.31: Warmup from introduction
         'vocab_expanded': _vocab_expanded,            # V14.2: Migration LR boost needed
@@ -6159,6 +6165,7 @@ def train():
     start_epoch = 0
     best_exact = 0
     prev_exact = 0  # Track previous epoch's exact match for adaptive TF
+    last_ar_exact = 0.0  # V12.43: Track last-known TRUE AR exact (evaluated every 4 epochs)
     prev_entropy = 0.5  # Track previous epoch's entropy for entropy manager (V12.9)
     migration_lr_boost_end = 0  # V14.2: No boost unless vocab expansion detected
     migration_lr_boost_factor = 1.0
@@ -6280,6 +6287,7 @@ def train():
             start_epoch = resume_state['start_epoch']
             prev_exact = resume_state['prev_exact']
             best_exact = resume_state['best_exact']
+            last_ar_exact = resume_state.get('last_ar_exact', 0.0)  # V12.43: RL AR gate
             # V15.1: Deferred — store state, apply after tracker is created (~line after family_lookup_tables)
             _tc_bin_tracker_state = resume_state.get('tc_bin_tracker_state')
             _phase2_state = resume_state.get('phase2_state')
@@ -6362,6 +6370,7 @@ def train():
             # Sync shutdown state so interrupt checkpoint preserves the correct values
             _shutdown_state['best_exact'] = best_exact
             _shutdown_state['prev_exact'] = prev_exact
+            _shutdown_state['last_ar_exact'] = last_ar_exact  # V12.43: RL AR gate
         elif _resume_val != 'auto':
             # Explicit path was given but doesn't exist
             print(f"\n{'='*70}")
@@ -6604,12 +6613,14 @@ def train():
             v13_tokenizer=_eval_tokenizer_pre,
         )
         err_dist = pre_eval['error_distribution']
+        # V12.43: Update last_ar_exact from baseline eval (useful for RL AR gate on fresh resume)
+        last_ar_exact = max(last_ar_exact, pre_eval['true_exact_match'])
         print(f"  Loaded model baseline (500 samples): "
               f"{pre_eval['true_exact_match']*100:.1f}% exact "
               f"({pre_eval['exact_count']}/{pre_eval['total_samples']})")
         print(f"  Error distribution: 0={err_dist[0]}, 1={err_dist[1]}, "
               f"2={err_dist[2]}, 3={err_dist[3]}, >3={err_dist['more']}")
-        print(f"  best_exact={best_exact:.3f}, prev_exact={prev_exact:.3f}")
+        print(f"  best_exact={best_exact:.3f}, prev_exact={prev_exact:.3f}, last_ar_exact={last_ar_exact:.3f}")
         print(f"  LR: enc={enc_opt.param_groups[0]['lr']:.2e}, dec={dec_opt.param_groups[0]['lr']:.2e}")
         if migration_lr_boost_end > 0:
             print(f"  LR boost active: x{migration_lr_boost_factor:.1f} until epoch {migration_lr_boost_end}")
@@ -6913,24 +6924,46 @@ def train():
         tc_weight, magpie_weight = get_curriculum_weights(epoch)
 
         # V12.43: RL minimum exact gate — suppress RL until model reaches a minimum
-        # exact match threshold. This prevents REINFORCE from generating massive
-        # negative gradients when the model can't produce correct formulas (e.g.,
-        # post-expansion at 0% exact). RL is restored when exact crosses threshold.
-        _rl_min_exact = TRAIN_CONFIG.get('rl_min_exact', 0.0)
+        # exact match threshold. Prevents REINFORCE from generating massive negative
+        # gradients when the model can't produce correct formulas (e.g., post-expansion).
+        #
+        # Two modes:
+        #   rl_min_ar_exact > 0: Gate on TRUE AR exact (preferred — directly measures
+        #       what RL trains). Evaluated every 4 epochs, uses last-known value.
+        #   rl_min_exact > 0: Gate on TF exact (legacy fallback).
+        _rl_min_ar = TRAIN_CONFIG.get('rl_min_ar_exact', 0.0)
+        _rl_min_tf = TRAIN_CONFIG.get('rl_min_exact', 0.0)
         _rl_gated = getattr(loss_fn, '_rl_gated_off', False)
-        if _rl_min_exact > 0 and rl_reactivated and (loss_fn.rl_weight > 0 or _rl_gated):
-            if prev_exact < _rl_min_exact:
+
+        if _rl_min_ar > 0 and rl_reactivated and (loss_fn.rl_weight > 0 or _rl_gated):
+            # Gate on TRUE autoregressive exact match
+            if last_ar_exact < _rl_min_ar:
                 if not _rl_gated:
-                    loss_fn._rl_gated_weight = loss_fn.rl_weight  # Save current weight
+                    loss_fn._rl_gated_weight = loss_fn.rl_weight
                     loss_fn._rl_gated_off = True
                     loss_fn.rl_weight = 0.0
-                    print(f"  [RL GATE] Suppressed: exact {prev_exact*100:.1f}% < "
-                          f"{_rl_min_exact*100:.0f}% threshold", flush=True)
+                    print(f"  [RL GATE] Suppressed: AR exact {last_ar_exact*100:.1f}% < "
+                          f"{_rl_min_ar*100:.0f}% threshold", flush=True)
             elif _rl_gated:
                 loss_fn.rl_weight = loss_fn._rl_gated_weight
                 loss_fn._rl_gated_off = False
-                print(f"  [RL GATE] Restored: exact {prev_exact*100:.1f}% >= "
-                      f"{_rl_min_exact*100:.0f}% → rl_weight={loss_fn.rl_weight:.4f}",
+                print(f"  [RL GATE] Restored: AR exact {last_ar_exact*100:.1f}% >= "
+                      f"{_rl_min_ar*100:.0f}% → rl_weight={loss_fn.rl_weight:.4f}",
+                      flush=True)
+        elif _rl_min_tf > 0 and rl_reactivated and (loss_fn.rl_weight > 0 or _rl_gated):
+            # Legacy: gate on TF exact
+            if prev_exact < _rl_min_tf:
+                if not _rl_gated:
+                    loss_fn._rl_gated_weight = loss_fn.rl_weight
+                    loss_fn._rl_gated_off = True
+                    loss_fn.rl_weight = 0.0
+                    print(f"  [RL GATE] Suppressed: TF exact {prev_exact*100:.1f}% < "
+                          f"{_rl_min_tf*100:.0f}% threshold", flush=True)
+            elif _rl_gated:
+                loss_fn.rl_weight = loss_fn._rl_gated_weight
+                loss_fn._rl_gated_off = False
+                print(f"  [RL GATE] Restored: TF exact {prev_exact*100:.1f}% >= "
+                      f"{_rl_min_tf*100:.0f}% → rl_weight={loss_fn.rl_weight:.4f}",
                       flush=True)
 
         # TF locked at 1.0 — REINFORCE handles AR training via true generation
@@ -7131,6 +7164,7 @@ def train():
         if not rolled_back:
             prev_exact = metrics['exact_match']
         _shutdown_state['prev_exact'] = prev_exact  # V12.10: Keep shutdown state current
+        _shutdown_state['last_ar_exact'] = last_ar_exact  # V12.43: RL AR gate
 
         # V13.1: Track exact match history for RL and PhysZ reactivation plateau detection
         rl_exact_history.append(metrics['exact_match'])
@@ -7346,6 +7380,7 @@ def train():
             )
             err_dist = true_eval['error_distribution']
             scope = "FULL DATASET" if is_final_epoch else f"{eval_max} samples"
+            last_ar_exact = true_eval['true_exact_match']  # V12.43: Update for RL AR gate
             print(f"  → TRUE Autoregressive ({scope}): {true_eval['true_exact_match']*100:.1f}% exact "
                   f"({true_eval['exact_count']}/{true_eval['total_samples']}) | "
                   f"Errors: 0={err_dist[0]}, 1={err_dist[1]}, 2={err_dist[2]}, 3={err_dist[3]}, >3={err_dist['more']}", flush=True)
