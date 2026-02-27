@@ -561,8 +561,13 @@ TRAIN_CONFIG = {
     #   rl_weight = rl_auto_scale_target / |raw_rl_loss|
     # This ensures RL is a gentle correction signal regardless of model state.
     # Gradients still flow correctly — only magnitude changes, not direction.
+    # V15.1: Target lowered from 10.0 to 0.1 — at 3% AR exact, raw_rl ≈ -43000,
+    # old target made |rl_contribution| ≈ 10.0, which was 30x the CE losses (~0.3).
+    # RL gradient dominated and drowned out CE's per-token learning signal.
+    # New target: |rl_contribution| ≈ 0.1, making RL ~30% of CE — a gentle nudge
+    # that lets CE drive per-token improvement while RL provides sequence-level pressure.
     'rl_auto_scale': True,               # Enable dynamic RL weight scaling
-    'rl_auto_scale_target': 10.0,        # Target |rl_weight * raw_rl_loss| magnitude
+    'rl_auto_scale_target': 0.1,         # Target |rl_weight * raw_rl_loss| magnitude
 
     # V14.2: Migration LR boost — temporarily increase LR after vocab expansion
     # At epoch 4001/5000, cosine schedule gives only ~10% of initial LR.

@@ -205,6 +205,8 @@ When suppressed:
 
 **Auto-scale clamp**: Floor lowered from `0.01` to `0.0001` so auto-scale can correctly dampen large `|raw_rl|` values (e.g., 17000 → weight=0.0006 instead of being clamped to 0.01).
 
+**Auto-scale target** (V15.1): Lowered from `10.0` to `0.1`. At 3% AR exact, `|raw_rl| ≈ 43000`. Old target produced `|rl_contribution| ≈ 10.0`, which was 30x the CE losses (~0.3), causing **negative total loss** and drowning out the CE per-token learning signal. New target: `|rl_contribution| ≈ 0.1` (~30% of CE). RL becomes a gentle sequence-level nudge while CE drives the primary per-token improvement.
+
 **Colab setting**: `rl_min_ar_exact=0.0` — RL runs from the start. Previously gated at 0.40 (commit 6a8a395) but removed because TF exact plateaued at 97% with AR at 22% — RL (SCST) is needed immediately to close the TF→AR gap. The `rl_auto_scale` probe mechanism handles first-epoch calibration safely.
 
 **PhysZ always-on** (V15.1): `use_physics_z=True` is now the default. Physical regularizers (compositional, Magpie encoding, GL/BCS consistency) are always active since they're grounded in physical theory. The auto-reactivation scheduler still exists but is a no-op when PhysZ starts enabled.
