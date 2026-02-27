@@ -7048,8 +7048,10 @@ def train():
             _raw_rl = abs(metrics['reinforce_loss'])
             _target = TRAIN_CONFIG.get('rl_auto_scale_target', 10.0)
             _auto_w = _target / _raw_rl
-            # Clamp to reasonable range to avoid pathological values
-            _auto_w = max(0.01, min(_auto_w, 10.0))
+            # Clamp to reasonable range. Floor at 1e-4 so auto-scale can
+            # correctly dampen large |raw_rl| (e.g. 17000 → weight=0.0006).
+            # Old floor of 0.01 prevented proper calibration when |raw_rl| >> target.
+            _auto_w = max(0.0001, min(_auto_w, 10.0))
             _old_w = loss_fn.rl_weight
             loss_fn.rl_weight = _auto_w
             TRAIN_CONFIG['rl_weight'] = _auto_w
