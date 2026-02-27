@@ -4,6 +4,69 @@ Chronological record of training runs, architecture changes, and optimization de
 
 ---
 
+## V15.x: Site Duplication Head (2026-02-27)
+
+### Problem
+
+The AR decoder duplicates elements in **34% of error records**, but only **0.35% (185/52,813)** of training formulas legitimately have duplicate elements. These 185 represent crystallographic site information — the same element on different Wyckoff positions (e.g., Cu on dopant site + Cu in CuO planes). The model has no mechanism to distinguish legitimate site duplication from spurious repetition.
+
+### Solution
+
+Added a **site_dup_head** — a binary classification head on the decoder that predicts at each position: "Should this token repeat a previously-generated element?"
+
+**Architecture**: `Linear(512→128) → GELU → Linear(128→1)` (matches stop_head pattern)
+
+**Training (TF path)**:
+- Computes binary targets: 1.0 where a token repeats an earlier element, 0.0 elsewhere
+- BCE loss with `pos_weight=200.0` for extreme class imbalance (0.35% positive rate)
+- Separate loss weight `site_dup_loss_weight` (default 0.0 = disabled, try 2.0)
+
+**Inference (AR generation)**:
+- Tracks `seen_elements_vocab` per sequence during KV-cached generation
+- At each step, if `site_dup_threshold > 0`: query site_dup_head for duplication probability
+- If prob < threshold, soft-suppress (-30.0) previously-seen element tokens
+- Uses -30.0 (not -inf) so confident main logits can still override for legitimate duplicates
+
+### Files Changed
+- **Created**: `src/superconductor/losses/site_dup_loss.py` — `compute_site_dup_targets()` (vectorized) + `compute_site_dup_stats()`
+- **Modified**: `src/superconductor/models/autoregressive_decoder.py` — site_dup_head in `__init__`, forward() returns 5-tuple, AR gating in `generate_with_kv_cache()`
+- **Modified**: `scripts/train_v12_clean.py` — loss computation, config keys, metrics, logging, skip scheduling
+
+### Config Keys
+```python
+'site_dup_loss_weight': 0.0,    # BCE loss weight (0 = disabled, try 2.0)
+'site_dup_threshold': 0.0,      # AR gate threshold (0 = disabled, try 0.5 after head converges)
+'site_dup_pos_weight': 800.0,   # BCE pos_weight — matches ~783:1 class imbalance
+                                # (277 positive positions / 217K total element positions per epoch)
+```
+
+### Class Imbalance Analysis
+- 52,813 formulas × 4.11 avg elements = ~217K element positions/epoch
+- Only 185 formulas (277 positions) are positive → **783:1 imbalance**
+- `pos_weight=800` balances gradient contribution between classes
+- **86% of batches have zero positive positions** — gradient is sparse but sufficient over epochs
+- Built-in diagnostic: `sd_pos_recall` (R+) in logs — if stuck at 0% after 10 epochs, head learned trivial solution
+
+### Checkpoint Compatibility
+`load_state_dict(strict=False)` handles missing `site_dup_head.*` keys — they initialize randomly. Same pattern as stop_head (V12.30) and token_type_head (V14.3).
+
+### Log Output Format
+```
+| SiteDup: 0.1234 (R+:85%)
+```
+- `R+` = positive recall (what % of true duplicates the head correctly predicts)
+- R+=0% after many epochs = trivial "always no" solution (increase pos_weight or loss_weight)
+- R+>80% = head is learning the 185 legitimate duplicate patterns
+
+### Verification Plan
+1. Set `site_dup_loss_weight: 2.0`, run ~5 epochs — loss should appear in logs and decrease
+2. Monitor `R+:` — should rise above 0% within 10 epochs (if not, head collapsed to trivial solution)
+3. After ~50 epochs, R+ should be >80% (recall on 185 positive formulas)
+4. Enable `site_dup_threshold: 0.5`, generate 2000 samples — duplicate rate should drop from ~34% toward <5%
+5. Verify TF exact match and AR exact match don't regress
+
+---
+
 ## Phase 2: Z-Space Coverage Tracking + State Persistence (2026-02-25)
 
 ### Problem

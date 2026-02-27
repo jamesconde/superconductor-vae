@@ -611,6 +611,7 @@ TRAIN_CONFIG = {
         'hp_loss':         (0.3,   0.1),   # High-pressure BCE (V12.19)
         'sc_loss':         (0.3,   0.1),   # SC/non-SC classification BCE (V12.21)
         'stop_loss':       (0.1,   0.1),   # Stop-prediction BCE (V12.30)
+        'site_dup_loss':   (0.01,  0.05),  # Site duplication BCE (V15.x) — converges fast on binary task
         'family_loss':     (0.5,   0.2),   # Hierarchical family classifier (V12.33)
     },
 
@@ -783,6 +784,18 @@ TRAIN_CONFIG = {
     'use_type_masking_ar': True,    # V14.3: Enable hard type masking during AR generation
                                     # Enabled: type head trained for 1000+ epochs, eliminates 57% of type confusion errors
     'use_heads_memory': True,       # V14.3: Feed encoder head predictions into decoder memory
+
+    # =========================================================================
+    # V15.x: Site Duplication Head
+    # =========================================================================
+    # Binary head on decoder predicting "should this position repeat a previously-
+    # generated element?" Only 0.35% of training formulas have legitimate duplicates
+    # (crystallographic sites). Trained with BCE; used as soft gate during AR gen.
+    # =========================================================================
+    'site_dup_loss_weight': 0.0,    # BCE loss weight (0 = disabled, try 2.0)
+    'site_dup_threshold': 0.0,      # AR gate threshold (0 = disabled, try 0.5 after head converges)
+    'site_dup_pos_weight': 800.0,   # BCE pos_weight — must match ~783:1 class imbalance
+                                    # (277 positive positions / 217K total element positions per epoch)
 
     # =========================================================================
     # V15.1: Per-Bin Tc Head Early Stopping (Snapshot/Restore)
@@ -2341,6 +2354,7 @@ class CombinedLossWithREINFORCE(nn.Module):
         self._max_len = 60
         self._stop_boost = 0.0  # V12.30: Set via set_decoder()
         self._hard_stop_threshold = 0.0  # V12.37: Set via set_decoder()
+        self._site_dup_threshold = 0.0  # V15.x: Set via set_decoder()
         self._heads_pred = None  # V14.3: Set per-batch for RLOO enriched memory
         self._type_masks = None  # V14.3: Set per-batch for RLOO type masking
 
@@ -2396,7 +2410,7 @@ class CombinedLossWithREINFORCE(nn.Module):
         self._last_family_preds = None  # Set per-batch in forward() for REINFORCE access
 
     def set_decoder(self, decoder, max_len: int = 60, draft_model=None, stop_boost: float = 0.0,
-                    hard_stop_threshold: float = 0.0):
+                    hard_stop_threshold: float = 0.0, site_dup_threshold: float = 0.0):
         """Set decoder for autoregressive REINFORCE sampling (V12.8).
 
         Args:
@@ -2405,12 +2419,14 @@ class CombinedLossWithREINFORCE(nn.Module):
             draft_model: Optional HybridDraft for speculative decoding (V12.9)
             stop_boost: V12.30 Additive END logit boost from stop head
             hard_stop_threshold: V12.37 Force END when sigmoid(stop_logit) > threshold
+            site_dup_threshold: V15.x Suppress duplicate elements during AR generation
         """
         self._decoder = decoder
         self._max_len = max_len
         self._draft_model = draft_model
         self._stop_boost = stop_boost  # V12.30
         self._hard_stop_threshold = hard_stop_threshold  # V12.37
+        self._site_dup_threshold = site_dup_threshold  # V15.x
 
     def set_draft_model(self, draft_model):
         """Set draft model for speculative decoding (V12.9)."""
@@ -2597,6 +2613,7 @@ class CombinedLossWithREINFORCE(nn.Module):
                 hard_stop_threshold=self._hard_stop_threshold,  # V12.37
                 heads_pred=heads_pred_expanded,  # V14.3: enriched memory
                 type_masks=type_masks,  # V14.3: type-constrained sampling
+                site_dup_threshold=self._site_dup_threshold,  # V15.x
             )
             self._last_spec_stats = None
 
@@ -2846,6 +2863,7 @@ class CombinedLossWithREINFORCE(nn.Module):
             stop_boost=self._stop_boost,  # V12.30
             hard_stop_threshold=self._hard_stop_threshold,  # V12.37
             type_masks=type_masks,  # V14.3
+            site_dup_threshold=self._site_dup_threshold,  # V15.x
         )
 
         # Pad/truncate sampled tokens to match target length
@@ -4917,6 +4935,7 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
                 physics_z_loss_fn=None, physics_z_weight=1.0,
                 family_loss_weight=0.0, family_lookup_tables=None,
                 stop_loss_weight=None,  # V12.40: Pass as param for skip scheduling
+                site_dup_loss_weight=None,  # V15.x: Pass as param for skip scheduling
                 stoich_cond_tf=1.0,  # V12.41: Stoich conditioning teacher forcing ratio
                 v13_tokenizer=None):  # V14.3: Token type classification requires tokenizer
     """Train for one epoch with curriculum weights and teacher forcing.
@@ -4945,6 +4964,10 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
     if stop_loss_weight is None:
         stop_loss_weight = TRAIN_CONFIG.get('stop_loss_weight', 0.0)
 
+    # V15.x: Resolve site_dup_loss_weight (parameter for skip scheduling, fallback to config)
+    if site_dup_loss_weight is None:
+        site_dup_loss_weight = TRAIN_CONFIG.get('site_dup_loss_weight', 0.0)
+
     # V12.15: Initialize timing stats
     timing = TimingStats() if enable_timing else None
     _timing_stats = timing
@@ -4972,6 +4995,11 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
     total_a5_z_mse = 0  # V12.43
     total_a5_tc_mse = 0  # V12.43
     total_type_loss = 0  # V14.3
+    total_site_dup_loss = 0  # V15.x: Site duplication BCE loss
+    total_sd_pos_correct = 0  # V15.x: Positive recall tracking (detect trivial solution)
+    total_sd_pos_total = 0
+    total_sd_neg_correct = 0  # V15.x: Negative accuracy (should be high)
+    total_sd_neg_total = 0
     total_numden_loss = 0  # V12.41: Numden head MSE loss
     total_type_correct = 0  # V14.3: Type head accuracy tracking
     total_type_total = 0    # V14.3: Total non-PAD type positions
@@ -5120,7 +5148,7 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
                 timing.start('decoder_fwd')
 
             # Decoder forward with teacher forcing ratio (all samples)
-            formula_logits, _, stop_logits, type_logits = decoder(
+            formula_logits, _, stop_logits, type_logits, site_dup_logits = decoder(
                 z, tokens,
                 stoich_pred=stoich_pred, teacher_forcing_ratio=tf_ratio,
                 heads_pred=heads_pred_dict,
@@ -5187,6 +5215,47 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
                     stop_bce = stop_bce * position_weights
                 # Apply mask and average
                 stop_loss_val = (stop_bce * stop_mask).sum() / stop_mask.sum().clamp(min=1)
+
+            # V15.x: Site duplication head loss (BCE on binary duplicate-element targets)
+            site_dup_loss_val = torch.tensor(0.0, device=device)
+            if site_dup_loss_weight > 0 and site_dup_logits is not None:
+                from superconductor.losses.site_dup_loss import compute_site_dup_targets
+                # Detect element range: V13+ uses 5..122, V12 uses 20..137
+                if _use_semantic:
+                    from superconductor.tokenizer.fraction_tokenizer import N_SPECIAL, N_ELEMENTS
+                    _sd_elem_start, _sd_elem_end = N_SPECIAL, N_SPECIAL + N_ELEMENTS - 1
+                else:
+                    _sd_elem_start, _sd_elem_end = 20, 137
+                site_dup_targets = compute_site_dup_targets(
+                    formula_targets, element_start=_sd_elem_start,
+                    element_end=_sd_elem_end, pad_idx=PAD_IDX,
+                )
+                # Mask on non-PAD positions
+                sd_mask = (formula_targets != PAD_IDX).float()
+                # BCE with pos_weight to handle extreme class imbalance (~783:1)
+                sd_pos_weight = torch.tensor(
+                    TRAIN_CONFIG.get('site_dup_pos_weight', 800.0), device=device
+                )
+                sd_bce = F.binary_cross_entropy_with_logits(
+                    site_dup_logits, site_dup_targets,
+                    pos_weight=sd_pos_weight, reduction='none',
+                )
+                site_dup_loss_val = (sd_bce * sd_mask).sum() / sd_mask.sum().clamp(min=1)
+
+                # V15.x: Track positive recall — detect trivial "always 0" solution
+                # If recall stays at 0 after 10+ epochs, the head isn't learning
+                with torch.no_grad():
+                    sd_preds = (site_dup_logits > 0).float()  # Threshold at 0 (logit space)
+                    sd_pos_mask = (site_dup_targets > 0.5) & (sd_mask > 0.5)
+                    sd_neg_mask = (site_dup_targets < 0.5) & (sd_mask > 0.5)
+                    n_pos = sd_pos_mask.sum().item()
+                    if n_pos > 0:
+                        total_sd_pos_correct += (sd_preds[sd_pos_mask] > 0.5).sum().item()
+                        total_sd_pos_total += n_pos
+                    n_neg = sd_neg_mask.sum().item()
+                    if n_neg > 0:
+                        total_sd_neg_correct += (sd_preds[sd_neg_mask] < 0.5).sum().item()
+                        total_sd_neg_total += n_neg
 
             # V12.19: High-pressure prediction loss (only on SC samples)
             hp_loss_val = torch.tensor(0.0, device=device)
@@ -5327,7 +5396,8 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
                         + token_type_loss_weight * type_loss_val  # V14.3
                         + numden_weight * numden_loss_val  # V12.41
                         + physics_z_loss_val  # V12.31
-                        + family_loss_weight * family_loss_val)  # V12.32
+                        + family_loss_weight * family_loss_val  # V12.32
+                        + site_dup_loss_weight * site_dup_loss_val)  # V15.x
 
             elif (~sc_mask).all():
                 # Pure non-SC batch — formula loss only (lower weight), no Tc/Magpie/REINFORCE
@@ -5361,7 +5431,8 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
                         + token_type_loss_weight * type_loss_val  # V14.3
                         + numden_weight * numden_loss_val  # V12.41
                         + physics_z_loss_val  # V12.31
-                        + family_loss_weight * family_loss_val)  # V12.32
+                        + family_loss_weight * family_loss_val  # V12.32
+                        + site_dup_loss_weight * site_dup_loss_val)  # V15.x
 
             else:
                 # Mixed batch — compute SC and non-SC losses separately
@@ -5444,7 +5515,8 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
                         token_type_loss_weight * type_loss_val +  # V14.3
                         numden_weight * numden_loss_val +  # V12.41
                         physics_z_loss_val +  # V12.31
-                        family_loss_weight * family_loss_val)  # V12.32
+                        family_loss_weight * family_loss_val +  # V12.32
+                        site_dup_loss_weight * site_dup_loss_val)  # V15.x
 
         # V12.15: Stop loss computation timing
         if timing:
@@ -5554,6 +5626,7 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
         total_a5_z_mse += loss_dict.get('a5_z_mse', torch.tensor(0.0)).item()  # V12.43
         total_a5_tc_mse += loss_dict.get('a5_tc_mse', torch.tensor(0.0)).item()  # V12.43
         total_type_loss += type_loss_val.item() if torch.is_tensor(type_loss_val) else type_loss_val  # V14.3
+        total_site_dup_loss += site_dup_loss_val.item() if torch.is_tensor(site_dup_loss_val) else site_dup_loss_val  # V15.x
         total_numden_loss += numden_loss_val.item() if torch.is_tensor(numden_loss_val) else numden_loss_val  # V12.41
         z_norm_val = z.detach().float().norm(dim=1).mean().item()
         if not math.isnan(z_norm_val):
@@ -5601,6 +5674,7 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
             'hp_loss': 0, 'sc_loss': 0, 'theory_loss': 0,
             'stop_loss': 0,  # V12.30
             'type_loss': 0,  # V14.3
+            'site_dup_loss': 0, 'sd_pos_recall': 0, 'sd_neg_acc': 0,  # V15.x
             'physics_z_loss': 0,  # V12.31
             'family_loss': 0,  # V12.32
             'z_norm': 0, 'n_skipped': n_skipped, 'n_total_batches': 0,
@@ -5623,6 +5697,9 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
         'stop_loss': total_stop_loss / n_batches,  # V12.30
         'type_loss': total_type_loss / n_batches,  # V14.3
         'type_accuracy': total_type_correct / max(total_type_total, 1),  # V14.3: Type head accuracy
+        'site_dup_loss': total_site_dup_loss / n_batches,  # V15.x: Site duplication BCE
+        'sd_pos_recall': total_sd_pos_correct / max(total_sd_pos_total, 1),  # V15.x: Positive recall (0 = trivial solution)
+        'sd_neg_acc': total_sd_neg_correct / max(total_sd_neg_total, 1),  # V15.x: Negative accuracy (should be ~1.0)
         'numden_loss': total_numden_loss / n_batches,  # V12.41: Numden head MSE
         'physics_z_loss': total_physics_z_loss / n_batches,  # V12.31
         'family_loss': total_family_loss / n_batches,  # V12.32
@@ -5830,7 +5907,8 @@ def train():
     if TRAIN_CONFIG.get('use_autoregressive_reinforce', True):
         loss_fn.set_decoder(decoder, max_len=TRAIN_CONFIG['max_formula_len'], draft_model=draft_model,
                             stop_boost=TRAIN_CONFIG.get('stop_boost', 0.0),
-                            hard_stop_threshold=TRAIN_CONFIG.get('hard_stop_threshold', 0.0))  # V12.37
+                            hard_stop_threshold=TRAIN_CONFIG.get('hard_stop_threshold', 0.0),
+                            site_dup_threshold=TRAIN_CONFIG.get('site_dup_threshold', 0.0))  # V15.x
     if TRAIN_CONFIG.get('rl_weight', 0.0) > 0:
         rl_method = TRAIN_CONFIG.get('rl_method', 'scst')
         method_name = 'SCST (Self-Critical)' if rl_method == 'scst' else 'RLOO (Leave-One-Out)'
@@ -6412,7 +6490,8 @@ def train():
         # V12.15: Preserve draft_model when updating decoder reference after compile
         loss_fn.set_decoder(decoder, max_len=TRAIN_CONFIG['max_formula_len'], draft_model=draft_model,
                             stop_boost=TRAIN_CONFIG.get('stop_boost', 0.0),
-                            hard_stop_threshold=TRAIN_CONFIG.get('hard_stop_threshold', 0.0))  # V12.37
+                            hard_stop_threshold=TRAIN_CONFIG.get('hard_stop_threshold', 0.0),
+                            site_dup_threshold=TRAIN_CONFIG.get('site_dup_threshold', 0.0))  # V15.x
         # V12.43: Re-wire constraint zoo with compiled encoder/decoder references
         if TRAIN_CONFIG.get('constraint_zoo_enabled', False):
             loss_fn.set_constraint_zoo(encoder, decoder, TRAIN_CONFIG,
@@ -6490,6 +6569,7 @@ def train():
         'hp_loss':        (None, None),      # Local var via TRAIN_CONFIG (read inside train_epoch)
         'sc_loss':        (None, None),      # Local var via TRAIN_CONFIG (read inside train_epoch)
         'stop_loss':      (None, None),      # Read from TRAIN_CONFIG inside train_epoch
+        'site_dup_loss':  (None, None),      # Local var: epoch_site_dup_loss_weight
         'family_loss':    (None, None),      # Local var: family_loss_weight
     }
     if loss_skip_enabled:
@@ -7021,6 +7101,7 @@ def train():
         epoch_hp_loss_weight = TRAIN_CONFIG.get('hp_loss_weight', 0.0)
         epoch_sc_loss_weight = TRAIN_CONFIG.get('sc_loss_weight', 0.0)
         epoch_stop_loss_weight = TRAIN_CONFIG.get('stop_loss_weight', 0.0)
+        epoch_site_dup_loss_weight = TRAIN_CONFIG.get('site_dup_loss_weight', 0.0)
         epoch_family_loss_weight = TRAIN_CONFIG.get('family_classifier_weight', 0.0)
 
         # V12.40: Zero local-var weights for skipped losses (must be AFTER warmup computations)
@@ -7036,6 +7117,8 @@ def train():
                 epoch_sc_loss_weight = 0.0
             if 'stop_loss' in losses_skipped_this_epoch:
                 epoch_stop_loss_weight = 0.0
+            if 'site_dup_loss' in losses_skipped_this_epoch:
+                epoch_site_dup_loss_weight = 0.0
             if 'family_loss' in losses_skipped_this_epoch:
                 epoch_family_loss_weight = 0.0
 
@@ -7067,6 +7150,7 @@ def train():
             family_lookup_tables=family_lookup_tables,
             physics_z_weight=effective_physics_z_weight,
             stop_loss_weight=epoch_stop_loss_weight,  # V12.40: For skip scheduling
+            site_dup_loss_weight=epoch_site_dup_loss_weight,  # V15.x: For skip scheduling
             stoich_cond_tf=TRAIN_CONFIG.get('stoich_cond_tf', 1.0),  # V12.41: Stoich conditioning TF
             v13_tokenizer=v13_tokenizer,  # V14.3: Token type classification
         )
@@ -7311,6 +7395,11 @@ def train():
         # V14.3: Show token type loss and accuracy if enabled
         if TRAIN_CONFIG.get('token_type_loss_weight', 0) > 0 and metrics.get('type_loss', 0) > 0:
             base_msg += f" | Type: {metrics['type_loss']:.4f} ({metrics.get('type_accuracy', 0)*100:.1f}%)"
+
+        # V15.x: Show site duplication loss + recall (recall=0 means trivial solution)
+        if TRAIN_CONFIG.get('site_dup_loss_weight', 0) > 0 and metrics.get('site_dup_loss', 0) > 0:
+            sd_recall = metrics.get('sd_pos_recall', 0)
+            base_msg += f" | SiteDup: {metrics['site_dup_loss']:.4f} (R+:{sd_recall*100:.0f}%)"
 
         # V12.31: Show physics Z loss if enabled
         if physics_z_loss_fn is not None and metrics.get('physics_z_loss', 0) > 0:

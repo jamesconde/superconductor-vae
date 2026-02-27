@@ -712,6 +712,18 @@ class EnhancedTransformerDecoder(nn.Module):
             nn.Linear(d_model // 4, 1),         # 128 → 1 (logit)
         )
 
+        # V15.x: Site duplication prediction head
+        # Predicts whether each position should repeat a previously-generated element.
+        # Only 0.35% of training formulas have legitimate duplicates (crystallographic
+        # site info, e.g. Cu on dopant + CuO plane sites). Trained with BCE loss
+        # during TF; used as a soft gate during AR generation to suppress spurious
+        # element repetition (~34% of AR error records).
+        self.site_dup_head = nn.Sequential(
+            nn.Linear(d_model, d_model // 4),  # 512 → 128
+            nn.GELU(),
+            nn.Linear(d_model // 4, 1),         # 128 → 1 (logit)
+        )
+
         # V14.3: Token type classifier head
         # Predicts what TYPE of token comes next (element/integer/fraction/special/EOS)
         # Uses same transformer hidden state as output_proj.
@@ -967,8 +979,9 @@ class EnhancedTransformerDecoder(nn.Module):
             logits = self.output_proj(output)
             stop_logits = self.stop_head(output).squeeze(-1)  # V12.30: [batch, seq_len]
             type_logits = self.token_type_head(output)  # V14.3: [batch, seq_len, N_TOKEN_TYPES]
+            site_dup_logits = self.site_dup_head(output).squeeze(-1)  # V15.x: [batch, seq_len]
             generated = logits.argmax(dim=-1)
-            return logits, generated, stop_logits, type_logits
+            return logits, generated, stop_logits, type_logits, site_dup_logits
 
         # OPTIMIZED path: Scheduled sampling (TF < 1.0) - 2 passes instead of 60
         # V12.6: This is 30x faster than the original sequential approach
@@ -1063,9 +1076,10 @@ class EnhancedTransformerDecoder(nn.Module):
         logits = self.output_proj(output)  # [batch, seq_len, vocab]
         stop_logits = self.stop_head(output).squeeze(-1)  # V12.30: [batch, seq_len]
         type_logits = self.token_type_head(output)  # V14.3: [batch, seq_len, N_TOKEN_TYPES]
+        site_dup_logits = self.site_dup_head(output).squeeze(-1)  # V15.x: [batch, seq_len]
         generated = logits.argmax(dim=-1)  # [batch, seq_len]
 
-        return logits, generated, stop_logits, type_logits
+        return logits, generated, stop_logits, type_logits, site_dup_logits
 
     def generate(
         self,
@@ -1314,6 +1328,7 @@ class EnhancedTransformerDecoder(nn.Module):
         hard_stop_threshold: float = 0.0,  # V12.37: Force END when sigmoid(stop_logit) > threshold
         heads_pred: Optional[Dict[str, torch.Tensor]] = None,  # V14.3: encoder head predictions
         type_masks: Optional[torch.Tensor] = None,  # V14.3: [N_TOKEN_TYPES, vocab_size] bool masks
+        site_dup_threshold: float = 0.0,  # V15.x: Suppress duplicate elements when site_dup_head prob < threshold
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
         """
         Generate token sequences with KV caching for O(n) complexity.
@@ -1335,6 +1350,9 @@ class EnhancedTransformerDecoder(nn.Module):
             type_masks: V14.3 Precomputed [N_TOKEN_TYPES, vocab_size] boolean masks
                        from tokenizer.get_type_masks(). When provided, applies hard type
                        masking: predicted type → only allow tokens of that type.
+            site_dup_threshold: V15.x If > 0, suppress element tokens that would repeat
+                       a previously-generated element unless site_dup_head predicts
+                       duplication probability >= threshold. Uses soft suppress (-30.0).
 
         Returns:
             generated_tokens: Token indices [batch, seq_len] (excluding START)
@@ -1368,6 +1386,10 @@ class EnhancedTransformerDecoder(nn.Module):
             log_probs_list = [] if return_log_probs else None
             entropy_list = [] if return_entropy else None  # V12.8: Track proper entropy
 
+            # V15.x: Track which element tokens have been generated per sequence
+            if site_dup_threshold > 0:
+                seen_elements_vocab = torch.zeros(batch_size, self.vocab_size, dtype=torch.bool, device=device)
+
             for position in range(max_len - 1):
                 # Embed current token
                 token_emb = self.token_embedding(current_token)  # [batch, 1, d_model]
@@ -1388,6 +1410,19 @@ class EnhancedTransformerDecoder(nn.Module):
                     valid_mask = type_masks[predicted_type]  # [batch, vocab_size]
                     # Set invalid tokens to -inf
                     logits = logits.masked_fill(~valid_mask, float('-inf'))
+
+                # V15.x: Site duplication gating — suppress previously-seen elements
+                # unless the site_dup_head predicts this position should be a duplicate
+                if site_dup_threshold > 0 and position > 0:
+                    site_dup_logit = self.site_dup_head(output).squeeze(1).squeeze(-1)  # [batch]
+                    site_dup_prob = torch.sigmoid(site_dup_logit)
+                    # Suppress duplicates for sequences where dup prob is below threshold
+                    suppress_mask = (site_dup_prob < site_dup_threshold)  # [batch]
+                    if suppress_mask.any():
+                        # combined[b, v] = True when sequence b should suppress AND token v was seen
+                        combined = suppress_mask.unsqueeze(1) & seen_elements_vocab  # [batch, vocab]
+                        # Soft suppress: -30.0 allows override if main logits are very confident
+                        logits = logits.masked_fill(combined, -30.0)
 
                 # V12.30: Boost END logit based on stop head prediction
                 if stop_boost > 0:
@@ -1477,6 +1512,22 @@ class EnhancedTransformerDecoder(nn.Module):
                 if return_log_probs:
                     log_probs_list.append(log_prob)
 
+                # V15.x: Track seen element tokens for site_dup gating
+                if site_dup_threshold > 0:
+                    tok_flat = next_token.squeeze(-1)  # [batch]
+                    is_elem = (
+                        (tok_flat >= _V12_ELEMENT_START)
+                        & (tok_flat <= _V12_ELEMENT_END)
+                        & ~finished
+                    )
+                    if is_elem.any():
+                        # Mark these element token IDs as seen in the vocab-sized bool tensor
+                        seen_elements_vocab.scatter_(
+                            1,
+                            next_token.long() * is_elem.unsqueeze(-1).long(),
+                            is_elem.unsqueeze(-1).expand_as(next_token),
+                        )
+
                 # Update finished status
                 finished = finished | (next_token.squeeze(-1) == END_IDX)
 
@@ -1507,6 +1558,7 @@ class EnhancedTransformerDecoder(nn.Module):
         hard_stop_threshold: float = 0.0,  # V12.37: Force END when sigmoid(stop_logit) > threshold
         heads_pred: Optional[Dict[str, torch.Tensor]] = None,  # V14.3
         type_masks: Optional[torch.Tensor] = None,  # V14.3
+        site_dup_threshold: float = 0.0,  # V15.x: Site duplication gating threshold
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Sample sequences for REINFORCE training with KV caching.
@@ -1524,6 +1576,7 @@ class EnhancedTransformerDecoder(nn.Module):
             stop_boost: V12.30 Additive END logit boost from stop head
             heads_pred: V14.3 Dict of encoder head predictions for enriched memory
             type_masks: V14.3 Precomputed type masks for hard type masking
+            site_dup_threshold: V15.x Site duplication gating threshold
 
         Returns:
             sampled_tokens: [batch, seq_len] - sampled token indices
@@ -1547,6 +1600,7 @@ class EnhancedTransformerDecoder(nn.Module):
             hard_stop_threshold=hard_stop_threshold,  # V12.37: Pass through hard stop threshold
             heads_pred=heads_pred,  # V14.3: Pass through heads_pred
             type_masks=type_masks,  # V14.3: Pass through type masks
+            site_dup_threshold=site_dup_threshold,  # V15.x: Pass through site dup threshold
         )
 
         # Create mask: 1 for valid tokens, 0 after END
