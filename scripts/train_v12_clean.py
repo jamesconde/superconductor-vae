@@ -3479,6 +3479,10 @@ def save_checkpoint(encoder, decoder, epoch, suffix='', entropy_manager=None,
     _last_ar = _shutdown_state.get('last_ar_exact', 0.0)
     if _last_ar > 0:
         checkpoint_data['last_ar_exact'] = _last_ar
+    # V15.1: Save best AR exact for composite checkpoint scoring
+    _best_ar = _shutdown_state.get('best_ar_exact', 0.0)
+    if _best_ar > 0:
+        checkpoint_data['best_ar_exact'] = _best_ar
 
     # V12.29: Embed training manifest for version/config tracking
     if manifest is not None:
@@ -4310,6 +4314,7 @@ def load_checkpoint(encoder, decoder, checkpoint_path, entropy_manager=None,
         'prev_exact': checkpoint.get('prev_exact', 0),
         'best_exact': checkpoint.get('best_exact', 0),
         'last_ar_exact': checkpoint.get('last_ar_exact', 0.0),  # V12.43: RL AR gate
+        'best_ar_exact': checkpoint.get('best_ar_exact', 0.0),  # V15.1: Composite best scoring
         'fresh_optimizers': fresh_optimizers,        # V12.31: Grace period needed
         'physics_z_is_new': physics_z_is_new,        # V12.31: Warmup from introduction
         'vocab_expanded': _vocab_expanded,            # V14.2: Migration LR boost needed
@@ -6484,6 +6489,7 @@ def train():
             _shutdown_state['best_exact'] = best_exact
             _shutdown_state['prev_exact'] = prev_exact
             _shutdown_state['last_ar_exact'] = last_ar_exact  # V12.43: RL AR gate
+            _shutdown_state['best_ar_exact'] = resume_state.get('best_ar_exact', 0.0)  # V15.1: Composite scoring
         elif _resume_val != 'auto':
             # Explicit path was given but doesn't exist
             print(f"\n{'='*70}")
@@ -7692,11 +7698,28 @@ def train():
             phase2_runner=phase2_runner,  # Phase 2 state persistence
         )
 
-        if metrics['exact_match'] > best_exact:
+        # V15.1: Composite best checkpoint — include AR exact when available.
+        # With adaptive TF, the TF exact metric is measured with mixed inputs
+        # (own predictions + ground truth), making it slightly harder. A model
+        # with 97.0% TF exact + 16% AR exact is better than one with 97.4% TF
+        # exact + 3% AR exact. Composite score: TF_exact + 0.5 * AR_exact.
+        # The 0.5 weight means AR improvements need to be 2x larger than TF
+        # drops to trigger a new best — conservative enough to avoid saving
+        # a model that traded too much TF quality for minor AR gains.
+        _composite_score = metrics['exact_match'] + 0.5 * last_ar_exact
+        _best_composite = best_exact + 0.5 * _shutdown_state.get('best_ar_exact', 0.0)
+        _is_new_best = _composite_score > _best_composite
+
+        if _is_new_best:
             best_exact = metrics['exact_match']
             _shutdown_state['best_exact'] = best_exact  # V12.10: Keep shutdown state current
+            _shutdown_state['best_ar_exact'] = last_ar_exact  # V15.1: Track AR component
             checkpoint_kwargs['best_exact'] = best_exact  # Update with new best
             save_checkpoint(encoder, decoder, epoch, 'best', **checkpoint_kwargs)
+            if last_ar_exact > 0:
+                print(f"  NEW BEST (composite): TF={metrics['exact_match']*100:.1f}% + "
+                      f"AR={last_ar_exact*100:.1f}% → score={_composite_score:.4f} "
+                      f"(prev={_best_composite:.4f})", flush=True)
 
             # V12.17: Cache z-vectors on new best checkpoint
             if TRAIN_CONFIG.get('cache_z_vectors', False):
