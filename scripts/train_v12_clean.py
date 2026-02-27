@@ -469,7 +469,7 @@ TRAIN_CONFIG = {
     # This forces the model to practice recovery from its own mistakes, closing
     # the TF→AR exposure bias gap.
     'tf_onset': 0.80,    # Start reducing TF when exact match exceeds this
-    'tf_floor': 0.20,    # Minimum TF ratio (keep some GT for gradient stability)
+    'tf_floor': 0.10,    # Minimum TF ratio (keep some GT for gradient stability)
 
     'kl_weight': 0.0001,  # Now L2 regularization weight on z (deterministic encoder)
     'hp_loss_weight': 1.0,   # V13.2: Full weight — mastery of material properties over per-token accuracy
