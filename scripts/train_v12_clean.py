@@ -794,7 +794,8 @@ TRAIN_CONFIG = {
     # generated element?" Only 0.35% of training formulas have legitimate duplicates
     # (crystallographic sites). Trained with BCE; used as soft gate during AR gen.
     # =========================================================================
-    'site_dup_loss_weight': 0.0,    # BCE loss weight (0 = disabled, try 2.0)
+    'site_dup_loss_weight': 1.0,    # BCE loss weight. Raw loss ~0.7 at init, comparable to formula CE.
+                                    # Converges fast on this simple binary task, then contributes near-zero.
     'site_dup_threshold': 0.0,      # AR gate threshold (0 = disabled, try 0.5 after head converges)
     'site_dup_pos_weight': 800.0,   # BCE pos_weight — must match ~783:1 class imbalance
                                     # (277 positive positions / 217K total element positions per epoch)
