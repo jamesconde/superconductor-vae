@@ -988,7 +988,8 @@ TRAIN_CONFIG = {
     # =========================================================================
     'phase2_enabled': False,              # Master toggle
     'phase2_start': 'auto',              # Epoch number or 'auto' (activate when exact >= threshold)
-    'phase2_auto_min_exact': 0.80,       # Auto-activation threshold for exact match
+    'phase2_auto_min_exact': 0.80,       # Auto-activation threshold for TF exact match
+    'phase2_min_ar_exact': 0.0,          # V12.43: Suppress Phase 2 until TRUE AR exact >= threshold (0=no gate)
     'phase2_min_resume_epochs': 0,       # Suppress Phase 2 for N epochs after resume (post-expansion recovery)
     'phase2_interval': 2,                 # Run Phase 2 every N supervised epochs
     'phase2_max_weight': 0.1,            # Max total Phase 2 loss weight (ramped up over warmup)
@@ -7432,7 +7433,16 @@ def train():
             phase2_runner.should_activate(epoch, metrics['exact_match'],
                                              start_epoch=start_epoch)
 
-            if phase2_runner.is_active and phase2_runner.should_run_this_epoch(epoch):
+            # V12.43: AR exact gate — suppress Phase 2 until AR generation is good enough.
+            # Phase 2 generates formulas and re-encodes them; low AR means mostly garbage.
+            _p2_min_ar = TRAIN_CONFIG.get('phase2_min_ar_exact', 0.0)
+            _p2_ar_ready = (_p2_min_ar <= 0 or last_ar_exact >= _p2_min_ar)
+            if phase2_runner.is_active and not _p2_ar_ready:
+                if epoch % 20 == 0:  # Don't spam every epoch
+                    print(f"  [Phase 2] Waiting for AR exact: {last_ar_exact*100:.1f}% < "
+                          f"{_p2_min_ar*100:.0f}% threshold", flush=True)
+
+            if phase2_runner.is_active and _p2_ar_ready and phase2_runner.should_run_this_epoch(epoch):
                 print(f"\n  [Phase 2] Running self-supervised sub-epoch "
                       f"(epoch {epoch}, Phase 2 epoch "
                       f"{epoch - phase2_runner.activation_epoch})...", flush=True)
@@ -7535,8 +7545,10 @@ def train():
                     # Phase 2 errors should never crash training
 
             elif phase2_runner.is_active and epoch == phase2_runner.activation_epoch:
+                _p2_ar_status = (f", AR={last_ar_exact*100:.1f}%"
+                                 f" (need {_p2_min_ar*100:.0f}%)" if _p2_min_ar > 0 else "")
                 print(f"\n  [Phase 2] ACTIVATED at epoch {epoch} "
-                      f"(exact={metrics['exact_match']*100:.1f}%)", flush=True)
+                      f"(TF exact={metrics['exact_match']*100:.1f}%{_p2_ar_status})", flush=True)
 
         # Save checkpoints (V12.10: include full training state)
         _manifest = _build_current_manifest()  # V12.29
