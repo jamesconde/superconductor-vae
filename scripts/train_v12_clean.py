@@ -462,6 +462,15 @@ TRAIN_CONFIG = {
     # Breaks the vicious cycle: decoder ignored noisy stoich tokens → no gradient → head stays bad
     # 1.0 = always GT (decoder learns to use stoich tokens), 0.0 = always predicted
     'stoich_cond_tf': 1.0,  # Always use ground truth stoich conditioning during training
+
+    # V15.1: Adaptive teacher forcing schedule
+    # TF stays at 1.0 until exact >= tf_onset, then decays linearly to tf_floor.
+    # At 95% exact with defaults: TF = 0.40 (60% of positions use own predictions).
+    # This forces the model to practice recovery from its own mistakes, closing
+    # the TF→AR exposure bias gap.
+    'tf_onset': 0.80,    # Start reducing TF when exact match exceeds this
+    'tf_floor': 0.20,    # Minimum TF ratio (keep some GT for gradient stability)
+
     'kl_weight': 0.0001,  # Now L2 regularization weight on z (deterministic encoder)
     'hp_loss_weight': 1.0,   # V13.2: Full weight — mastery of material properties over per-token accuracy
     'sc_loss_weight': 1.0,   # V13.2: Full weight — SC/non-SC distinction critical for Tc=0 encoding in z-space
@@ -1289,7 +1298,9 @@ def get_curriculum_weights(epoch: int) -> Tuple[float, float]:
     return tc_weight, magpie_weight
 
 
-def get_teacher_forcing_ratio(exact_match: float) -> float:
+def get_teacher_forcing_ratio(exact_match: float,
+                               tf_onset: float = 0.80,
+                               tf_floor: float = 0.2) -> float:
     """
     Adaptive teacher forcing based on model competence (exact match %).
 
@@ -1297,19 +1308,31 @@ def get_teacher_forcing_ratio(exact_match: float) -> float:
     The decoder's forward method was updated to use a parallel approach that's
     only 2x slower than full teacher forcing instead of 60x.
 
-    Formula: TF = 1.0 - exact_match (no floor)
-    - TF decreases linearly as exact_match increases
-    - At 100% exact match, TF = 0 (pure autoregressive)
+    V15.1: Redesigned schedule. TF stays at 1.0 until exact >= tf_onset, then
+    decays linearly to tf_floor as exact approaches 100%. This avoids the
+    catastrophic cliff of going from full TF to near-zero AR exposure in one step.
 
-    Examples:
-        - exact_match = 0%   → TF = 1.0 (full teacher forcing)
-        - exact_match = 50%  → TF = 0.5 (half teacher forcing)
-        - exact_match = 80%  → TF = 0.2 (mostly autoregressive)
-        - exact_match = 100% → TF = 0.0 (pure autoregressive)
+    Formula: TF = 1.0 when exact < onset
+             TF = 1.0 - (1.0 - floor) * (exact - onset) / (1.0 - onset)  when exact >= onset
+
+    With defaults (onset=0.80, floor=0.2):
+        - exact_match = 0-80%  → TF = 1.0 (full teacher forcing — still learning basics)
+        - exact_match = 85%    → TF = 0.80 (20% of positions use own predictions)
+        - exact_match = 90%    → TF = 0.60 (40% of positions use own predictions)
+        - exact_match = 95%    → TF = 0.40 (60% of positions use own predictions)
+        - exact_match = 100%   → TF = 0.20 (floor — always keep some TF for stability)
+
+    Args:
+        exact_match: TF exact match fraction (0.0 to 1.0)
+        tf_onset: Exact match threshold to start TF reduction (default 0.80)
+        tf_floor: Minimum TF ratio (default 0.20) — keep some TF for gradient stability
     """
-    # Linear decay with no floor - allows pure autoregressive at high competence
-    tf_ratio = 1.0 - exact_match
-    return max(0.0, tf_ratio)  # Clamp at 0 (exact_match can't exceed 1.0 anyway)
+    if exact_match < tf_onset:
+        return 1.0
+    # Linear decay from 1.0 to tf_floor over [onset, 1.0]
+    progress = (exact_match - tf_onset) / (1.0 - tf_onset)
+    tf_ratio = 1.0 - (1.0 - tf_floor) * progress
+    return max(tf_floor, tf_ratio)
 
 
 # ============================================================================
@@ -7056,9 +7079,14 @@ def train():
                       f"{_rl_min_tf*100:.0f}% → rl_weight={loss_fn.rl_weight:.4f}",
                       flush=True)
 
-        # TF locked at 1.0 — REINFORCE handles AR training via true generation
-        # V15.2 LESSON: 2-pass scheduled sampling doesn't expose real error cascading
-        tf_ratio = 1.0
+        # V15.1: Adaptive TF based on exact match — reduce TF as model improves.
+        # At 95% exact, TF ≈ 0.40, forcing the model to generate from its own outputs
+        # 60% of the time. This closes the TF→AR exposure bias gap that RL alone
+        # couldn't bridge at low AR exact. The 2-pass scheduled sampling in the decoder
+        # handles the mixed ground-truth/prediction inputs.
+        tf_onset = TRAIN_CONFIG.get('tf_onset', 0.80)
+        tf_floor = TRAIN_CONFIG.get('tf_floor', 0.20)
+        tf_ratio = get_teacher_forcing_ratio(prev_exact, tf_onset=tf_onset, tf_floor=tf_floor)
 
         # V12.9: Update entropy weight and temperature from entropy manager
         if entropy_manager is not None and TRAIN_CONFIG.get('rl_weight', 0.0) > 0:

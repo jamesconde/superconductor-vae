@@ -215,6 +215,34 @@ When suppressed:
 
 **Phase 2 threshold**: Raised from `phase2_auto_min_exact=0.80` to `0.90` — self-supervised z-space exploration needs a model that can reliably decode formulas.
 
+### Adaptive Teacher Forcing (V15.1)
+
+TF was locked at 1.0 (pure ground-truth inputs) since V12.8, relying on REINFORCE to close the TF→AR gap. At 95.7% TF exact / 3% AR exact, this strategy failed — RL had no useful signal at 3% AR (all RLOO samples equally bad → near-zero advantage variance → random gradients).
+
+**New schedule**: `TF = f(exact_match)` with configurable onset and floor:
+
+| Config Key | Default | Description |
+|-----------|---------|-------------|
+| `tf_onset` | 0.80 | Start reducing TF when exact exceeds this |
+| `tf_floor` | 0.20 | Minimum TF ratio (keep some GT for gradient stability) |
+
+| Exact Match | TF Ratio | % Positions Using Own Predictions |
+|------------|----------|-----------------------------------|
+| 0-80% | 1.00 | 0% (pure teacher forcing) |
+| 85% | 0.80 | 20% |
+| 90% | 0.60 | 40% |
+| 95% | 0.40 | 60% |
+| 100% | 0.20 | 80% |
+
+**Mechanism**: The decoder's 2-pass scheduled sampling (V12.6) handles the mixed inputs:
+1. First pass: parallel forward with GT inputs → get model predictions
+2. Mix: at each position, use GT with probability TF, own prediction otherwise
+3. Second pass: forward with mixed inputs → final logits for loss computation
+
+Cost: 2x a standard forward pass (two transformer passes), vs 60x for sequential AR.
+
+**Why this works**: Forces the model to practice error recovery during training. At TF=0.40, the model sees its own mistakes 60% of the time and must learn to continue generating correctly despite earlier errors. This directly addresses exposure bias — the root cause of the 95% TF / 3% AR gap.
+
 ---
 
 ## V12.41 Backward Compatibility Mode (2026-02-24)
