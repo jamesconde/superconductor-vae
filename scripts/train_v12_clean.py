@@ -520,7 +520,9 @@ TRAIN_CONFIG = {
     # =========================================================================
     'rl_weight': 1.0,            # V13.2: Enabled for AR refinement (SCST). CE converged at 99.6% TF exact; RL closes the TF→AR gap.
     'rl_min_exact': 0.0,         # V12.43: Suppress RL until TF exact >= this threshold (0=no gate)
-    'rl_min_ar_exact': 0.0,      # V12.43: Suppress RL until TRUE AR exact >= threshold (preferred over rl_min_exact)
+    'rl_min_ar_exact': 0.40,     # V15.1: Gate RL until AR exact >= 40%. Adaptive TF closes the
+                                  # exposure bias gap first; RL kicks in when 40% of RLOO samples
+                                  # get positive reward (enough signal). Saves 5x epoch time.
     'ce_weight': 1.0,            # Cross-entropy weight (keep at 1.0)
     'n_samples_rloo': 4,         # Number of samples for RLOO baseline (A100: 4)
     'rl_temperature': 1.2,       # V15.2: Match old model that achieved good AR. Post-bottleneck rebuild needs exploration.
