@@ -123,15 +123,28 @@ Model starts at 0% exact after expansion. Several issues discovered during first
 | **CUDA graph crash** | Encoder compiled with `reduce-overhead` but called 3x per batch (main + A5 + REINFORCE) | Compile encoder with `mode='default'` (7% of model, minimal perf impact) |
 | **RL domination** | REINFORCE generates -15000 loss at 0% exact, consuming 92% of epoch time | New `rl_min_exact` gate (see below) |
 
-### RL Minimum Exact Gate (`rl_min_exact`)
+### RL Minimum Exact Gate (`rl_min_ar_exact`)
 
-New config key `rl_min_exact` (default 0.0 = disabled) suppresses REINFORCE until teacher-forced exact match reaches the specified threshold. When suppressed:
+Two config keys control RL gating (if both set, AR takes priority):
+
+| Key | Default | Gates on | Description |
+|-----|---------|----------|-------------|
+| `rl_min_ar_exact` | 0.0 | TRUE AR exact | **Preferred.** Gates on actual autoregressive generation quality (evaluated every 4 epochs). |
+| `rl_min_exact` | 0.0 | TF exact | Legacy fallback. Gates on teacher-forced exact (always TF=1.0). |
+
+When suppressed:
 - `loss_fn.rl_weight` is set to 0.0 (saved and restored)
-- Console prints `[RL GATE] Suppressed: exact X% < Y% threshold`
-- When exact crosses the threshold: `[RL GATE] Restored: ... → rl_weight=Z`
+- Console prints `[RL GATE] Suppressed: AR exact X% < Y% threshold`
+- When AR exact crosses the threshold: `[RL GATE] Restored: ... → rl_weight=Z`
 - RL auto-scale then calibrates the weight on the first RL-active epoch
 
-**Colab setting**: `rl_min_exact=0.65` — at 0-65% exact, training uses only CE + Tc + Magpie losses, which is ~2x faster per epoch and avoids RL's massive negative gradients from drowning out reconstruction signals.
+**Why gate on AR exact, not TF exact?** TF exact measures per-token prediction with ground truth context. RL trains autoregressive generation. At 90% TF exact the model may still have 13% AR exact — RL would be pure noise. Gating on AR directly ensures RL only activates when enough generated sequences are correct to provide meaningful reward signal.
+
+**Auto-scale clamp**: Floor lowered from `0.01` to `0.0001` so auto-scale can correctly dampen large `|raw_rl|` values (e.g., 17000 → weight=0.0006 instead of being clamped to 0.01).
+
+**Colab setting**: `rl_min_ar_exact=0.40` — at <40% AR exact, training uses only CE + Tc + Magpie losses (~4x faster per epoch). At 40%+ AR, ~40% of RLOO samples get positive reward, providing enough signal for REINFORCE.
+
+**State persistence**: `last_ar_exact` is saved to checkpoints and restored on resume. Pre-training baseline eval also seeds this value.
 
 **Phase 2 threshold**: Raised from `phase2_auto_min_exact=0.80` to `0.90` — self-supervised z-space exploration needs a model that can reliably decode formulas.
 
