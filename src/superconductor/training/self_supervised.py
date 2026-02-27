@@ -1414,7 +1414,10 @@ class SelfSupervisedEpoch:
         sampling). Backward compatible: old caches without element data use
         cache.get(..., None) and fall back to 3-strategy sampling.
         """
-        cache = torch.load(cache_path, map_location=self.device, weights_only=True)
+        # weights_only=False: z-cache is our own training output, trusted.
+        # PyTorch 2.6 changed default to True, which rejects TorchVersion objects
+        # embedded in cache metadata.
+        cache = torch.load(cache_path, map_location=self.device, weights_only=False)
         z_vectors = cache['z_vectors']  # [N, 2048]
         is_sc = cache.get('is_sc', torch.ones(z_vectors.shape[0]))
 
@@ -1571,6 +1574,23 @@ class SelfSupervisedEpoch:
             return torch.cat([fraction_pred, numden_pred, element_count_pred.unsqueeze(-1)], dim=-1)
         return torch.cat([fraction_pred, element_count_pred.unsqueeze(-1)], dim=-1)
 
+    def _empty_metrics(self) -> Dict[str, float]:
+        """Return zero-valued Phase 2 metrics dict (used when Phase 2 is skipped)."""
+        return {
+            'phase2_weight': 0.0,
+            'phase2_n_sampled': 0,
+            'phase2_n_valid': 0,
+            'phase2_valid_rate': 0.0,
+            'phase2_total_loss': 0.0,
+            'phase2_z_mse': 0.0,
+            'phase2_tc_mse': 0.0,
+            'phase2_unique_rate': 0.0,
+            'phase2_n_degenerate': 0,
+            'phase2_n_novel': 0,
+            'phase2_n_holdout_recovered': 0,
+            'phase2_collapse_active': False,
+        }
+
     def _run_inner(
         self,
         epoch: int,
@@ -1586,6 +1606,8 @@ class SelfSupervisedEpoch:
     ) -> Dict[str, float]:
         """Single-pass: sample z → generate → filter → compute losses on ALL valid.
 
+        Returns dict of Phase 2 metrics (prefixed `phase2_*`).
+
         Duplicate formulas from different z-vectors are kept (each z is a distinct
         latent point needing its own round-trip loss). Degeneracy is tracked as a
         diagnostic metric — it tells us about z-space topology (many z → same formula
@@ -1596,6 +1618,11 @@ class SelfSupervisedEpoch:
 
         _ensure_imports()
         from superconductor.models.autoregressive_decoder import indices_to_formula
+
+        # Safety: bail if sampler has no z-cache loaded (e.g. z-cache load failed)
+        if not hasattr(self.sampler, '_n_cached') or self.sampler._n_cached == 0:
+            print("  [Phase 2] Skipped: sampler has no z-cache loaded", flush=True)
+            return self._empty_metrics()
 
         n_samples = self._n_samples
 
