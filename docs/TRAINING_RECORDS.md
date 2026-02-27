@@ -205,7 +205,9 @@ When suppressed:
 
 **Auto-scale clamp**: Floor lowered from `0.01` to `0.0001` so auto-scale can correctly dampen large `|raw_rl|` values (e.g., 17000 → weight=0.0006 instead of being clamped to 0.01).
 
-**Colab setting**: `rl_min_ar_exact=0.40` — at <40% AR exact, training uses only CE + Tc + Magpie losses (~4x faster per epoch). At 40%+ AR, ~40% of RLOO samples get positive reward, providing enough signal for REINFORCE.
+**Colab setting**: `rl_min_ar_exact=0.0` — RL runs from the start. Previously gated at 0.40 (commit 6a8a395) but removed because TF exact plateaued at 97% with AR at 22% — RL (SCST) is needed immediately to close the TF→AR gap. The `rl_auto_scale` probe mechanism handles first-epoch calibration safely.
+
+**PhysZ always-on** (V15.1): `use_physics_z=True` is now the default. Physical regularizers (compositional, Magpie encoding, GL/BCS consistency) are always active since they're grounded in physical theory. The auto-reactivation scheduler still exists but is a no-op when PhysZ starts enabled.
 
 **State persistence**: `last_ar_exact` is saved to checkpoints and restored on resume. Pre-training baseline eval also seeds this value.
 

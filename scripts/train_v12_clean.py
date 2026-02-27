@@ -821,8 +821,9 @@ TRAIN_CONFIG = {
     # Block 12 (512-2047) is unsupervised discovery space.
     # No architectural changes — physics enforced via loss gradient pressure.
     # =========================================================================
-    'use_physics_z': False,                   # V13.1: Disabled during formula reconstruction phase.
-                                               # Auto-reactivated by PhysZ scheduler when exact plateaus.
+    'use_physics_z': True,                    # V15.1: Always on — physical regularizers based in fact
+                                               # should always contribute to z-space organization.
+                                               # PhysZ warmup ramp still applies on first activation.
     'physics_z_comp_weight': 1.0,             # Block 8 compositional supervision
     'physics_z_magpie_weight': 0.5,           # Block 11 Magpie encoding
     'physics_z_consistency_weight': 0.1,      # GL/BCS/cobordism consistency
