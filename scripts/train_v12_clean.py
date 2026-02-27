@@ -1019,17 +1019,49 @@ HOLDOUT_PATH = PROJECT_ROOT / 'data/GENERATIVE_HOLDOUT_DO_NOT_TRAIN.json'
 OUTPUT_DIR = PROJECT_ROOT / 'outputs'
 
 
+def _check_checkpoint_d_model(path: Path) -> int | None:
+    """Peek at a checkpoint to determine its d_model (architecture width).
+
+    Returns d_model int, or None if it can't be determined.
+    """
+    try:
+        meta = torch.load(path, map_location='cpu', weights_only=False)
+        # Method 1: Check manifest (fast, added V12.29+)
+        manifest = meta.get('manifest', {})
+        mc = manifest.get('model_config', {})
+        if 'd_model' in mc:
+            d_model = mc['d_model']
+            del meta
+            return d_model
+        # Method 2: Check decoder state dict tensor shape
+        dec_sd = meta.get('decoder_state_dict', {})
+        if 'token_embedding.weight' in dec_sd:
+            d_model = dec_sd['token_embedding.weight'].shape[1]
+            del meta
+            return d_model
+        del meta
+    except Exception:
+        pass
+    return None
+
+
 def _find_best_checkpoint(output_dir: Path) -> Path | None:
     """V14.3: Auto-detect the best checkpoint in the output directory.
 
     Priority:
-      1. If checkpoint_best.pt exists AND no epoch checkpoint is newer → use best
-      2. If a checkpoint_epoch_*.pt has a HIGHER epoch number → prefer it
+      1. If checkpoint_best.pt exists AND no compatible epoch checkpoint is newer → use best
+      2. If a compatible checkpoint_epoch_*.pt has a HIGHER epoch → prefer it
          (handles post-expansion: best has stale weights, epoch has retrained weights)
-      3. Fall back to highest-numbered checkpoint_epoch_*.pt if no best exists
+      3. Fall back to highest compatible checkpoint_epoch_*.pt if no best exists
+
+    Architecture compatibility: epoch checkpoints must have the same d_model as
+    the current MODEL_CONFIG. This prevents loading old V12.41 (d_model=512)
+    checkpoints when the model is V12.43 (d_model=576).
 
     Returns None if no checkpoint is found.
     """
+    current_d_model = MODEL_CONFIG.get('d_model', 576)
+
     best = output_dir / 'checkpoint_best.pt'
     best_epoch = -1
     best_exact_val = None
@@ -1048,33 +1080,49 @@ def _find_best_checkpoint(output_dir: Path) -> Path | None:
         except Exception:
             print(f"  [AUTO] Found checkpoint_best.pt (could not peek at metadata)")
 
-    # Check epoch checkpoints
+    # Check epoch checkpoints — sorted by epoch number (ascending)
     epoch_files = sorted(
         output_dir.glob('checkpoint_epoch_*.pt'),
         key=lambda p: int(p.stem.split('_')[-1]) if p.stem.split('_')[-1].isdigit() else 0,
     )
-    latest_epoch_file = epoch_files[-1] if epoch_files else None
-    latest_epoch_num = -1
-    if latest_epoch_file is not None:
-        try:
-            latest_epoch_num = int(latest_epoch_file.stem.split('_')[-1])
-        except ValueError:
-            pass
 
-    # Decision: prefer whichever has the higher epoch number
-    if best.exists() and latest_epoch_file is not None:
-        if latest_epoch_num > best_epoch:
-            print(f"  [AUTO] Epoch checkpoint {latest_epoch_file.name} (epoch {latest_epoch_num}) "
-                  f"is newer than checkpoint_best.pt (epoch {best_epoch}) — using epoch checkpoint")
-            print(f"  [AUTO] (checkpoint_best.pt has stale weights from before retraining)")
-            return latest_epoch_file
+    # Find the highest epoch checkpoint that matches current architecture
+    compatible_epoch_file = None
+    compatible_epoch_num = -1
+    # Search from highest to lowest — stop at first compatible match
+    for ef in reversed(epoch_files):
+        try:
+            ep_num = int(ef.stem.split('_')[-1])
+        except ValueError:
+            continue
+        # Quick filter: only check candidates newer than checkpoint_best.pt
+        if ep_num <= best_epoch:
+            break  # All remaining are older, no need to check
+        # Verify architecture compatibility
+        ep_d_model = _check_checkpoint_d_model(ef)
+        if ep_d_model == current_d_model:
+            compatible_epoch_file = ef
+            compatible_epoch_num = ep_num
+            break  # Found the newest compatible one
         else:
-            return best
+            print(f"  [AUTO] Skipping {ef.name}: d_model={ep_d_model} != current {current_d_model}")
+
+    # Decision: prefer compatible epoch checkpoint if newer than best
+    if best.exists() and compatible_epoch_file is not None:
+        print(f"  [AUTO] Epoch checkpoint {compatible_epoch_file.name} (epoch {compatible_epoch_num}) "
+              f"is newer than checkpoint_best.pt (epoch {best_epoch}) — using epoch checkpoint")
+        print(f"  [AUTO] (checkpoint_best.pt has stale weights from before retraining)")
+        return compatible_epoch_file
     elif best.exists():
         return best
-    elif latest_epoch_file is not None:
-        print(f"  [AUTO] No checkpoint_best.pt found, using latest: {latest_epoch_file.name}")
-        return latest_epoch_file
+    elif compatible_epoch_file is not None:
+        print(f"  [AUTO] No checkpoint_best.pt found, using: {compatible_epoch_file.name}")
+        return compatible_epoch_file
+    elif epoch_files:
+        # No compatible epoch checkpoint found — fall back to highest epoch regardless
+        latest = epoch_files[-1]
+        print(f"  [AUTO] No compatible epoch checkpoint found, using latest: {latest.name}")
+        return latest
 
     return None
 
