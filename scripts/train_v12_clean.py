@@ -408,7 +408,9 @@ TRAIN_CONFIG = {
     'num_epochs': 5000,
     'learning_rate': 3e-5,      # Reduced for stable fine-tuning (was 1e-4)
     'lr_warmup_epochs': 0,      # V13.0: Disabled — Phase A/B handle LR transitions; warmup would throttle Phase A fraction embedding training
-    'max_formula_len': 60,      # V12.41: 60 for digit-by-digit tokenization. V13.0: 30 with semantic fraction tokens.
+    'max_formula_len': 90,      # V15.x: 90 to cover all training formulas + headroom for novel
+                                # complex compositions. Prev 60 truncated 27 formulas.
+                                # PE supports up to 100. V13.0: 30 with semantic fraction tokens.
     'checkpoint_interval': 50,
 
     # =========================================================================
