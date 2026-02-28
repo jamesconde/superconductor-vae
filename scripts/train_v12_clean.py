@@ -427,8 +427,8 @@ TRAIN_CONFIG = {
     # Effective batch size = batch_size * accumulation_steps
     # Larger effective batch = smoother gradients, but may need LR scaling
     # =========================================================================
-    'batch_size': 42,            # Base size — scaled by detect_environment() (A100: 25x → 1050)
-    'accumulation_steps': 1,    # V16.0: No accumulation — RL off frees VRAM for full batch
+    'batch_size': 42,            # Full GPU budget (no other GPU apps running)
+    'accumulation_steps': 2,    # Gradient accumulation (increase for larger effective batch) V12.12: effective batch=64
 
     # V12.8: Data Loading Optimizations (defaults — overridden by detect_environment())
     'num_workers': 2,
@@ -5951,20 +5951,6 @@ def train():
         if TRAIN_CONFIG['batch_size'] != original_bs:
             print(f"[env] Batch size adjusted: {original_bs} -> {TRAIN_CONFIG['batch_size']} "
                   f"(x{env['batch_size_multiplier']})")
-
-    # V16.0: RL-aware batch scaling — RLOO sampling (n_samples forward passes)
-    # consumes significant VRAM. When RL is disabled, we can use larger batches.
-    # The base 25x multiplier (A100-80GB) was calibrated WITH RL on.
-    # Without RL: ~2x more VRAM headroom → boost batch size.
-    # With RL re-enabled: this block won't fire, original 25x applies.
-    rl_weight = TRAIN_CONFIG.get('rl_weight', 1.0)
-    if rl_weight == 0.0 and env['gpu'].get('class') in ('xlarge', 'large'):
-        rl_boost = 1.3  # 25x base * 1.3 = 32.5x (42*32.5≈1365/step).
-        old_bs = TRAIN_CONFIG['batch_size']
-        TRAIN_CONFIG['batch_size'] = max(1, int(old_bs * rl_boost))
-        if TRAIN_CONFIG['batch_size'] != old_bs:
-            print(f"[env] RL disabled (rl_weight=0): batch size boosted "
-                  f"{old_bs} -> {TRAIN_CONFIG['batch_size']} (x{rl_boost})")
 
     # Override accumulation_steps for large-VRAM GPUs (A100: single-step with big batch)
     if env.get('accumulation_steps') is not None:

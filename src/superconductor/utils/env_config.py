@@ -144,7 +144,7 @@ def detect_environment() -> dict:
             persistent_workers = True
             prefetch_factor = 4
             batch_size_multiplier = 25.0  # 42 * 25 = 1050 (halved from 50 post-expansion)
-            accumulation_steps = 1        # V16.0: No accumulation — RL-aware scaling handles batch sizing
+            accumulation_steps = 2        # Effective batch = 1050 * 2 = 2100
             n_samples_rloo = 4            # 4 samples: proven effective, save VRAM for batch
             selective_backprop = False     # All samples get full gradients
             use_torch_compile = True
@@ -159,7 +159,7 @@ def detect_environment() -> dict:
             persistent_workers = True
             prefetch_factor = 3
             batch_size_multiplier = 8.0   # 42 * 8 = 336 (reduced from 12 post-expansion)
-            accumulation_steps = 1        # V16.0: No accumulation — RL-aware scaling handles batch sizing
+            accumulation_steps = 2        # Effective batch = 336 * 2 = 672
             n_samples_rloo = 4            # 4 samples: proven effective
             selective_backprop = False     # All samples get full gradients (no skipping)
             use_torch_compile = True
