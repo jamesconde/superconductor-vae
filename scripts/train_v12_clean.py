@@ -118,6 +118,7 @@ from superconductor.losses.round_trip_loss import RoundTripConsistencyLoss, Exte
 from superconductor.losses.constraint_zoo import SiteOccupancySumLoss, ChargeBalanceLoss
 from superconductor.losses.contrastive import category_to_label  # Dataset label mapping (not the loss itself)
 from superconductor.training.self_supervised import SelfSupervisedConfig, SelfSupervisedEpoch
+from superconductor.training.curriculum_scheduler import CurriculumScheduler
 
 
 # ============================================================================
@@ -426,8 +427,8 @@ TRAIN_CONFIG = {
     # Effective batch size = batch_size * accumulation_steps
     # Larger effective batch = smoother gradients, but may need LR scaling
     # =========================================================================
-    'batch_size': 42,            # Full GPU budget (no other GPU apps running)
-    'accumulation_steps': 2,    # Gradient accumulation (increase for larger effective batch) V12.12: effective batch=64
+    'batch_size': 42,            # Base size — scaled by detect_environment() (A100: 25x → 1050)
+    'accumulation_steps': 2,    # Base — detect_environment() may override
 
     # V12.8: Data Loading Optimizations (defaults — overridden by detect_environment())
     'num_workers': 2,
@@ -520,7 +521,7 @@ TRAIN_CONFIG = {
     #   - Then enable rl_weight=1.0-2.5 for fine-tuning
     #   - Higher n_samples_rloo = lower variance but slower
     # =========================================================================
-    'rl_weight': 1.0,            # V13.2: Enabled for AR refinement (SCST). CE converged at 99.6% TF exact; RL closes the TF→AR gap.
+    'rl_weight': 0.0,            # V16.0: Disabled until AR improves. Was 1.0 (SCST). Re-enable when AR exact > 40%.
     'rl_min_exact': 0.0,         # V12.43: Suppress RL until TF exact >= this threshold (0=no gate)
     'rl_min_ar_exact': 0.40,     # V15.1: Gate RL until AR exact >= 40%. Adaptive TF closes the
                                   # exposure bias gap first; RL kicks in when 40% of RLOO samples
@@ -1047,6 +1048,43 @@ TRAIN_CONFIG = {
     'phase2_element_interpolate_fraction': 0.3,   # Fraction of element-anchored using SLERP (rest uses centroid blend)
     'holdout_eval_interval': 50,          # Mini holdout search every N epochs
     'holdout_eval_budget': 200,           # Candidates per target in mini holdout search
+
+    # =========================================================================
+    # V15.3: Curriculum-Based AR Warmup
+    # =========================================================================
+    # Progressively focuses training on formulas the model can generate AR,
+    # starting with short formulas (3-6 tokens) and advancing to longer ones
+    # as AR exact match improves per bucket. Weights MULTIPLY existing sampler
+    # weights (class balance, Tc-binned, etc.) — no catastrophic forgetting.
+    # =========================================================================
+    'curriculum_ar_enabled': False,
+    'curriculum_ar_bucket_edges': [3, 7, 11, 16, 24, 32, 61],
+    'curriculum_ar_advance_threshold': 0.50,
+    'curriculum_ar_advance_patience': 3,
+    'curriculum_ar_active_boost': 3.0,
+    'curriculum_ar_frontier_boost': 1.5,
+    'curriculum_ar_floor_weight': 0.2,
+    'curriculum_ar_graduated_weight': 0.5,
+
+    # =========================================================================
+    # V16.0: Hungarian Set Decoder
+    # DETR-style parallel slot decoder with Hungarian matching loss.
+    # Predicts (element, fraction) pairs as unordered sets — no sequential
+    # generation, no exposure bias. Runs alongside AR decoder ('parallel' mode).
+    # =========================================================================
+    'hungarian_enabled': True,
+    'hungarian_loss_weight': 1.0,
+    'hungarian_element_weight': 1.0,
+    'hungarian_fraction_weight': 5.0,
+    'hungarian_no_object_weight': 0.1,
+    'hungarian_presence_weight': 1.0,
+    'hungarian_d_model': 512,
+    'hungarian_nhead': 8,
+    'hungarian_num_layers': 3,
+    'hungarian_dim_feedforward': 1024,
+    'hungarian_n_z_tokens': 4,
+    'hungarian_dropout': 0.1,
+    'hungarian_mode': 'parallel',  # 'parallel' = both AR+set, 'set_only' = detach z
 }
 
 CONTRASTIVE_DATA_PATH = PROJECT_ROOT / 'data/processed/supercon_fractions_contrastive.csv'
@@ -1355,6 +1393,9 @@ _shutdown_state = {
     'theory_loss_fn': None,  # V12.22
     'manifest_builder': None,  # V12.29
     'tc_bin_tracker': None,  # V15.1
+    'curriculum_scheduler': None,  # V15.3
+    'set_decoder': None,  # V16.0: Hungarian set decoder
+    'set_dec_opt': None,  # V16.0: Set decoder optimizer
 }
 
 def signal_handler(signum, frame):
@@ -1383,6 +1424,9 @@ def signal_handler(signum, frame):
             manifest=_interrupt_manifest,  # V12.29
             tc_bin_tracker=_shutdown_state.get('tc_bin_tracker'),  # V15.1
             phase2_runner=_shutdown_state.get('phase2_runner'),  # Phase 2 state
+            curriculum_scheduler=_shutdown_state.get('curriculum_scheduler'),  # V15.3
+            set_decoder=_shutdown_state.get('set_decoder'),  # V16.0
+            set_dec_opt=_shutdown_state.get('set_dec_opt'),  # V16.0
         )
     sys.exit(0)
 
@@ -2129,6 +2173,10 @@ def load_and_prepare_data():
     else:
         loader_kwargs['pin_memory'] = False
 
+    # V15.3: Curriculum scheduler (initialized below if enabled)
+    curriculum_scheduler = None
+    _base_sample_weights = None
+
     # V12.12: Balanced sampling for contrastive mode
     if contrastive and TRAIN_CONFIG.get('balanced_sampling', True) and n_non_sc_train > 0:
         # Assign sampling weights: oversample minority class for ~50/50 batches
@@ -2180,6 +2228,27 @@ def load_and_prepare_data():
                          for t in sorted(tc_bins_cfg.keys())}
             print(f"  Tc-binned oversampling: {n_boosted} (multipliers: {tc_bins_cfg})")
 
+        # V15.3: Curriculum-based AR warmup — boost active length bucket
+        curriculum_scheduler = None
+        _base_sample_weights = None
+        if TRAIN_CONFIG.get('curriculum_ar_enabled', False):
+            # Compute per-sample sequence lengths (non-PAD tokens)
+            _train_formula_tokens = formula_tokens[train_indices]
+            _cur_seq_lengths = (_train_formula_tokens != PAD_IDX).sum(dim=1).numpy()
+            curriculum_scheduler = CurriculumScheduler(
+                seq_lengths=_cur_seq_lengths,
+                bucket_edges=TRAIN_CONFIG.get('curriculum_ar_bucket_edges', [3, 7, 11, 16, 24, 32, 61]),
+                advance_threshold=TRAIN_CONFIG.get('curriculum_ar_advance_threshold', 0.50),
+                advance_patience=TRAIN_CONFIG.get('curriculum_ar_advance_patience', 3),
+                active_boost=TRAIN_CONFIG.get('curriculum_ar_active_boost', 3.0),
+                frontier_boost=TRAIN_CONFIG.get('curriculum_ar_frontier_boost', 1.5),
+                floor_weight=TRAIN_CONFIG.get('curriculum_ar_floor_weight', 0.2),
+                graduated_weight=TRAIN_CONFIG.get('curriculum_ar_graduated_weight', 0.5),
+            )
+            # Store base weights (pre-curriculum) for recomputation on phase advance
+            _base_sample_weights = sample_weights.copy()
+            sample_weights = sample_weights * curriculum_scheduler.get_sample_weights()
+
         sampler = WeightedRandomSampler(
             weights=torch.from_numpy(sample_weights).double(),
             num_samples=len(train_indices),
@@ -2213,7 +2282,7 @@ def load_and_prepare_data():
         json.dump(norm_stats_with_cols, f)
     print(f"  Saved norm_stats to {norm_stats_path}")
 
-    return train_loader, norm_stats, n_magpie_cols
+    return train_loader, norm_stats, n_magpie_cols, curriculum_scheduler, _base_sample_weights
 
 
 # ============================================================================
@@ -3436,7 +3505,8 @@ def save_checkpoint(encoder, decoder, epoch, suffix='', entropy_manager=None,
                     enc_opt=None, dec_opt=None, enc_scheduler=None, dec_scheduler=None,
                     prev_exact=None, best_exact=None, theory_loss_fn=None,
                     manifest=None, physics_z_loss_fn=None, tc_bin_tracker=None,
-                    phase2_runner=None):
+                    phase2_runner=None, curriculum_scheduler=None,
+                    set_decoder=None, set_dec_opt=None):
     """Save model checkpoint with full training state for proper resumption."""
     OUTPUT_DIR.mkdir(exist_ok=True)
 
@@ -3499,6 +3569,16 @@ def save_checkpoint(encoder, decoder, epoch, suffix='', entropy_manager=None,
     # Phase 2: Save self-supervised training state (activation, coverage, collapse flags)
     if phase2_runner is not None:
         checkpoint_data['phase2_state'] = phase2_runner.get_state()
+
+    # V15.3: Save curriculum scheduler state
+    if curriculum_scheduler is not None:
+        checkpoint_data['curriculum_scheduler_state'] = curriculum_scheduler.state_dict()
+
+    # V16.0: Save set decoder state if available
+    if set_decoder is not None:
+        checkpoint_data['set_decoder_state_dict'] = set_decoder.state_dict()
+    if set_dec_opt is not None:
+        checkpoint_data['set_dec_opt_state_dict'] = set_dec_opt.state_dict()
 
     # V13.0: Store decoder architecture params for auto-detection by holdout/analysis scripts
     # Fallback values must match current MODEL_CONFIG defaults (V12.43: Net2Net expanded)
@@ -4324,6 +4404,9 @@ def load_checkpoint(encoder, decoder, checkpoint_path, entropy_manager=None,
         'vocab_expanded': _vocab_expanded,            # V14.2: Migration LR boost needed
         'tc_bin_tracker_state': checkpoint.get('tc_bin_tracker_state', None),  # V15.1
         'phase2_state': checkpoint.get('phase2_state', None),  # Phase 2 state persistence
+        'curriculum_scheduler_state': checkpoint.get('curriculum_scheduler_state', None),  # V15.3
+        'set_decoder_state_dict': checkpoint.get('set_decoder_state_dict', None),  # V16.0
+        'set_dec_opt_state_dict': checkpoint.get('set_dec_opt_state_dict', None),  # V16.0
     }
 
     if 'prev_exact' in checkpoint:
@@ -4827,6 +4910,27 @@ def evaluate_true_autoregressive(encoder, decoder, loader, device, max_samples=1
                 'avg_z_norm': float(all_z_norms_np[sl_mask].mean()),
             }
 
+    # V15.3: Curriculum-based AR bucket analysis (finer bins than seq_len_bucket)
+    curriculum_bucket_edges = TRAIN_CONFIG.get('curriculum_ar_bucket_edges', [3, 7, 11, 16, 24, 32, 61])
+    curriculum_ar_per_bucket = {}
+    _cur_parts = []
+    for i in range(len(curriculum_bucket_edges) - 1):
+        lo, hi = curriculum_bucket_edges[i], curriculum_bucket_edges[i + 1]
+        mask = (all_seq_lens_np >= lo) & (all_seq_lens_np < hi)
+        if mask.any():
+            ar_exact = float((all_n_errors_np[mask] == 0).mean())
+            n_samples = int(mask.sum())
+            label = f'{lo}-{hi-1}' if i < len(curriculum_bucket_edges) - 2 else f'{lo}+'
+            curriculum_ar_per_bucket[i] = {
+                'ar_exact': ar_exact,
+                'n_samples': n_samples,
+                'label': label,
+            }
+            _cur_parts.append(f"[{label}]={ar_exact*100:.1f}% (n={n_samples})")
+    z_diagnostics['curriculum_ar_per_bucket'] = curriculum_ar_per_bucket
+    if _cur_parts:
+        print(f"  AR by length: {' | '.join(_cur_parts)}")
+
     # V12.35: Per-block Z norm diagnostics
     # Compute aggregate statistics per physics Z block: mean/std for exact vs error,
     # correlation with errors, and which blocks diverge most between exact/error samples.
@@ -4980,7 +5084,8 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
                 stop_loss_weight=None,  # V12.40: Pass as param for skip scheduling
                 site_dup_loss_weight=None,  # V15.x: Pass as param for skip scheduling
                 stoich_cond_tf=1.0,  # V12.41: Stoich conditioning teacher forcing ratio
-                v13_tokenizer=None):  # V14.3: Token type classification requires tokenizer
+                v13_tokenizer=None,  # V14.3: Token type classification requires tokenizer
+                set_decoder=None, hungarian_loss_fn=None, set_dec_opt=None):  # V16.0: Hungarian set decoder
     """Train for one epoch with curriculum weights and teacher forcing.
 
     V12.8: Added amp_dtype for configurable mixed precision (bfloat16/float16)
@@ -5051,6 +5156,9 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
     total_spec_accept = 0  # V12.9: Speculative decoding acceptance rate
     total_spec_tokens = 0  # V12.9: Tokens per step with speculation
     n_spec_batches = 0     # V12.9: Batches with speculative decoding stats
+    total_hungarian_loss = 0  # V16.0: Hungarian set decoder loss
+    total_hungarian_elem_acc = 0  # V16.0: Element classification accuracy
+    total_hungarian_set_exact = 0  # V16.0: Set-level exact match
     n_batches = 0
     n_sc_batches = 0
     n_non_sc_batches = 0
@@ -5117,6 +5225,8 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
                 n_skipped += 1
                 enc_opt.zero_grad()
                 dec_opt.zero_grad()
+                if set_dec_opt is not None:
+                    set_dec_opt.zero_grad()
                 if timing:
                     timing.start('data_load')  # Resume data load timing
                 continue
@@ -5395,6 +5505,19 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
                 )
                 physics_z_loss_val = pz_result['total'] * physics_z_weight
 
+            # V16.0: Hungarian set decoder forward + loss
+            hungarian_loss_val = torch.tensor(0.0, device=device)
+            hungarian_result = None
+            if set_decoder is not None:
+                _set_z = z.detach() if TRAIN_CONFIG.get('hungarian_mode') == 'set_only' else z
+                set_out = set_decoder(_set_z)
+                hungarian_result = hungarian_loss_fn(
+                    set_out['element_logits'], set_out['fraction_pred'],
+                    set_out['presence_logits'],
+                    elem_idx, elem_frac, elem_mask,
+                )
+                hungarian_loss_val = hungarian_result['total'] * TRAIN_CONFIG.get('hungarian_loss_weight', 1.0)
+
             # V12.15: Time loss computation (includes REINFORCE sampling)
             if timing:
                 timing.start('loss_compute')
@@ -5440,7 +5563,8 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
                         + numden_weight * numden_loss_val  # V12.41
                         + physics_z_loss_val  # V12.31
                         + family_loss_weight * family_loss_val  # V12.32
-                        + site_dup_loss_weight * site_dup_loss_val)  # V15.x
+                        + site_dup_loss_weight * site_dup_loss_val  # V15.x
+                        + hungarian_loss_val)  # V16.0
 
             elif (~sc_mask).all():
                 # Pure non-SC batch — formula loss only (lower weight), no Tc/Magpie/REINFORCE
@@ -5475,7 +5599,8 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
                         + numden_weight * numden_loss_val  # V12.41
                         + physics_z_loss_val  # V12.31
                         + family_loss_weight * family_loss_val  # V12.32
-                        + site_dup_loss_weight * site_dup_loss_val)  # V15.x
+                        + site_dup_loss_weight * site_dup_loss_val  # V15.x
+                        + hungarian_loss_val)  # V16.0
 
             else:
                 # Mixed batch — compute SC and non-SC losses separately
@@ -5559,7 +5684,8 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
                         numden_weight * numden_loss_val +  # V12.41
                         physics_z_loss_val +  # V12.31
                         family_loss_weight * family_loss_val +  # V12.32
-                        site_dup_loss_weight * site_dup_loss_val)  # V15.x
+                        site_dup_loss_weight * site_dup_loss_val +  # V15.x
+                        hungarian_loss_val)  # V16.0
 
         # V12.15: Stop loss computation timing
         if timing:
@@ -5573,6 +5699,8 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
             n_skipped += 1
             enc_opt.zero_grad()
             dec_opt.zero_grad()
+            if set_dec_opt is not None:
+                set_dec_opt.zero_grad()
             if timing:
                 timing.start('data_load')  # Resume data load timing
             continue
@@ -5639,11 +5767,22 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
                 else:
                     scaler.step(dec_opt)
 
+                # V16.0: Step set decoder optimizer
+                if set_dec_opt is not None:
+                    scaler.unscale_(set_dec_opt)
+                    set_grad_norm = torch.nn.utils.clip_grad_norm_(set_decoder.parameters(), 2.0)
+                    if math.isnan(set_grad_norm) or math.isinf(set_grad_norm):
+                        set_dec_opt.zero_grad()
+                    else:
+                        scaler.step(set_dec_opt)
+
                 scaler.update()
 
                 # Zero gradients for next accumulation
                 enc_opt.zero_grad()
                 dec_opt.zero_grad()
+                if set_dec_opt is not None:
+                    set_dec_opt.zero_grad()
 
                 if timing:
                     timing.stop('optimizer')
@@ -5671,6 +5810,11 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
         total_type_loss += type_loss_val.item() if torch.is_tensor(type_loss_val) else type_loss_val  # V14.3
         total_site_dup_loss += site_dup_loss_val.item() if torch.is_tensor(site_dup_loss_val) else site_dup_loss_val  # V15.x
         total_numden_loss += numden_loss_val.item() if torch.is_tensor(numden_loss_val) else numden_loss_val  # V12.41
+        # V16.0: Hungarian set decoder metrics
+        if hungarian_result is not None:
+            total_hungarian_loss += hungarian_result['total'].item()
+            total_hungarian_elem_acc += hungarian_result['element_accuracy']
+            total_hungarian_set_exact += hungarian_result.get('set_exact', 0.0)
         z_norm_val = z.detach().float().norm(dim=1).mean().item()
         if not math.isnan(z_norm_val):
             total_z_norm += z_norm_val
@@ -5754,6 +5898,12 @@ def train_epoch(encoder, decoder, loader, loss_fn, enc_opt, dec_opt, scaler, dev
         'n_total_batches': n_batches,
     }
 
+    # V16.0: Add Hungarian set decoder metrics
+    if set_decoder is not None:
+        results['hungarian_loss'] = total_hungarian_loss / n_batches
+        results['hungarian_elem_acc'] = total_hungarian_elem_acc / n_batches
+        results['hungarian_set_exact'] = total_hungarian_set_exact / n_batches
+
     # V12.12: Add SC/non-SC breakdown
     if n_sc_batches > 0:
         results['sc_exact_match'] = total_sc_exact / n_sc_batches
@@ -5802,6 +5952,20 @@ def train():
             print(f"[env] Batch size adjusted: {original_bs} -> {TRAIN_CONFIG['batch_size']} "
                   f"(x{env['batch_size_multiplier']})")
 
+    # V16.0: RL-aware batch scaling — RLOO sampling (n_samples forward passes)
+    # consumes significant VRAM. When RL is disabled, we can use larger batches.
+    # The base 25x multiplier (A100-80GB) was calibrated WITH RL on.
+    # Without RL: ~2x more VRAM headroom → boost batch size.
+    # With RL re-enabled: this block won't fire, original 25x applies.
+    rl_weight = TRAIN_CONFIG.get('rl_weight', 1.0)
+    if rl_weight == 0.0 and env['gpu'].get('class') in ('xlarge', 'large'):
+        rl_boost = 2.0  # Conservative: RL sampling uses ~50% of peak VRAM
+        old_bs = TRAIN_CONFIG['batch_size']
+        TRAIN_CONFIG['batch_size'] = max(1, int(old_bs * rl_boost))
+        if TRAIN_CONFIG['batch_size'] != old_bs:
+            print(f"[env] RL disabled (rl_weight=0): batch size boosted "
+                  f"{old_bs} -> {TRAIN_CONFIG['batch_size']} (x{rl_boost})")
+
     # Override accumulation_steps for large-VRAM GPUs (A100: single-step with big batch)
     if env.get('accumulation_steps') is not None:
         old_accum = TRAIN_CONFIG.get('accumulation_steps', 2)
@@ -5840,7 +6004,7 @@ def train():
         print("Flash Attention (SDPA): enabled")
 
     # Load data
-    train_loader, norm_stats, magpie_dim = load_and_prepare_data()
+    train_loader, norm_stats, magpie_dim, curriculum_scheduler, _base_sample_weights = load_and_prepare_data()
 
     # Create models
     encoder, decoder, v13_tokenizer = create_models(magpie_dim, device)
@@ -5913,6 +6077,40 @@ def train():
         fraction_token_start=v13_tokenizer.fraction_token_start if use_semantic else 0,
         fraction_token_weight=TRAIN_CONFIG.get('fraction_token_weight', 1.0) if use_semantic else 1.0,
     )
+
+    # V16.0: Hungarian Set Decoder (DETR-style parallel slot prediction)
+    set_decoder = None
+    hungarian_loss_fn = None
+    set_dec_opt = None
+    if TRAIN_CONFIG.get('hungarian_enabled', False):
+        from superconductor.models.set_decoder import SetFormulaDecoder
+        from superconductor.losses.hungarian_loss import HungarianMatchingLoss
+        set_decoder = SetFormulaDecoder(
+            latent_dim=MODEL_CONFIG['latent_dim'],
+            d_model=TRAIN_CONFIG.get('hungarian_d_model', 512),
+            nhead=TRAIN_CONFIG.get('hungarian_nhead', 8),
+            num_layers=TRAIN_CONFIG.get('hungarian_num_layers', 3),
+            dim_feedforward=TRAIN_CONFIG.get('hungarian_dim_feedforward', 1024),
+            n_slots=12,
+            n_elements=118,
+            n_z_tokens=TRAIN_CONFIG.get('hungarian_n_z_tokens', 4),
+            dropout=TRAIN_CONFIG.get('hungarian_dropout', 0.1),
+        ).to(device)
+        hungarian_loss_fn = HungarianMatchingLoss(
+            n_elements=118,
+            n_slots=12,
+            element_ce_weight=TRAIN_CONFIG.get('hungarian_element_weight', 1.0),
+            fraction_mse_weight=TRAIN_CONFIG.get('hungarian_fraction_weight', 5.0),
+            no_object_weight=TRAIN_CONFIG.get('hungarian_no_object_weight', 0.1),
+            presence_bce_weight=TRAIN_CONFIG.get('hungarian_presence_weight', 1.0),
+            fraction_loss_weight=TRAIN_CONFIG.get('hungarian_fraction_weight', 5.0),
+            element_loss_weight=TRAIN_CONFIG.get('hungarian_element_weight', 1.0),
+        )
+        set_dec_opt = torch.optim.AdamW(set_decoder.parameters(), lr=TRAIN_CONFIG['learning_rate'])
+        _n_params = sum(p.numel() for p in set_decoder.parameters())
+        print(f"Hungarian Set Decoder: {_n_params:,} params, mode={TRAIN_CONFIG.get('hungarian_mode', 'parallel')}")
+        _shutdown_state['set_decoder'] = set_decoder
+        _shutdown_state['set_dec_opt'] = set_dec_opt
 
     # V12.9: Build or load draft model for speculative decoding
     draft_model = None
@@ -6293,6 +6491,7 @@ def train():
     migration_lr_boost_factor = 1.0
     _tc_bin_tracker_state = None  # V15.1: Deferred resume state for Tc bin tracker
     _phase2_state = None  # Phase 2: Deferred resume state for self-supervised training
+    _curriculum_scheduler_state = None  # V15.3: Deferred resume state for curriculum scheduler
 
     _resume_val = TRAIN_CONFIG.get('resume_checkpoint')
     if _resume_val:
@@ -6413,6 +6612,14 @@ def train():
             # V15.1: Deferred — store state, apply after tracker is created (~line after family_lookup_tables)
             _tc_bin_tracker_state = resume_state.get('tc_bin_tracker_state')
             _phase2_state = resume_state.get('phase2_state')
+            _curriculum_scheduler_state = resume_state.get('curriculum_scheduler_state')
+            # V16.0: Restore set decoder state
+            if set_decoder is not None and resume_state.get('set_decoder_state_dict') is not None:
+                set_decoder.load_state_dict(resume_state['set_decoder_state_dict'], strict=False)
+                print("  Restored set decoder state")
+            if set_dec_opt is not None and resume_state.get('set_dec_opt_state_dict') is not None:
+                set_dec_opt.load_state_dict(resume_state['set_dec_opt_state_dict'])
+                print("  Restored set decoder optimizer state")
             print(f"  Starting from epoch {start_epoch}")
 
             # V12.43: Detect stale checkpoint_best.pt — if we resumed from an epoch
@@ -6584,6 +6791,16 @@ def train():
             print(f"  [V15.1 Tc-BIN] Tracker initialized (bins={tc_bin_tracker.target_bins}, "
                   f"threshold={tc_bin_tracker.regression_threshold})", flush=True)
     _shutdown_state['tc_bin_tracker'] = tc_bin_tracker
+
+    # V15.3: Restore curriculum scheduler state from checkpoint
+    if curriculum_scheduler is not None and _curriculum_scheduler_state is not None:
+        curriculum_scheduler.load_state_dict(_curriculum_scheduler_state)
+        print(f"  [Curriculum AR] Restored: {curriculum_scheduler.get_status_string()}", flush=True)
+        # Recompute sampler weights for restored phase
+        if _base_sample_weights is not None:
+            _restored_weights = _base_sample_weights * curriculum_scheduler.get_sample_weights()
+            train_loader.sampler.weights = torch.from_numpy(_restored_weights).double()
+    _shutdown_state['curriculum_scheduler'] = curriculum_scheduler
 
     # V12.11: Rollback loop detection
     rollback_count = 0
@@ -7202,6 +7419,8 @@ def train():
             site_dup_loss_weight=epoch_site_dup_loss_weight,  # V15.x: For skip scheduling
             stoich_cond_tf=TRAIN_CONFIG.get('stoich_cond_tf', 1.0),  # V12.41: Stoich conditioning TF
             v13_tokenizer=v13_tokenizer,  # V14.3: Token type classification
+            set_decoder=set_decoder, hungarian_loss_fn=hungarian_loss_fn,  # V16.0
+            set_dec_opt=set_dec_opt,  # V16.0
         )
 
         # V14.1: RL auto-scaling — after first epoch with RL active, measure raw RL loss
@@ -7259,7 +7478,8 @@ def train():
                                physics_z_loss_fn=physics_z_loss_fn,
                                manifest=_build_current_manifest(),
                                tc_bin_tracker=tc_bin_tracker,
-                               phase2_runner=phase2_runner)
+                               phase2_runner=phase2_runner,
+                               curriculum_scheduler=curriculum_scheduler)
                 raise RuntimeError(f"Training stopped: {max_rollbacks} consecutive rollbacks detected. "
                                    f"Check data, model architecture, or hyperparameters.")
 
@@ -7478,6 +7698,12 @@ def train():
         if 'spec_acceptance_rate' in metrics:
             base_msg += f" | Spec: {metrics['spec_acceptance_rate']*100:.0f}% ({metrics['spec_tokens_per_step']:.1f}t/s)"
 
+        # V16.0: Show Hungarian set decoder metrics if enabled
+        if set_decoder is not None and 'hungarian_loss' in metrics:
+            base_msg += (f" | Set: L={metrics['hungarian_loss']:.4f} "
+                         f"E={metrics['hungarian_elem_acc']*100:.1f}% "
+                         f"S={metrics['hungarian_set_exact']*100:.1f}%")
+
         # V12.15: Show timing breakdown
         if 'timing' in metrics and metrics['timing'] is not None:
             epoch_time = metrics.get('epoch_time', 0)
@@ -7523,6 +7749,22 @@ def train():
             print(f"  → TRUE Autoregressive ({scope}): {true_eval['true_exact_match']*100:.1f}% exact "
                   f"({true_eval['exact_count']}/{true_eval['total_samples']}) | "
                   f"Errors: 0={err_dist[0]}, 1={err_dist[1]}, 2={err_dist[2]}, 3={err_dist[3]}, >3={err_dist['more']}", flush=True)
+
+        # V15.3: Curriculum AR step — advance phase if active bucket meets threshold
+        if curriculum_scheduler is not None and true_eval is not None:
+            _cur_buckets = true_eval.get('z_diagnostics', {}).get('curriculum_ar_per_bucket', {})
+            _cur_ar_dict = {int(k): v['ar_exact'] for k, v in _cur_buckets.items()}
+            _cur_action = curriculum_scheduler.step(_cur_ar_dict)
+
+            if _cur_action == 'advance':
+                print(f"  [Curriculum AR] ADVANCED → {curriculum_scheduler.get_status_string()}", flush=True)
+                # Update sampler weights in-place
+                _new_weights = _base_sample_weights * curriculum_scheduler.get_sample_weights()
+                train_loader.sampler.weights = torch.from_numpy(_new_weights).double()
+            elif _cur_action == 'complete':
+                print(f"  [Curriculum AR] COMPLETE — all buckets graduated!", flush=True)
+            else:
+                print(f"  [Curriculum AR] {curriculum_scheduler.get_status_string()}", flush=True)
 
         # V15.1: Per-bin Tc head snapshot/restore — MUST come BEFORE checkpoint saving
         # so restored weights get captured in the checkpoint
@@ -7700,6 +7942,9 @@ def train():
             manifest=_manifest,  # V12.29
             tc_bin_tracker=tc_bin_tracker,  # V15.1
             phase2_runner=phase2_runner,  # Phase 2 state persistence
+            curriculum_scheduler=curriculum_scheduler,  # V15.3
+            set_decoder=set_decoder,  # V16.0
+            set_dec_opt=set_dec_opt,  # V16.0
         )
 
         # V15.1: Composite best checkpoint — include AR exact when available.

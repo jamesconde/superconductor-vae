@@ -4,6 +4,117 @@ Chronological record of training runs, architecture changes, and optimization de
 
 ---
 
+## V16.0: Hungarian Set Decoder (2026-02-27)
+
+### Problem
+
+The AR decoder achieves ~97% teacher-forced exact match but only ~15% TRUE autoregressive exact match. Chemical formulas are **unordered sets** of (element, fraction) pairs — `Ba₂Cu₃O₇ = Cu₃Ba₂O₇` — but the AR decoder imposes sequential left-to-right generation, wasting capacity learning canonical ordering and suffering cascading errors (exposure bias).
+
+### Solution
+
+A DETR-style **fixed-slot set prediction decoder** with **Hungarian matching loss**, running in parallel alongside the existing AR decoder. Each of 12 slots predicts an (element, fraction) pair directly from latent z. During training, the Hungarian algorithm finds the optimal assignment between predicted slots and ground truth pairs (order-invariant). At inference, all slots predict in a single parallel forward pass.
+
+**Key advantages**:
+- No sequential generation → no exposure bias
+- Self-attention between slots prevents duplicate element predictions
+- Ground truth data (`element_indices`, `element_fractions`, `element_mask`) already exists — no data pipeline changes
+- In `parallel` mode, Hungarian loss gradients flow through z to encoder, providing set-supervision that improves z-space structure
+
+### Architecture
+
+```
+z [B, 2048] → z_proj → memory [B, 4, 512]
+slot_queries [12, 512] (learned) → 3x {self-attn + cross-attn + FFN}
+→ element_head [B, 12, 119] (118 elements + empty)
+→ fraction_head [B, 12] (softplus, non-negative)
+→ presence_head [B, 12] (occupied/empty logit)
+```
+
+**Param count**: ~14M (vs ~30M AR decoder). GPU memory: ~53MB fp32.
+
+### Loss Design
+
+- **Cost matrix**: `element_CE_weight * (-log P(gt_elem)) + fraction_MSE_weight * (pred - gt)²`
+- **Hungarian matching**: `scipy.optimize.linear_sum_assignment` on 12×12 cost (~0.1ms/batch)
+- **Element CE**: Full weight on real elements, 0.1x on empty slots (prevents trivial all-empty)
+- **Fraction MSE**: 5x weight (fractions are small numbers, MSE would be negligible otherwise)
+- **Presence BCE**: Binary occupied/empty supervision
+
+### Files Changed
+- **Created**: `src/superconductor/models/set_decoder.py` — `SetDecoderLayer`, `SetFormulaDecoder`
+- **Created**: `src/superconductor/losses/hungarian_loss.py` — `HungarianMatchingLoss`
+- **Modified**: `scripts/train_v12_clean.py` — config keys, model init, forward/loss, optimizer, checkpoint, logging
+
+### Config Keys
+```python
+'hungarian_enabled': False,             # Master toggle
+'hungarian_loss_weight': 1.0,           # Scale for total Hungarian loss
+'hungarian_element_weight': 1.0,        # Element CE weight (cost matrix + loss)
+'hungarian_fraction_weight': 5.0,       # Fraction MSE weight (cost matrix + loss)
+'hungarian_no_object_weight': 0.1,      # Down-weight empty slot CE
+'hungarian_presence_weight': 1.0,       # Presence BCE weight
+'hungarian_d_model': 512,               # Transformer hidden dim
+'hungarian_nhead': 8,                   # Attention heads
+'hungarian_num_layers': 3,              # Decoder layers
+'hungarian_dim_feedforward': 1024,      # FFN hidden dim
+'hungarian_n_z_tokens': 4,             # Memory tokens from z projection
+'hungarian_dropout': 0.1,              # Dropout rate
+'hungarian_mode': 'parallel',          # 'parallel' (both AR+set) or 'set_only' (detach z)
+```
+
+### Metrics
+- `hungarian_loss`: Total Hungarian matching loss
+- `hungarian_elem_acc`: Element classification accuracy (all 12 slots)
+- `hungarian_set_exact`: % of samples where predicted element SET exactly matches GT
+
+### Checkpoint Compatibility
+Old checkpoints lack `set_decoder_state_dict` — set decoder starts fresh. `hungarian_enabled: False` by default means zero impact on existing training.
+
+---
+
+## V15.3: Curriculum-Based AR Warmup (2026-02-27)
+
+### Problem
+
+The model has 97% TF exact but only ~15% AR exact (exposure bias gap). Adaptive TF trains the model to handle its own predictions, but treats all formulas equally. Short formulas (3-5 tokens) are much easier for AR generation than long ones (30+ tokens with nested fractions). Without curriculum, the model tries to improve AR on hard formulas before mastering easy ones.
+
+### Solution
+
+Curriculum-based training that boosts sampling weight for the "active" length bucket, starting with short formulas and advancing to longer ones as AR exact improves. Weights MULTIPLY (not replace) existing sampler weights (class balance, Tc-binned, hard-sequence oversampling) — no catastrophic forgetting.
+
+**Bucket edges** `[3, 7, 11, 16, 24, 32, 61]` create 6 buckets aligned with distribution percentiles:
+- Bucket 0 `[3-6]`: ~10% of data (P10) — simplest formulas
+- Bucket 1 `[7-10]`: ~30% cumulative (P25)
+- Bucket 2 `[11-15]`: ~50% cumulative (median)
+- Bucket 3 `[16-23]`: ~80% cumulative (P75)
+- Bucket 4 `[24-31]`: ~90% cumulative (P90)
+- Bucket 5 `[32+]`: longest 10%
+
+**Weight scheme**: Active bucket gets 3x, frontier (next bucket) gets 1.5x, graduated (past) get 0.5x, future get 0.2x floor weight.
+
+**Advancement**: Active bucket must reach `advance_threshold` (50%) AR exact for `advance_patience` (3) consecutive AR evals (evaluated every 4 epochs → 12 epochs sustained) to advance.
+
+### Files Changed
+- **Created**: `src/superconductor/training/curriculum_scheduler.py` — `CurriculumScheduler` class
+- **Modified**: `scripts/train_v12_clean.py` — config keys, init, per-bucket AR eval, step after AR eval, checkpoint save/restore
+
+### Config Keys
+```python
+'curriculum_ar_enabled': False,                              # Master toggle
+'curriculum_ar_bucket_edges': [3, 7, 11, 16, 24, 32, 61],  # Bucket boundaries
+'curriculum_ar_advance_threshold': 0.50,                     # AR exact to advance
+'curriculum_ar_advance_patience': 3,                         # Consecutive evals above threshold
+'curriculum_ar_active_boost': 3.0,                           # Weight for active bucket
+'curriculum_ar_frontier_boost': 1.5,                         # Weight for next bucket
+'curriculum_ar_floor_weight': 0.2,                           # Min weight for future buckets
+'curriculum_ar_graduated_weight': 0.5,                       # Weight for mastered buckets
+```
+
+### Checkpoint Compatibility
+No issues. `curriculum_scheduler_state` is a new key — old checkpoints simply won't have it, and the scheduler starts at phase 0. `curriculum_ar_enabled: False` by default means existing training is unaffected.
+
+---
+
 ## V15.x: Site Duplication Head (2026-02-27)
 
 ### Problem
