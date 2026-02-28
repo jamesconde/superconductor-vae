@@ -505,7 +505,9 @@ TRAIN_CONFIG = {
 
     # Focal loss and label smoothing (to break accuracy plateau)
     'focal_gamma': 2.0,          # Focal loss focusing parameter (0=standard CE, 2=typical)
-    'label_smoothing': 0.05,     # V13.0: Reduced from 0.1 — 30x larger vocab dilutes smoothing effect
+    'label_smoothing': 0.1,      # V15.1: Restored to 0.1 — softens overconfident next-token predictions,
+                                  # reducing error cascade in AR (slightly-wrong token at t produces
+                                  # less catastrophic distribution shift at t+1)
 
     # =========================================================================
     # V12.8: REINFORCE Settings
@@ -2235,7 +2237,7 @@ def create_models(magpie_dim: int, device: torch.device):
         encoder_hidden=MODEL_CONFIG['encoder_hidden'],
         latent_dim=MODEL_CONFIG['latent_dim'],
         decoder_hidden=MODEL_CONFIG['decoder_hidden'],
-        dropout=0.1,
+        dropout=0.05,  # V15.1: Lowered 0.1→0.05 — generator needs confident z-encoding, not regularization
         use_numden_head=use_numden,
     ).to(device)
 
@@ -2269,7 +2271,9 @@ def create_models(magpie_dim: int, device: torch.device):
         use_stoich_conditioning=True,
         max_elements=12,
         n_stoich_tokens=4,
-        dropout=0.4,  # V14.3b: Raised 0.1→0.4 to combat decoder memorization (109M params / 46K samples)
+        dropout=0.15,  # V15.1: Lowered 0.4→0.15 — generator needs to build confident token predictions
+                       # for AR robustness. Heavy dropout forces hedging which amplifies AR error cascades.
+                       # Label smoothing (0.1) handles overconfidence more gracefully.
         # V12.8: Gradient checkpointing for memory optimization
         use_gradient_checkpointing=TRAIN_CONFIG.get('use_gradient_checkpointing', False),
         # V12.34: Position-dependent teacher forcing (no effect at TF=1.0)

@@ -224,7 +224,7 @@ TF was locked at 1.0 (pure ground-truth inputs) since V12.8, relying on REINFORC
 | Config Key | Default | Description |
 |-----------|---------|-------------|
 | `tf_onset` | 0.80 | Start reducing TF when exact exceeds this |
-| `tf_floor` | 0.20 | Minimum TF ratio (keep some GT for gradient stability) |
+| `tf_floor` | 0.10 | Minimum TF ratio (keep some GT for gradient stability) |
 
 | Exact Match | TF Ratio | % Positions Using Own Predictions |
 |------------|----------|-----------------------------------|
@@ -242,6 +242,18 @@ TF was locked at 1.0 (pure ground-truth inputs) since V12.8, relying on REINFORC
 Cost: 2x a standard forward pass (two transformer passes), vs 60x for sequential AR.
 
 **Why this works**: Forces the model to practice error recovery during training. At TF=0.40, the model sees its own mistakes 60% of the time and must learn to continue generating correctly despite earlier errors. This directly addresses exposure bias — the root cause of the 95% TF / 3% AR gap.
+
+### Dropout Reduction & Label Smoothing (V15.1)
+
+For a generative model, heavy dropout is counterproductive to AR quality. Dropout forces the model to hedge its predictions — fine for classification, but in AR generation, hedging at position t creates a slightly-wrong token that compounds into worse errors at t+1, t+2, etc. (error cascade). Lower dropout lets the decoder build sharper, more confident token distributions.
+
+Label smoothing addresses overconfidence more gracefully: instead of zeroing out activations randomly, it softens the target from hard one-hot (all probability on one token) to a slightly spread distribution. This prevents the model from becoming infinitely confident in any single prediction, which helps AR because the model's internal distribution is closer to what it actually samples from during generation.
+
+| Setting | Before | After | Rationale |
+|---------|--------|-------|-----------|
+| `label_smoothing` | 0.05 | 0.10 | Restored to pre-V13 value. Softens target distribution to reduce AR error cascade. |
+| Decoder `dropout` | 0.40 | 0.15 | Generator needs confident predictions, not regularization-induced hedging. |
+| Encoder `dropout` | 0.10 | 0.05 | Slight reduction — encoder z-encoding should be as precise as possible. |
 
 ---
 
