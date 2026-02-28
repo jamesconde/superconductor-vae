@@ -428,7 +428,7 @@ TRAIN_CONFIG = {
     # Larger effective batch = smoother gradients, but may need LR scaling
     # =========================================================================
     'batch_size': 42,            # Base size — scaled by detect_environment() (A100: 25x → 1050)
-    'accumulation_steps': 2,    # Base — detect_environment() may override
+    'accumulation_steps': 1,    # V16.0: No accumulation — RL off frees VRAM for full batch
 
     # V12.8: Data Loading Optimizations (defaults — overridden by detect_environment())
     'num_workers': 2,
