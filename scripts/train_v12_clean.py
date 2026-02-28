@@ -5959,7 +5959,7 @@ def train():
     # With RL re-enabled: this block won't fire, original 25x applies.
     rl_weight = TRAIN_CONFIG.get('rl_weight', 1.0)
     if rl_weight == 0.0 and env['gpu'].get('class') in ('xlarge', 'large'):
-        rl_boost = 2.0  # Conservative: RL sampling uses ~50% of peak VRAM
+        rl_boost = 1.6  # 25x base * 1.6 = 40x (42*40=1680/step). RL RLOO uses ~40% peak VRAM.
         old_bs = TRAIN_CONFIG['batch_size']
         TRAIN_CONFIG['batch_size'] = max(1, int(old_bs * rl_boost))
         if TRAIN_CONFIG['batch_size'] != old_bs:
