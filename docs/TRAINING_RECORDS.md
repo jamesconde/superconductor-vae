@@ -4,6 +4,31 @@ Chronological record of training runs, architecture changes, and optimization de
 
 ---
 
+## V13/V14 Activation: Semantic Fraction + Isotope Tokenization (2026-02-28)
+
+### Problem
+
+The V12→V13→V14→V15 checkpoint migration was completed (embedding rows remapped, vocab expanded to 4752, stoich_input_dim 37→13, PE buffer 90→30), but `TRAIN_CONFIG` still had `use_semantic_fractions: False` and `use_isotope_tokens: False`. This caused:
+- Model created with 148-token V12 vocab at runtime
+- Checkpoint's 4752-token weights truncated to 148 via partial preserve (losing migrated fraction/isotope embeddings)
+- stoich_input_dim mismatch (checkpoint 13 vs model 37)
+- PE buffer mismatch (checkpoint 30 vs model 90)
+
+### Fix
+
+Activated V13/V14 mode by setting:
+- `use_semantic_fractions: True` — each fraction is a single `FRAC:p/q` token (4317 fractions cover 100% of training data)
+- `use_isotope_tokens: True` — 291 isotope tokens + ISO_UNK (infrastructure for future use)
+- `max_formula_len: 30` — V13 semantic tokens produce shorter sequences (was 90 for V12 digit-by-digit)
+
+Tokenizer vocab size: 4752 (matches checkpoint exactly). Cache will auto-rebuild on next training run (cache_meta detects `use_semantic_fractions` mismatch).
+
+### Files Changed
+- `scripts/train_v12_clean.py` — 3 config values updated
+- `notebooks/generative_evaluation.ipynb` — V13 tokenizer integration for formula decoding + Phase 2
+
+---
+
 ## V16.0: Hungarian Set Decoder (2026-02-27)
 
 ### Problem

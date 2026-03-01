@@ -409,9 +409,8 @@ TRAIN_CONFIG = {
     'num_epochs': 5000,
     'learning_rate': 3e-5,      # Reduced for stable fine-tuning (was 1e-4)
     'lr_warmup_epochs': 0,      # V13.0: Disabled — Phase A/B handle LR transitions; warmup would throttle Phase A fraction embedding training
-    'max_formula_len': 90,      # V15.x: 90 to cover all training formulas + headroom for novel
-                                # complex compositions. Prev 60 truncated 27 formulas.
-                                # PE supports up to 100. V13.0: 30 with semantic fraction tokens.
+    'max_formula_len': 30,      # V13.0: 30 with semantic fraction tokens (each fraction is 1 token).
+                                # V12 needed 90 for digit-by-digit. Checkpoint PE buffer is [1, 30, 512].
     'checkpoint_interval': 50,
 
     # =========================================================================
@@ -996,7 +995,7 @@ TRAIN_CONFIG = {
     # Replace digit-by-digit fraction tokenization with single semantic tokens.
     # Each (p/q) becomes one FRAC:p/q token, eliminating cascading digit errors.
     # =========================================================================
-    'use_semantic_fractions': False,  # V13.0: Set True for semantic fraction tokenizer (4647 vocab). False = V12.41 mode (148 vocab).
+    'use_semantic_fractions': True,  # V13.0: Semantic fraction tokenizer (4752 vocab with isotopes). Checkpoint migrated from V12→V13→V14→V15.
     'fraction_vocab_path': 'data/fraction_vocab.json',  # Fraction vocabulary file
     'fraction_token_weight': 2.0,  # Upweight fraction tokens in CE loss (optional)
 
@@ -1012,7 +1011,7 @@ TRAIN_CONFIG = {
     # Each {mass}Element in a formula becomes a single semantic token.
     # No training data exists yet — infrastructure for future theory-guided generation.
     # =========================================================================
-    'use_isotope_tokens': False,      # V14.0: Isotope-aware tokenization (requires use_semantic_fractions=True)
+    'use_isotope_tokens': True,       # V14.0: Isotope-aware tokenization. Checkpoint migrated with 291 isotopes (vocab 4752).
     'isotope_vocab_path': 'data/isotope_vocab.json',
 
     # =========================================================================
