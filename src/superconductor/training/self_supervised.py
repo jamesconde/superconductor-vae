@@ -1139,12 +1139,26 @@ class Phase2LossComputer:
         tc_class_logits = decode_result.get('tc_class_logits')  # [N, 5] or None
 
         # Get SC prediction from encoder's sc_head if it exists
+        # sc_head takes concatenated [z, tc_pred, magpie_pred, hp_pred, fraction_pred,
+        #   element_count_pred, competence, tc_class_logits] = 2048+1+magpie+1+12+1+1+5
         sc_logit = None
         if hasattr(encoder, 'sc_head') and encoder.sc_head is not None:
-            # sc_head operates on the decoder backbone output
-            backbone_h = decode_result.get('backbone_h')
-            if backbone_h is not None:
-                sc_logit = encoder.sc_head(backbone_h).squeeze(-1)  # [N]
+            hp_pred = encoder.hp_head(z_sampled).squeeze(-1) if hasattr(encoder, 'hp_head') else torch.zeros(z_sampled.shape[0], device=z_sampled.device)
+            fraction_output = encoder.fraction_head(z_sampled)
+            fraction_pred = fraction_output[:, :encoder.max_elements]
+            element_count_pred = fraction_output[:, -1]
+            competence = encoder.competence_head(z_sampled).squeeze(-1) if hasattr(encoder, 'competence_head') else torch.zeros(z_sampled.shape[0], device=z_sampled.device)
+            sc_input = torch.cat([
+                z_sampled,                                    # 2048
+                tc_pred.unsqueeze(-1),                        # 1
+                decode_result['magpie_pred'],                 # magpie_dim
+                hp_pred.unsqueeze(-1),                        # 1
+                fraction_pred,                                # 12
+                element_count_pred.unsqueeze(-1),             # 1
+                competence.unsqueeze(-1),                     # 1
+                tc_class_logits if tc_class_logits is not None else torch.zeros(z_sampled.shape[0], 5, device=z_sampled.device),  # 5
+            ], dim=-1)
+            sc_logit = encoder.sc_head(sc_input).squeeze(-1)  # [N]
 
         losses = []
 
@@ -1563,6 +1577,7 @@ class SelfSupervisedEpoch:
         V13 mode (13-dim): fractions(12) + count(1)
 
         Returns None if encoder lacks fraction_head.
+        Pads to decoder's expected stoich_input_dim if needed (V12 decoder + V13 encoder).
         """
         if not hasattr(self.encoder, 'fraction_head'):
             return None
@@ -1571,8 +1586,14 @@ class SelfSupervisedEpoch:
         element_count_pred = fraction_output[:, 12]
         if hasattr(self.encoder, 'numden_head') and self.encoder.use_numden_head:
             numden_pred = self.encoder.numden_head(z)
-            return torch.cat([fraction_pred, numden_pred, element_count_pred.unsqueeze(-1)], dim=-1)
-        return torch.cat([fraction_pred, element_count_pred.unsqueeze(-1)], dim=-1)
+            stoich = torch.cat([fraction_pred, numden_pred, element_count_pred.unsqueeze(-1)], dim=-1)
+        else:
+            stoich = torch.cat([fraction_pred, element_count_pred.unsqueeze(-1)], dim=-1)
+        # Pad if decoder expects more dims (V12 checkpoint: 37, V13 encoder: 13)
+        expected = getattr(self.decoder, 'stoich_input_dim', stoich.shape[-1])
+        if stoich.shape[-1] < expected:
+            stoich = torch.cat([stoich, torch.zeros(stoich.shape[0], expected - stoich.shape[-1], device=stoich.device)], dim=-1)
+        return stoich
 
     def _empty_metrics(self) -> Dict[str, float]:
         """Return zero-valued Phase 2 metrics dict (used when Phase 2 is skipped)."""
