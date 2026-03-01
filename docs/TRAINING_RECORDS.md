@@ -4,6 +4,31 @@ Chronological record of training runs, architecture changes, and optimization de
 
 ---
 
+## Generative Evaluation Notebook: Gist Logging + Checkpoint Compatibility (2026-02-28)
+
+### Changes
+
+**GitHub Gist for Phase 2 remote monitoring** (`notebooks/generative_evaluation.ipynb`):
+- Added `GIST_ID` and `GIST_LOG_EVERY` config options to Cell 2 (disabled by default)
+- New gist setup cell with `update_gist()` function (mirrors pattern from `train_colab.ipynb`)
+- Phase 2 loop pushes metrics after each sub-epoch: losses, valid rate, discoveries, holdout recoveries
+- Holdout mini-search results and completion status also pushed
+- Gist file: `phase2_log.json` (separate from the training gist's `training_log.json`)
+
+**Checkpoint compatibility fixes** (earlier this session):
+- Auto-detect numden_head architecture (LayerNorm vs BatchNorm1d) from checkpoint weights
+- Auto-detect trained decoder features (heads_to_memory, token_type_head, stop_head) via LayerNorm weight divergence — only enables features whose weights diverged >5% from init
+- Fixed broken encoder head calls: `tc_pred` via `encoder.decode(z)`, `sc_head` with full concatenated input, `hierarchical_family_head` dict extraction
+- Fixed Phase 2 `stoich_pred` dim mismatch: set `use_numden_head=True` after rebuilding numden_head from checkpoint
+
+### Commits
+- `88a0d37` — Auto-detect numden_head architecture from checkpoint weights
+- `e21066b` — Auto-detect trained decoder features; fix broken encoder head calls
+- `ca25448` — Fix Phase 2 stoich_pred dim mismatch: set use_numden_head=True
+- `22cd8da` — Add optional GitHub Gist logging for Phase 2 remote monitoring
+
+---
+
 ## V13/V14 Activation: Semantic Fraction + Isotope Tokenization (2026-02-28)
 
 ### Problem
