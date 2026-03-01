@@ -1224,6 +1224,12 @@ class EnhancedTransformerDecoder(nn.Module):
 
         # Add positional encoding for this position
         # pos_encoding.pe is [1, max_len, d_model]
+        pe_max = self.pos_encoding.pe.shape[1]
+        if position >= pe_max:
+            raise IndexError(
+                f"Position {position} exceeds PE buffer size {pe_max}. "
+                f"Reduce max_len in generate_with_kv_cache() to <= {pe_max}."
+            )
         x = token_embedding + self.pos_encoding.pe[:, position:position+1, :]
         x = self.pos_encoding.dropout(x)
 
@@ -1363,6 +1369,10 @@ class EnhancedTransformerDecoder(nn.Module):
         batch_size = z.size(0)
         device = z.device
         max_len = max_len or self.max_len
+        # Safety: clamp to PE buffer size to prevent empty-tensor overflow
+        pe_max = self.pos_encoding.pe.shape[1]
+        if max_len > pe_max:
+            max_len = pe_max
 
         with torch.no_grad():
             # V12.8: Use cached memory if provided, otherwise create it
@@ -1585,6 +1595,10 @@ class EnhancedTransformerDecoder(nn.Module):
             mask: [batch, seq_len] - 1 for valid positions, 0 for padding
         """
         max_len = max_len or self.max_len
+        # Safety: clamp to PE buffer size to prevent empty-tensor overflow
+        pe_max = self.pos_encoding.pe.shape[1]
+        if max_len > pe_max:
+            max_len = pe_max
 
         # V12.8: Sample with log probs AND entropy using KV cache
         sampled_tokens, log_probs, entropy = self.generate_with_kv_cache(
@@ -1674,6 +1688,10 @@ class EnhancedTransformerDecoder(nn.Module):
         batch_size = z.size(0)
         device = z.device
         max_len = max_len or self.max_len
+        # Safety: clamp to PE buffer size to prevent empty-tensor overflow
+        pe_max = self.pos_encoding.pe.shape[1]
+        if max_len > pe_max:
+            max_len = pe_max
 
         # Stats tracking
         total_drafted = 0
