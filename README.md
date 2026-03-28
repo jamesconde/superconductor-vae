@@ -8,7 +8,7 @@ FullMaterialsVAE is a multi-task generative model (114.8M parameters) for superc
 
 ## Capstone Report
 
-The full technical report is available here: [James_Conde_MAGE_Report.pdf](James_Conde_MAGE_Report.pdf)
+The full technical report is available here: [James_Conde_MAGE_Report.pdf](https://github.com/jamesconde/superconductor-vae/blob/main/James_Conde_MAGE_Report_updated_figures.pdf))
 
 ## Access
 
